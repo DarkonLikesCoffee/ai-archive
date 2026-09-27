@@ -218,16 +218,9 @@ header{background:var(--bg);border-color:var(--border)!important}
 @media(max-width:700px){.sidebar{display:none!important}}
 
 
-/* v0.6.6 conversation rendering */
-.reply-context{margin:2px 0 13px;padding:9px 11px 10px;border-left:3px solid var(--accent);background:var(--surface-2);border-radius:0 10px 10px 0;max-width:100%;}
-.reply-context-label{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
-.reply-context-quote{margin:0!important;padding:7px 10px;border:1px solid var(--border);border-left:0;background:var(--surface);border-radius:7px;color:var(--muted);font-size:12px;line-height:1.55}
 .asset-loading{width:100%;max-width:760px!important}
 .asset-skeleton{height:76px;width:min(460px,100%);border:1px solid var(--border);border-radius:10px;background:linear-gradient(90deg,var(--surface-2),var(--surface-3),var(--surface-2));background-size:200% 100%;animation:asset-shimmer 1.2s ease-in-out infinite}
 @keyframes asset-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
-.content .code-block{margin:15px 0;border:1px solid var(--code-border);border-radius:10px;overflow:auto;background:var(--code-bg);box-shadow:none}
-.content .code-block pre{margin:0!important;padding:15px 16px!important;background:var(--code-bg)!important;border:0!important;border-radius:0!important;line-height:1.65}
-.content .code-block pre code{display:block;background:transparent!important;color:var(--text);padding:0!important;font-size:12px;white-space:pre}
 /* highlight.js GitHub/Discord-like palette; no hand-maintained language list */
 .hljs-comment,.hljs-quote{color:#7d8797;font-style:italic}
 .hljs-keyword,.hljs-selector-tag,.hljs-subst{color:#ff7ab2;font-weight:600}
@@ -247,3 +240,111 @@ header{background:var(--bg);border-color:var(--border)!important}
 :root[data-theme="light"] .hljs-attr,:root[data-theme="light"] .hljs-attribute{color:#6941a5}
 :root[data-theme="light"] .hljs-meta{color:#5f6b7a}
 :root[data-theme="light"] .hljs-deletion{color:#b42318}
+
+/* v0.6.7 — GitHub/Discord-like Markdown code + reply context */
+.content .code-block{
+  margin:16px 0;
+  padding:0;
+  overflow:hidden;
+  border:1px solid var(--code-border);
+  border-radius:8px;
+  background:var(--code-bg);
+}
+.content .code-block pre{
+  margin:0!important;
+  padding:14px 16px!important;
+  overflow-x:hidden;
+  overflow-y:visible;
+  background:transparent!important;
+  border:0!important;
+  border-radius:0!important;
+  font:400 13px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+  tab-size:2;
+}
+.content .code-block pre code,
+.content .code-block pre code.hljs{
+  display:block;
+  padding:0!important;
+  background:transparent!important;
+  color:var(--text);
+  font:inherit;
+  /* No horizontal scrollbar: wrap long lines instead of clipping them, and
+     force-break tokens (long hashes/URLs with no spaces) that would
+     otherwise still overflow the block width. */
+  white-space:pre-wrap;
+  word-break:break-word;
+  overflow-wrap:anywhere;
+}
+/* highlight.js supplies the token classes; these are deliberately language-agnostic. */
+.content .code-block .hljs-comment,.content .code-block .hljs-quote{color:#8b949e;font-style:italic}
+.content .code-block .hljs-keyword,.content .code-block .hljs-selector-tag,.content .code-block .hljs-literal{color:#ff7b9c}
+.content .code-block .hljs-string,.content .code-block .hljs-regexp,.content .code-block .hljs-addition{color:#9cdc9c}
+.content .code-block .hljs-number,.content .code-block .hljs-variable,.content .code-block .hljs-template-variable{color:#d7ba7d}
+.content .code-block .hljs-title,.content .code-block .hljs-title.class_,.content .code-block .hljs-title.function_{color:#79c0ff}
+.content .code-block .hljs-built_in,.content .code-block .hljs-type,.content .code-block .hljs-params{color:#8ed0ff}
+.content .code-block .hljs-attr,.content .code-block .hljs-attribute{color:#c9a7ff}
+.content .code-block .hljs-meta{color:#a5adba}
+.content .code-block .hljs-deletion{color:#ff8b8b}
+
+.reply-context{
+  display:flex;
+  align-items:flex-start;
+  gap:9px;
+  width:min(720px,100%);
+  margin:3px 0 14px;
+  padding:3px 0 4px 10px;
+  border-left:2px solid var(--accent);
+  background:transparent;
+}
+.reply-context-icon{
+  flex:0 0 auto;
+  margin-top:1px;
+  color:var(--accent);
+  font-size:14px;
+  line-height:18px;
+}
+.reply-context-main{min-width:0;max-width:100%}
+.reply-context-label{
+  display:flex;
+  align-items:baseline;
+  gap:6px;
+  margin:0 0 3px;
+  color:var(--text);
+  font-size:11px;
+  line-height:16px;
+  letter-spacing:0;
+  text-transform:none;
+}
+.reply-context-label strong{font-weight:650;color:var(--text)!important}
+.reply-context-label span{color:var(--muted);font-weight:400}
+.reply-context-quote{
+  margin:0!important;
+  padding:0;
+  border:0!important;
+  background:transparent!important;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.45;
+  max-width:680px;
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+}
+.reply-context-quote code{color:var(--text)!important;background:var(--surface-3)!important}
+
+/* Images are actual media, not attachment pills. */
+.content .md-image-link{display:block;width:fit-content;max-width:100%;margin:10px 0 15px}
+.content .md-image{
+  display:block;
+  width:auto;
+  /* Chat-sized thumbnail, not a full-bleed image — click still opens the
+     original at full resolution via the surrounding link. */
+  max-width:min(380px,100%);
+  max-height:380px;
+  object-fit:contain;
+  border-radius:10px;
+  border:1px solid var(--border);
+  background:var(--surface);
+}
+.content .md-image:hover{border-color:var(--accent)}

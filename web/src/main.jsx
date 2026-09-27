@@ -28,14 +28,21 @@ function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;'
 function highlightCode(source, language='') {
   const text = String(source);
   const lang = String(language).toLowerCase().replace(/^language-/, '').trim();
+
+  // Match GitHub/Discord Markdown semantics: an explicitly supplied,
+  // supported fence language gets syntax highlighting. An unlabeled fence
+  // stays plain text instead of guessing a language and producing noisy or
+  // incorrect highlighting. The language registry comes from highlight.js,
+  // not from a hand-maintained list in the app.
+  if (!lang) return escapeHtml(text);
+
   try {
-    if (lang && hljs.getLanguage(lang)) {
+    if (hljs.getLanguage(lang)) {
       return hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
     }
-    return hljs.highlightAuto(text).value;
-  } catch {
-    return escapeHtml(text);
-  }
+  } catch {}
+
+  return escapeHtml(text);
 }
 
 function renderMarkdown(text) {
@@ -55,30 +62,48 @@ function renderMarkdown(text) {
       // Render that as a proper reply context card instead of exposing the
       // implementation detail as a file/code block.
       const replyMatch = line.match(/^\*\*Attachment: (excerpt_from_previous_claude_message\.txt)\*\*$/i);
-      if (replyMatch && j + 1 < blockLines.length && /^```/.test(blockLines[j + 1])) {
-        const fenceLine = blockLines[j + 1];
-        const fence = fenceLine.match(/^(`{3,})/)?.[1] || '```';
-        const quote = [];
-        let k = j + 2;
-        while (k < blockLines.length && !blockLines[k].startsWith(fence)) { quote.push(blockLines[k]); k++; }
-        if (k < blockLines.length) k++;
-        html.push(`<div class=\"reply-context\"><div class=\"reply-context-label\">↩ Replying to Claude</div><blockquote class=\"reply-context-quote\">${inlineMarkdown(quote.join('\n')).replace(/\n/g,'<br>')}</blockquote></div>`);
-        j = k;
-        while (j < blockLines.length && !blockLines[j].trim()) j++;
-        continue;
+      if (replyMatch) {
+        // The attachment header and the fenced quote are two separate
+        // Markdown paragraphs in the exported file, so there is always a
+        // blank line between them. Skip it before looking for the fence.
+        let f = j + 1;
+        while (f < blockLines.length && !blockLines[f].trim()) f++;
+        if (f < blockLines.length && /^```/.test(blockLines[f])) {
+          const fenceLine = blockLines[f];
+          const fence = fenceLine.match(/^(`{3,})/)?.[1] || '```';
+          const quote = [];
+          let k = f + 1;
+          while (k < blockLines.length && !blockLines[k].startsWith(fence)) { quote.push(blockLines[k]); k++; }
+          if (k < blockLines.length) k++;
+          const quotedHtml = inlineMarkdown(quote.join('\n')).replace(/\n/g,'<br>');
+          html.push(`<div class="reply-context"><div class="reply-context-icon">↩</div><div class="reply-context-main"><div class="reply-context-label"><strong>Claude</strong><span>replying to a message</span></div><div class="reply-context-quote">${quotedHtml}</div></div></div>`);
+          j = k;
+          while (j < blockLines.length && !blockLines[j].trim()) j++;
+          continue;
+        }
       }
 
-      if (/^```/.test(line) || /^`{3,}/.test(line)) {
-        const fence = line.match(/^(`{3,})/)?.[1] || '```';
-        const lang = line.slice(fence.length).trim(); const buf = []; j++;
-        while (j < blockLines.length && !blockLines[j].startsWith(fence)) { buf.push(blockLines[j]); j++; }
-        if (j < blockLines.length) j++;
-        html.push(`<div class="code-block"><pre><code class="language-${escapeHtml(lang)}">${highlightCode(buf.join('\n'), lang)}</code></pre></div>`); continue;
+      const fenceMatch = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+      if (fenceMatch) {
+        const fence = fenceMatch[1];
+        const marker = fence[0];
+        const lang = fenceMatch[2].trim();
+        const buf = [];
+        j++;
+        while (j < blockLines.length) {
+          const closeMatch = blockLines[j].match(new RegExp(`^\\s*${marker}{${fence.length},}\\s*$`));
+          if (closeMatch) { j++; break; }
+          buf.push(blockLines[j]);
+          j++;
+        }
+        const codeClass = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+        html.push(`<div class="code-block"><pre><code${codeClass}>${highlightCode(buf.join('\n'), lang)}</code></pre></div>`);
+        continue;
       }
       if (/^#{1,3} /.test(line)) { const m=line.match(/^(#{1,3}) (.*)$/); html.push(`<h${m[1].length}>${inlineMarkdown(m[2])}</h${m[1].length}>`); j++; continue; }
       if (/^[-*] /.test(line)) { const items=[]; while(j<blockLines.length && /^[-*] /.test(blockLines[j])) { items.push(`<li>${inlineMarkdown(blockLines[j].slice(2))}</li>`); j++; } html.push(`<ul>${items.join('')}</ul>`); continue; }
       if (!line.trim()) { j++; continue; }
-      const para=[line]; j++; while(j<blockLines.length && blockLines[j].trim() && !/^#{1,3} |^[-*] |^```/.test(blockLines[j])) { para.push(blockLines[j]); j++; }
+      const para=[line]; j++; while(j<blockLines.length && blockLines[j].trim() && !/^#{1,3} |^[-*] |^\s*(`{3,}|~{3,})/.test(blockLines[j])) { para.push(blockLines[j]); j++; }
       html.push(`<p>${inlineMarkdown(para.join('\n')).replace(/\n/g,'<br>')}</p>`);
     }
     return html.join('\n');
@@ -119,8 +144,15 @@ function renderMarkdown(text) {
       while (i < lines.length) {
         const line = lines[i];
 
-        if (isToolHeading(line)) break;
-        if (/^#{1,2} /.test(line)) break;
+        // Only treat a line as a section boundary when we are NOT in the
+        // middle of an open fence. A shell/code comment like "# foo" inside
+        // a fenced tool body must never be mistaken for a Markdown heading —
+        // doing so truncated the fence early and corrupted every tool
+        // section that contained a "#"-style comment.
+        if (!fence) {
+          if (isToolHeading(line)) break;
+          if (/^#{1,2} /.test(line)) break;
+        }
 
         if (!fence) {
           const m = line.match(/^(`{3,})/);
@@ -178,19 +210,34 @@ function renderMarkdown(text) {
 
 function inlineMarkdown(s) {
   let x=escapeHtml(s);
-  x=x.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<span class="md-image-placeholder" data-md-image="$2">🖼️ $1</span>');
+
+  // Image/link placeholders are generated HTML containing the raw asset
+  // path/URL. That path very often contains underscores (phone photos are
+  // named IMG_YYYYMMDD_HHMMSS.jpg) or asterisks. If the emphasis regexes
+  // below are allowed to scan that generated HTML too, they mangle the
+  // data-md-image/data-md-attachment attribute value (injecting a literal
+  // <em>/<strong> tag inside the attribute), which then never matches the
+  // unmangled path the asset-resolution code looks for — so the image never
+  // renders. Stash each generated placeholder behind an opaque token so the
+  // formatting passes below can't see inside it, then restore at the end.
+  const stash = [];
+  const protect = (html) => { const token = `\u0000${stash.length}\u0000`; stash.push(html); return token; };
+
+  x=x.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (m, alt, url) => protect(`<span class="md-image-placeholder" data-md-image="${url}">🖼️ ${alt}</span>`));
   x=x.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m,label,url) => {
     const safeUrl = String(url).replace(/\\/g, '/');
     if (/^(?:assets\/|archive\/.*\/assets\/)/.test(safeUrl)) {
-      return `<span class="md-attachment-placeholder" data-md-attachment="${escapeHtml(safeUrl)}">${escapeHtml(label)}</span>`;
+      return protect(`<span class="md-attachment-placeholder" data-md-attachment="${safeUrl}">${label}</span>`);
     }
-    return `<a href="${safeUrl}" target="_blank" rel="noreferrer">${label}</a>`;
+    return protect(`<a href="${safeUrl}" target="_blank" rel="noreferrer">${label}</a>`);
   });
   x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/__([^_]+)__/g,'<strong>$1</strong>');
   x=x.replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/_([^_]+)_/g,'<em>$1</em>');
   x=x.replace(/~~([^~]+)~~/g,'<del>$1</del>');
   x=x.replace(/`([^`]+)`/g,'<code>$1</code>');
   x=x.replace(/^&gt; (.*)$/gm,'<blockquote>$1</blockquote>');
+
+  x=x.replace(/\u0000(\d+)\u0000/g, (m, i) => stash[Number(i)]);
   return x;
 }
 

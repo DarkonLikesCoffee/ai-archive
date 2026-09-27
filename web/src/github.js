@@ -39,52 +39,65 @@ export async function readIndex(settings) {
 export async function readAsset(settings, path) {
   const apiPath = `/contents/${encodePath(path)}`;
   const f = await githubRequest(settings, apiPath);
-  const mime = f.type === 'file' ? (guessMime(path) || f.content_type || 'application/octet-stream') : 'application/octet-stream';
+  const mime = f.type === 'file'
+    ? (guessMime(path) || f.content_type || 'application/octet-stream')
+    : 'application/octet-stream';
 
-  // The Contents API only includes inline base64 content for reasonably small
-  // files. Images and larger attachments can therefore arrive without
-  // `content`. Fetch the raw representation explicitly so private-repo images
-  // are still previewable instead of falling back to a generic attachment card.
   let dataUrl = '';
-  const wantsBinary = /^image\//i.test(mime);
 
-  async function blobToDataUrl(blob) {
-    return await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
+  const wantsImagePreview = /^image\//i.test(mime);
+
+  // For private repositories, do not depend on download_url redirects or on
+  // the Contents endpoint deciding whether to include inline content. For an
+  // image, the blob API gives us authenticated base64 bytes for the exact file
+  // SHA, which can be turned directly into a browser-safe data URL.
+  if (wantsImagePreview && f.type === 'file' && f.sha) {
+    try {
+      const blob = await githubRequest(settings, `/git/blobs/${encodeURIComponent(f.sha)}`);
+      if (blob?.encoding === 'base64' && blob.content) {
+        dataUrl = base64ToDataUrl(blob.content, mime);
+      }
+    } catch {}
   }
 
-  if (wantsBinary) {
-    const raw = await fetch(`${API}/repos/${encodeURIComponent(settings.owner)}/${encodeURIComponent(settings.repo)}${apiPath}`, {
-      headers: {
-        Authorization: `Bearer ${settings.token}`,
-        Accept: 'application/vnd.github.raw',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    });
-    if (raw.ok) {
-      const blob = await raw.blob();
-      dataUrl = await blobToDataUrl(new Blob([blob], { type: mime }));
-    }
-    if (!dataUrl && f.download_url) {
-      const fallback = await fetch(f.download_url, {
-        headers: { Authorization: `Bearer ${settings.token}`, Accept: 'application/octet-stream' },
-      });
-      if (fallback.ok) dataUrl = await blobToDataUrl(new Blob([await fallback.blob()], { type: mime }));
-    }
-  } else if (f.content) {
+  // Small image files may already be present on the Contents response.
+  if (wantsImagePreview && !dataUrl && f.content) {
     dataUrl = base64ToDataUrl(f.content, mime);
-  } else if (f.download_url) {
-    const r = await fetch(f.download_url, {
-      headers: { Authorization: `Bearer ${settings.token}`, Accept: 'application/octet-stream' },
-    });
-    if (r.ok) dataUrl = await blobToDataUrl(await r.blob());
   }
 
-  return { name: path.split('/').pop(), path, mime, dataUrl, htmlUrl: f.html_url, downloadUrl: f.download_url, size: f.size };
+  // Last-resort raw fetch, used only for images. Keeping ZIP/PDF/etc. as
+  // metadata prevents the dashboard from downloading large attachments just
+  // to render a file card.
+  if (wantsImagePreview && !dataUrl && f.download_url) {
+    try {
+      const r = await fetch(f.download_url, {
+        headers: {
+          Authorization: `Bearer ${settings.token}`,
+          Accept: 'application/octet-stream',
+        },
+      });
+      if (r.ok) {
+        const blob = await r.blob();
+        dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = reject;
+          reader.readAsDataURL(new Blob([blob], { type: mime }));
+        });
+      }
+    } catch {}
+  }
+
+  return {
+    name: path.split('/').pop(),
+    path,
+    mime,
+    dataUrl,
+    sha: f.sha,
+    htmlUrl: f.html_url,
+    downloadUrl: f.download_url,
+    size: f.size,
+  };
 }
 
 function guessMime(path) {
