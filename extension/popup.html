@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AI Archive</title>
+<style>
+  *{box-sizing:border-box} body{width:390px;margin:0;padding:18px;font:14px system-ui,-apple-system,sans-serif;background:#f6f6f6;color:#171717}
+  h1{margin:0 0 4px;font-size:20px}.muted{color:#666;margin:0 0 16px}.section{background:#fff;border:1px solid #ddd;border-radius:12px;padding:14px;margin-bottom:12px}
+  label{display:block;margin:10px 0 5px;font-weight:600}input,select{width:100%;padding:9px;border:1px solid #ccc;border-radius:8px;background:#fff;font:inherit}
+  button{width:100%;margin-top:10px;padding:10px;border:0;border-radius:8px;background:#111;color:#fff;font-weight:600;cursor:pointer}button.secondary{background:#e9e9e9;color:#111}button.danger{background:#b42318}button:disabled{opacity:.55;cursor:not-allowed}
+  .toggle{display:flex;gap:8px;align-items:center;font-weight:500}.toggle input{width:auto}.status{margin-top:10px;font-size:12px}.ok{color:#176b3a}.err{color:#b42318}
+  .progress{height:8px;background:#e4e4e4;border-radius:99px;overflow:hidden;margin:10px 0}.progress>div{height:100%;width:0;background:#111;transition:width .15s ease}.stage{font-weight:650}.details{font-size:12px;color:#666;line-height:1.45}.hidden{display:none}.hint{font-size:11px;color:#666;line-height:1.4;margin:8px 0 0}
+</style>
+</head>
+<body>
+<h1>AI Archive</h1><p class="muted">Claude → private GitHub archive</p>
+<section id="setup" class="section">
+  <label>GitHub owner</label><input id="owner" placeholder="your-username">
+  <label>Private repository</label><input id="repo" placeholder="ai-conversation-archive">
+  <label>Archive account name</label><input id="accountSetup" placeholder="personal">
+  <label>Fine-grained token</label><input id="token" type="password" placeholder="github_pat_…">
+  <button id="save">Save GitHub settings</button>
+</section>
+<section id="logged" class="section hidden">
+  <div id="accountText" class="muted"></div>
+  <label>Archive account name</label><input id="accountLogged" placeholder="personal">
+  <label>Conversations to save</label>
+  <select id="syncLimit">
+    <option value="10">Latest 10</option>
+    <option value="25">Latest 25</option>
+    <option value="50">Latest 50</option>
+    <option value="100">Latest 100</option>
+    <option value="250">Latest 250</option>
+    <option value="all">All conversations</option>
+  </select>
+  <label class="toggle"><input id="autoSync" type="checkbox"><span>Automatically sync when Claude opens</span></label>
+  <button id="sync">Sync Claude</button>
+  <button id="clear" class="secondary">Disconnect</button>
+</section>
+<section id="progressSection" class="section hidden">
+  <div id="stage" class="stage">Ready</div>
+  <div class="progress"><div id="progressBar"></div></div>
+  <div id="progressText" class="details"></div>
+  <button id="cancel" class="danger">Cancel sync</button>
+</section>
+<div id="status" class="status"></div>
+<p class="hint">The archive stores conversations as Markdown. A sync creates at most one GitHub commit.</p>
+<script src="config.js"></script><script src="popup.js"></script>
+</body>
+</html>
