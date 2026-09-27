@@ -348,3 +348,153 @@ header{background:var(--bg);border-color:var(--border)!important}
   background:var(--surface);
 }
 .content .md-image:hover{border-color:var(--accent)}
+
+/* v0.6.8 — complete theme pass + message copy controls */
+:root[data-theme="slate"]{
+  --danger-bg:#321b20;--danger-border:#63313a;--danger-text:#ffb8c0;--shadow:rgba(0,0,0,.18);
+}
+:root[data-theme="black"]{
+  --danger-bg:#241012;--danger-border:#522126;--danger-text:#ffb8c0;--shadow:rgba(0,0,0,.28);
+}
+:root[data-theme="light"]{
+  --danger-bg:#fff1f2;--danger-border:#f0b7bd;--danger-text:#9f1239;--shadow:rgba(30,40,60,.10);
+}
+
+/* Theme every remaining global/control surface, not just the conversation. */
+body,.app,.reader-shell,.auth{background:var(--bg)!important;color:var(--text)!important}
+.sidebar{background:var(--surface)!important;border-right-color:var(--border)!important}
+.brand strong,header h1,.reader h2,.conversation strong{color:var(--text)!important}
+.brand-mark,.logo{background:var(--surface-3)!important;color:var(--text)!important}
+.brand small,.section-label,header p,.meta,.muted,.hint,.conv-side time,.preview{color:var(--muted)!important}
+.nav{color:var(--muted)!important}.nav:hover{background:var(--surface-2)!important;color:var(--text)!important}.nav.active{background:var(--surface-3)!important;color:var(--text)!important}.nav span{color:var(--muted)!important}
+.search,.auth input{background:var(--surface-2)!important;border-color:var(--border)!important;color:var(--text)!important}
+.search::placeholder,.auth input::placeholder{color:var(--muted)!important}
+.search:focus,.auth input:focus{border-color:var(--accent)!important;box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 15%,transparent)!important}
+.card{background:var(--surface)!important;border-color:var(--border)!important;box-shadow:0 12px 35px var(--shadow)}
+.auth label{color:var(--muted)!important}
+.auth button{background:var(--text)!important;color:var(--bg)!important}
+.error{background:var(--danger-bg)!important;border-color:var(--danger-border)!important;color:var(--danger-text)!important}
+.conversation{background:var(--surface)!important;border-color:var(--border)!important;color:var(--text)!important}
+.conversation:hover{background:var(--surface-2)!important;border-color:var(--accent)!important}
+.asset-count,.pill{background:var(--surface-3)!important;border-color:var(--border)!important;color:var(--muted)!important}
+.empty,.loading{color:var(--muted)!important}
+.reader-sticky-header{background:color-mix(in srgb,var(--bg) 92%,transparent)!important;border-color:var(--border)!important;box-shadow:0 8px 24px var(--shadow)!important}
+.back,.github-link{background:var(--surface-2)!important;border-color:var(--border)!important;color:var(--text)!important}
+.back:hover,.github-link:hover{background:var(--surface-3)!important;border-color:var(--accent)!important}
+.message{border-color:var(--border)!important}
+.message.user .content{background:var(--surface-2)!important;border-color:var(--border)!important;color:var(--text)!important}
+.message .role{color:var(--muted)!important}
+.message.user .role{color:var(--accent)!important}
+.message.assistant .role{color:var(--muted)!important}
+.content,.content p,.content li,.content h1,.content h2,.content h3{color:var(--text)!important}
+.content a{color:var(--accent)!important}
+.content blockquote{background:var(--surface-2)!important;border-left-color:var(--accent)!important;color:var(--muted)!important}
+.content code:not(pre code){background:var(--surface-3)!important;border-color:var(--border)!important;color:var(--text)!important}
+.content pre{background:var(--code-bg)!important;border-color:var(--code-border)!important}
+.tool-group-body{border-color:var(--border)!important}
+.tool-group>summary,.tool-detail>summary,.tool-detail-body,.tool-detail-body p{color:var(--muted)!important}
+.tool-group>summary:hover,.tool-detail>summary:hover{color:var(--text)!important;background:var(--surface-2)!important}
+.tool-detail-body pre{background:var(--code-bg)!important;border-color:var(--code-border)!important;color:var(--text)!important}
+.md-image-placeholder,.md-attachment-placeholder{background:var(--surface-2)!important;border-color:var(--border)!important;color:var(--muted)!important}
+.md-attachment-card{background:var(--surface-2)!important;border-color:var(--border)!important;color:var(--text)!important}
+.md-attachment-card:hover{background:var(--surface-3)!important;border-color:var(--accent)!important}
+.attachment-icon{background:var(--surface-3)!important;color:var(--accent)!important}
+.attachment-info strong{color:var(--text)!important}.attachment-info small{color:var(--muted)!important}
+.md-image{background:var(--surface)!important;border-color:var(--border)!important}
+.asset-skeleton{background:linear-gradient(90deg,var(--surface-2),var(--surface-3),var(--surface-2))!important;border-color:var(--border)!important}
+
+/* Copy button: intentionally quiet until the message is hovered/focused. */
+.message-head{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:18px;margin-bottom:13px}
+.message.user .message-head{justify-content:flex-end}
+.message.user .message-head .role{order:2}
+.message.user .message-head .copy-message{order:1}
+.copy-message{
+  border:1px solid transparent;
+  background:transparent;
+  color:var(--muted);
+  border-radius:6px;
+  padding:3px 7px;
+  font-size:11px;
+  line-height:1.4;
+  cursor:pointer;
+  opacity:0;
+  transition:opacity .12s ease,background .12s ease,border-color .12s ease,color .12s ease;
+}
+.message:hover .copy-message,.copy-message:focus-visible{opacity:1}
+.copy-message:hover{background:var(--surface-2);border-color:var(--border);color:var(--text)}
+.copy-message:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:1px}
+
+/* The highlight.js token colors below are deliberately theme-specific and
+   come after the generic code rules so light mode cannot inherit dark text. */
+:root[data-theme="slate"] .content .code-block .hljs-comment,:root[data-theme="black"] .content .code-block .hljs-comment{color:#8b949e!important}
+:root[data-theme="slate"] .content .code-block .hljs-keyword,:root[data-theme="black"] .content .code-block .hljs-keyword{color:#ff7b9c!important}
+:root[data-theme="slate"] .content .code-block .hljs-string,:root[data-theme="black"] .content .code-block .hljs-string{color:#9cdc9c!important}
+:root[data-theme="slate"] .content .code-block .hljs-number,:root[data-theme="black"] .content .code-block .hljs-number{color:#d7ba7d!important}
+:root[data-theme="slate"] .content .code-block .hljs-title,:root[data-theme="black"] .content .code-block .hljs-title{color:#79c0ff!important}
+:root[data-theme="slate"] .content .code-block .hljs-built_in,:root[data-theme="black"] .content .code-block .hljs-built_in{color:#8ed0ff!important}
+:root[data-theme="slate"] .content .code-block .hljs-attr,:root[data-theme="black"] .content .code-block .hljs-attr{color:#c9a7ff!important}
+:root[data-theme="slate"] .content .code-block .hljs-meta,:root[data-theme="black"] .content .code-block .hljs-meta{color:#a5adba!important}
+:root[data-theme="slate"] .content .code-block .hljs-deletion,:root[data-theme="black"] .content .code-block .hljs-deletion{color:#ff8b8b!important}
+
+:root[data-theme="light"] .content .code-block .hljs-comment,:root[data-theme="light"] .content .code-block .hljs-quote{color:#6b7280!important}
+:root[data-theme="light"] .content .code-block .hljs-keyword,:root[data-theme="light"] .content .code-block .hljs-selector-tag,:root[data-theme="light"] .content .code-block .hljs-literal{color:#a6266e!important}
+:root[data-theme="light"] .content .code-block .hljs-string,:root[data-theme="light"] .content .code-block .hljs-regexp,:root[data-theme="light"] .content .code-block .hljs-addition{color:#18743b!important}
+:root[data-theme="light"] .content .code-block .hljs-number,:root[data-theme="light"] .content .code-block .hljs-variable,:root[data-theme="light"] .content .code-block .hljs-template-variable{color:#8a5a00!important}
+:root[data-theme="light"] .content .code-block .hljs-title,:root[data-theme="light"] .content .code-block .hljs-title.class_,:root[data-theme="light"] .content .code-block .hljs-title.function_,:root[data-theme="light"] .content .code-block .hljs-function .hljs-title{color:#075a8d!important}
+:root[data-theme="light"] .content .code-block .hljs-built_in,:root[data-theme="light"] .content .code-block .hljs-type,:root[data-theme="light"] .content .code-block .hljs-params{color:#2459a6!important}
+:root[data-theme="light"] .content .code-block .hljs-attr,:root[data-theme="light"] .content .code-block .hljs-attribute{color:#6941a5!important}
+:root[data-theme="light"] .content .code-block .hljs-meta{color:#5f6b7a!important}
+:root[data-theme="light"] .content .code-block .hljs-deletion{color:#b42318!important}
+
+/* Reply context should remain one coherent quoted block. */
+.reply-context{color:var(--muted)!important;border-left-color:var(--accent)!important}
+.reply-context-icon{color:var(--accent)!important}.reply-context-label,.reply-context-label strong{color:var(--text)!important}.reply-context-label span,.reply-context-quote{color:var(--muted)!important}
+.reply-context-quote code{color:var(--text)!important;background:var(--surface-3)!important}
+
+
+/* v0.6.9 — message actions and robust quote blocks */
+.message{border-bottom:0!important;padding:26px 8px 30px!important}
+.message-actions{width:100%;display:flex;justify-content:flex-start;margin-top:9px;min-height:22px}
+.message.user .message-actions{justify-content:flex-end}
+.copy-message{
+  border:1px solid var(--border)!important;
+  background:transparent!important;
+  color:var(--muted)!important;
+  border-radius:6px;
+  padding:3px 8px;
+  font-size:11px;
+  line-height:1.4;
+  cursor:pointer;
+  opacity:.72;
+  transition:opacity .12s ease,background .12s ease,border-color .12s ease,color .12s ease;
+}
+.copy-message:hover{opacity:1;background:var(--surface-2)!important;border-color:var(--border)!important;color:var(--text)!important}
+.copy-message:focus-visible{opacity:1;outline:2px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:1px}
+.content>blockquote{margin:14px 0;padding:12px 15px;border-left:3px solid var(--accent);background:var(--surface-2);color:var(--muted);border-radius:0 8px 8px 0}
+.content>blockquote>ul,.content>blockquote>p,.content>blockquote>h1,.content>blockquote>h2,.content>blockquote>h3{margin-top:0}
+.content>blockquote>ul:last-child,.content>blockquote>p:last-child,.content>blockquote>h1:last-child,.content>blockquote>h2:last-child,.content>blockquote>h3:last-child{margin-bottom:0}
+
+/* v0.6.11 — scoped conversation find controls */
+.reader-find{position:relative;min-width:0;width:100%;display:flex;align-items:center}
+.reader-find .reader-search{padding-right:150px}
+.reader-find-controls{position:absolute;right:7px;top:50%;transform:translateY(-50%);display:flex;align-items:center;gap:2px}
+.reader-find-count{font-size:11px;color:var(--muted);white-space:nowrap;padding:0 4px}
+.reader-find-button{width:24px;height:24px;padding:0;border:0;border-radius:5px;background:transparent;color:var(--muted);display:grid;place-items:center;cursor:pointer;font-size:15px;line-height:1}
+.reader-find-button:hover:not(:disabled){background:var(--surface-3);color:var(--text)}
+.reader-find-button:disabled{opacity:.35;cursor:default}
+.reader-find-button:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:1px}
+.conversation-find-match{background:color-mix(in srgb,var(--accent) 28%,transparent);color:inherit;border-radius:3px;padding:0 1px}
+.conversation-find-match.current{background:var(--accent);color:var(--bg);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 20%,transparent)}
+
+/* Copy is intentionally invisible until the message is hovered or focused. */
+.message-actions{opacity:0;transition:opacity .12s ease}
+.message:hover .message-actions,.message:focus-within .message-actions{opacity:1}
+.copy-message{opacity:1!important}
+
+@media(max-width:900px){
+  .reader-sticky-header{grid-template-columns:auto minmax(180px,1fr) auto}
+}
+@media(max-width:700px){
+  .reader-sticky-header{grid-template-columns:auto 1fr}
+  .reader-header-actions{display:none}
+}

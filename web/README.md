@@ -1,4 +1,4 @@
-# AI Archive Dashboard v0.6.6
+# AI Archive Dashboard v0.6.10
 
 Web dashboard for browsing the AI conversation archive stored in a private GitHub repository.
 
@@ -14,9 +14,20 @@ Web dashboard for browsing the AI conversation archive stored in a private GitHu
 - Image asset lookup also supports filename/basename fallbacks and URL fragments/query strings.
 - Existing compact tool groups, right-aligned user messages, sticky reader header, hidden metadata, Markdown rendering, and attachment cards are retained.
 
+## v0.6.10
+- Message copy controls are hidden until a message is hovered or focused.
+- Copying strips Claude tool sections, reply excerpts, and local attachment links, leaving only the actual message/response.
+- The conversation search is now a local find bar for the currently open conversation, with match counts, Enter/Shift+Enter navigation, Escape to clear, and highlighted matches.
+
 ## Run
 
 ```bash
 npm install
 npm run dev
 ```
+
+
+## v0.6.11
+- Conversation search is scoped to the currently open conversation.
+- Ctrl/Cmd+F focuses the conversation search instead of the browser find UI.
+- Added previous/next result buttons and a live match count.
