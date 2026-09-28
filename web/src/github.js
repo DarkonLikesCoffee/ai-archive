@@ -114,25 +114,81 @@ export async function readConversation(settings, path) {
   return parseConversationMarkdown(await readText(settings, path));
 }
 
+function normalizeMarkdown(markdown) {
+  return String(markdown ?? '').replace(/\r\n?/g, '\n');
+}
+
 function parseMetadata(markdown) {
-  const m = markdown.match(/^<!--\s*AI_ARCHIVE_METADATA\s*\n([\s\S]*?)\n-->\s*\n\n?/);
-  if (!m) return { metadata: {}, body: markdown };
-  try { return { metadata: JSON.parse(m[1]), body: markdown.slice(m[0].length) }; }
-  catch { return { metadata: {}, body: markdown.slice(m[0].length) }; }
+  const normalized = normalizeMarkdown(markdown);
+  const m = normalized.match(/^<!--\s*AI_ARCHIVE_METADATA\s*\n([\s\S]*?)\n-->[ \t]*(?:\n[ \t]*)*/);
+  if (!m) return { metadata: {}, body: normalized };
+  try {
+    return { metadata: JSON.parse(m[1]), body: normalized.slice(m[0].length) };
+  } catch {
+    return { metadata: {}, body: normalized.slice(m[0].length) };
+  }
+}
+
+function splitMessageBlocks(content) {
+  const lines = String(content).split('\n');
+  const parts = [];
+  let current = [];
+  let fenceChar = null;
+  let fenceLength = 0;
+
+  const isFenceStart = (line) => {
+    const match = line.match(/^\s*(`{3,}|~{3,})/);
+    return match ? match[1] : null;
+  };
+
+  const isFenceClose = (line) => {
+    if (!fenceChar) return false;
+    const expression = new RegExp('^\\s*' + fenceChar + '{' + fenceLength + ',}\\s*$');
+    return expression.test(line);
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (fenceChar) {
+      current.push(line);
+      if (isFenceClose(line)) { fenceChar = null; fenceLength = 0; }
+      continue;
+    }
+    const fence = isFenceStart(line);
+    if (fence) { fenceChar = fence[0]; fenceLength = fence.length; current.push(line); continue; }
+    if (line.trim() === '---') {
+      let next = i + 1;
+      while (next < lines.length && !lines[next].trim()) next += 1;
+      if (next < lines.length && /^## /.test(lines[next])) {
+        parts.push(current.join('\n'));
+        current = [];
+        i = next - 1;
+        continue;
+      }
+    }
+    current.push(line);
+  }
+  parts.push(current.join('\n'));
+  return parts;
 }
 
 export function parseConversationMarkdown(markdown) {
   const { metadata, body } = parseMetadata(markdown);
-  const titleMatch = body.match(/^# ([^\n]+)\n\n/);
+  const titleMatch = body.match(/^# ([^\n]+)(?:\n\n|\n)/);
   const title = metadata.title || (titleMatch ? titleMatch[1].trim() : 'Untitled conversation');
   const content = titleMatch ? body.slice(titleMatch[0].length) : body;
-  const parts = content.split(/\n---\n\n(?=## )/g);
+  const parts = splitMessageBlocks(content);
   const messages = [];
   for (const part of parts) {
-    const m = part.match(/^## ([^\n]+)\n\n([\s\S]*?)(?:\n)?$/);
+    const m = part.match(/^## ([^\n]+)\n(?:\n)?([\s\S]*?)(?:\n)?$/);
     if (!m) continue;
     const roleName = m[1].trim();
-    const role = roleName.toLowerCase() === 'you' ? 'user' : roleName.toLowerCase() === metadata.provider ? 'assistant' : roleName.toLowerCase();
+    const normalizedRole = roleName.toLowerCase();
+    const role = normalizedRole === 'you'
+      ? 'user'
+      : normalizedRole === String(metadata.provider || '').toLowerCase()
+        ? 'assistant'
+        : normalizedRole;
     messages.push({ role, roleName, content: m[2].replace(/\n$/, '') });
   }
   return { ...metadata, title, messages };
