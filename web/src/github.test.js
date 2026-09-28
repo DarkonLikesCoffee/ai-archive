@@ -133,3 +133,40 @@ test('normalizes CRLF input', () => {
   assert.equal(result.messages[0].content, 'Hello');
   assert.equal(result.messages[1].content, 'Hi');
 });
+
+test('does not split on a separator-looking line inside a fenced code block', () => {
+  const result = parseConversationMarkdown(`# Test
+
+## You
+
+```text
+---
+## Not a message
+---
+```
+
+---
+
+## Claude
+
+Answer
+`);
+
+  assert.equal(result.messages.length, 2);
+  assert.match(result.messages[0].content, /## Not a message/);
+  assert.match(result.messages[0].content, /---/);
+});
+
+test('accepts LF-separated role headings without requiring two blank lines', () => {
+  const result = parseConversationMarkdown(`# Test
+## You
+Hello
+---
+## Claude
+Hi
+`);
+
+  assert.equal(result.messages.length, 2);
+  assert.equal(result.messages[0].content, 'Hello');
+  assert.equal(result.messages[1].content, 'Hi');
+});
