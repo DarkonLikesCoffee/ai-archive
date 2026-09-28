@@ -127,7 +127,21 @@ Hello
 });
 
 test('normalizes CRLF input', () => {
-  const result = parseConversationMarkdown('# Test\\r\\n\\r\\n## You\\r\\n\\r\\nHello\\r\\n\\r\\n---\\r\\n\\r\\n## Claude\\r\\n\\r\\nHi');
+  const markdown = [
+    '# Test',
+    '',
+    '## You',
+    '',
+    'Hello',
+    '',
+    '---',
+    '',
+    '## Claude',
+    '',
+    'Hi',
+  ].join('\\r\\n');
+
+  const result = parseConversationMarkdown(markdown);
 
   assert.equal(result.messages.length, 2);
   assert.equal(result.messages[0].content, 'Hello');
@@ -135,22 +149,26 @@ test('normalizes CRLF input', () => {
 });
 
 test('does not split on a separator-looking line inside a fenced code block', () => {
-  const result = parseConversationMarkdown(`# Test
+  const markdown = [
+    '# Test',
+    '',
+    '## You',
+    '',
+    '```text',
+    '---',
+    '## Not a message',
+    '---',
+    '```',
+    '',
+    '---',
+    '',
+    '## Claude',
+    '',
+    'Answer',
+    '',
+  ].join('\\n');
 
-## You
-
-```text
----
-## Not a message
----
-```
-
----
-
-## Claude
-
-Answer
-`);
+  const result = parseConversationMarkdown(markdown);
 
   assert.equal(result.messages.length, 2);
   assert.match(result.messages[0].content, /## Not a message/);
