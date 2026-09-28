@@ -139,7 +139,7 @@ test('normalizes CRLF input', () => {
     '## Claude',
     '',
     'Hi',
-  ].join('\\r\\n');
+  ].join('\r\n');
 
   const result = parseConversationMarkdown(markdown);
 
@@ -166,7 +166,7 @@ test('does not split on a separator-looking line inside a fenced code block', ()
     '',
     'Answer',
     '',
-  ].join('\\n');
+  ].join('\n');
 
   const result = parseConversationMarkdown(markdown);
 
