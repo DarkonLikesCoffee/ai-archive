@@ -275,31 +275,58 @@
     // Collect and deduplicate tasks before starting downloads, then process
     // them with a small concurrency limit while preserving message/file order.
     const directTasks = [];
+    const directTasksByKey = new Map();
     for (const message of messages) {
       for (const file of (Array.isArray(message.files) ? message.files : [])) {
         const url = file?.preview_asset?.url || file?.preview_url || file?.document_asset?.url;
         if (!url) continue;
         const name = file.file_name || file.name || `file-${file.file_uuid || file.uuid || directTasks.length + 1}`;
-        const key = `${file.file_uuid || file.uuid || name}|${url}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        directTasks.push({ message, file, url, name });
+        const fileId = file.file_uuid || file.uuid || null;
+        const identity = fileId ? `id:${fileId}` : `name:${name}`;
+        const key = `${identity}|${url}`;
+        const messageId = message.uuid || message.id || null;
+        const existingTask = directTasksByKey.get(key);
+        if (existingTask) {
+          if (messageId && !existingTask.messageExternalIds.includes(messageId)) {
+            existingTask.messageExternalIds.push(messageId);
+          }
+          continue;
+        }
+
+        const task = {
+          message,
+          file,
+          url,
+          name,
+          messageExternalIds: messageId ? [messageId] : [],
+        };
+        directTasksByKey.set(key, task);
+        directTasks.push(task);
       }
     }
 
     const directAssets = await mapWithConcurrency(
       directTasks,
       ASSET_DOWNLOAD_CONCURRENCY,
-      async ({ message, file, url, name }) => {
+      async ({ message, file, url, name, messageExternalIds }) => {
         const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
-        return { asset, message, file };
+        return { asset, message, file, messageExternalIds };
       },
       signal,
     );
 
-    for (const { asset, message, file } of directAssets) {
+    for (const { asset, message, file, messageExternalIds } of directAssets) {
       const messageId = message.uuid || message.id || null;
-      assets.push({ ...asset, source: 'message', file_uuid: file.file_uuid || file.uuid || null, message_external_id: messageId });
+      const linkedMessageIds = messageExternalIds.length
+        ? messageExternalIds
+        : (messageId ? [messageId] : []);
+      assets.push({
+        ...asset,
+        source: 'message',
+        file_uuid: file.file_uuid || file.uuid || null,
+        message_external_id: messageId,
+        ...(linkedMessageIds.length ? { message_external_ids: linkedMessageIds } : {}),
+      });
       const nameKey = String(asset.name || '').toLowerCase();
       messageAssetFingerprints.add(`${nameKey}|${asset.sha256}`);
       fingerprintsForMessage(message).add(`${nameKey}|${asset.sha256}`);
