@@ -1175,3 +1175,67 @@ test('refuses detailed Claude payloads without a valid conversation UUID', async
     assert.equal(harness.handoffs.length, 0, `payload with ${label} must not reach GitHub`);
   }
 });
+
+
+test('refuses an active lineage whose leaf has no parent pointer', async () => {
+  const conversation = {
+    uuid: 'conversation-missing-parent-pointer',
+    name: 'Missing parent pointer',
+    current_leaf_message_uuid: 'active-leaf',
+    chat_messages: [
+      {
+        uuid: 'root-user',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Original request' }],
+      },
+      {
+        uuid: 'active-leaf',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'Response with missing parent pointer' }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /message "active-leaf" has no parent_message_uuid/);
+  assert.match(error.error, /active lineage cannot be verified back to the root/);
+  assert.equal(harness.handoffs.length, 0, 'an unverified active chain must not reach GitHub');
+});
+
+test('refuses an active lineage whose intermediate message has no parent pointer', async () => {
+  const conversation = {
+    uuid: 'conversation-missing-intermediate-parent',
+    name: 'Missing intermediate parent pointer',
+    current_leaf_message_uuid: 'active-leaf',
+    chat_messages: [
+      {
+        uuid: 'root-user',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Original request' }],
+      },
+      {
+        uuid: 'middle-message',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'Intermediate reply with missing parent' }],
+      },
+      {
+        uuid: 'active-leaf',
+        parent_message_uuid: 'middle-message',
+        sender: 'human',
+        content: [{ type: 'text', text: 'Follow-up' }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /message "middle-message" has no parent_message_uuid/);
+  assert.equal(harness.handoffs.length, 0, 'a truncated intermediate chain must not be exported');
+});
