@@ -29,6 +29,7 @@ function createHarness(conversation, {
   downloadDelayMs = 0,
   sandboxDownloadDelayMs = 0,
   assetDownloadConcurrency = 3,
+  cancelOnFirstDigest = false,
 } = {}) {
   const listeners = [];
   const requests = [];
@@ -38,6 +39,9 @@ function createHarness(conversation, {
   const firstHandoff = new Promise((resolve) => { resolveFirstHandoff = resolve; });
   let resolveErrorProgress;
   const errorProgress = new Promise((resolve) => { resolveErrorProgress = resolve; });
+  let resolveCancelledProgress;
+  const cancelledProgress = new Promise((resolve) => { resolveCancelledProgress = resolve; });
+  let cancelTriggeredDuringDigest = false;
   let finishFirstHandoff;
   let activeDownloads = 0;
   let maxActiveDownloads = 0;
@@ -54,6 +58,7 @@ function createHarness(conversation, {
         if (message.type === 'syncProgress') {
           progressMessages.push(message);
           if (message.stage === 'error') resolveErrorProgress(message);
+          if (message.stage === 'cancelled') resolveCancelledProgress(message);
         }
         if (message.type === 'syncNormalized') {
           handoffs.push(message);
@@ -150,7 +155,17 @@ function createHarness(conversation, {
     TextEncoder,
     Uint8Array,
     btoa,
-    crypto: webcrypto,
+    crypto: {
+      subtle: {
+        digest: async (...args) => {
+          if (cancelOnFirstDigest && !cancelTriggeredDuringDigest) {
+            cancelTriggeredDuringDigest = true;
+            listeners[0]?.({ type: 'cancelSync' }, {}, () => {});
+          }
+          return webcrypto.subtle.digest(...args);
+        },
+      },
+    },
   }, { filename: 'extension/content.js' });
 
   assert.equal(listeners.length, 1, 'content script should register one message listener');
@@ -160,6 +175,7 @@ function createHarness(conversation, {
     handoffs,
     progressMessages,
     errorProgress,
+    cancelledProgress,
     firstHandoff,
     metrics() {
       return { maxActiveDownloads };
@@ -679,4 +695,35 @@ test('benchmark: bounded asset downloads against sequential baseline at multiple
 
   t.diagnostic('Synthetic asset download benchmark (lower time is better; simulated network latency only):');
   t.diagnostic(JSON.stringify(measurements));
+});
+
+
+
+test('cancelling while hashing an extracted attachment prevents the GitHub handoff', async () => {
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Cancellation during attachment hashing',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Archive this extracted attachment.' }],
+      attachments: [{
+        file_name: 'notes.txt',
+        file_type: 'text/plain',
+        extracted_content: 'Synthetic text attachment used to test cancellation.',
+      }],
+    }],
+  };
+  const harness = createHarness(conversation, { cancelOnFirstDigest: true });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const outcome = await Promise.race([
+    harness.firstHandoff.then(() => 'handoff'),
+    harness.cancelledProgress.then(() => 'cancelled'),
+  ]);
+
+  assert.equal(outcome, 'cancelled', 'the cancellation message should win before any archive handoff');
+  assert.equal(harness.handoffs.length, 0, 'a cancelled normalization must not be handed to GitHub');
 });

@@ -290,12 +290,14 @@
     // are displayed inline as quoted context immediately before the user's message.
     for (const message of messages) {
       for (const attachment of (Array.isArray(message.attachments) ? message.attachments : [])) {
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
         if (!attachment?.extracted_content || isReplyExcerptAttachment(attachment)) continue;
         const name = String(attachment.file_name || attachment.name || 'attachment.txt');
         const nameKey = name.toLowerCase();
         const text = String(attachment.extracted_content);
         const buffer = new TextEncoder().encode(text).buffer;
         const hash = await sha256Bytes(buffer);
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
         const messageId = message.uuid || message.id || null;
         const fingerprint = `${nameKey}|${hash}`;
         const scopedFingerprints = fingerprintsForMessage(message);
@@ -429,13 +431,17 @@
       const conversations = [];
       for (let i = 0; i < selected.length; i++) {
         if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        conversations.push(await normalize(await full(org, selected[i].uuid, signal), org, signal));
+        const conversation = await normalize(await full(org, selected[i].uuid, signal), org, signal);
+        if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        conversations.push(conversation);
         sendProgress({ stage: 'fetching', current: i + 1, total, selected: limit });
       }
 
+      if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
       sendProgress({ stage: 'preparing', current: 0, total, selected: limit });
       // Data is already normalized above; this stage exists to make the handoff explicit.
       sendProgress({ stage: 'preparing', current: total, total, selected: limit });
+      if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
       // Keep the content-script lock until the background sync has actually
       // finished; otherwise another startSync message can trigger a second fetch
       // while the first batch is still being committed to GitHub.
