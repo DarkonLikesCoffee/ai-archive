@@ -19,8 +19,8 @@ function assertNotCancelled() {
   if (cancelRequested) throw new Error('__SYNC_CANCELLED__');
 }
 
-async function gh(path, opts = {}) {
-  assertNotCancelled();
+async function gh(path, opts = {}, allowAfterCancel = false) {
+  if (!allowAfterCancel) assertNotCancelled();
   const s = await settings();
   if (!s.github_owner || !s.github_repo || !s.github_token) throw Error('Configure GitHub settings in the extension popup first.');
   const headers = {
@@ -34,7 +34,7 @@ async function gh(path, opts = {}) {
   const r = await fetch(`${API}/repos/${encodeURIComponent(s.github_owner)}/${encodeURIComponent(s.github_repo)}${path}`, {
     ...opts,
     headers,
-    signal: controller?.signal,
+    signal: allowAfterCancel ? undefined : controller?.signal,
   });
   const text = await r.text();
   if (!r.ok) throw Error(`GitHub ${r.status}: ${text.slice(0, 400)}`);
@@ -580,7 +580,50 @@ async function sync(conversations, onProgress) {
     if (baseCommit && latestRef?.object?.sha !== baseCommit.sha) {
       throw new Error('The GitHub branch changed during this sync. Nothing was published; run sync again to include the latest archive.');
     }
-    await gh(`/git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: commit.sha, force: false }) });
+    try {
+      await gh(`/git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: commit.sha, force: false }) });
+    } catch (publishError) {
+      // A timeout or cancellation can happen after GitHub accepted the PATCH but
+      // before the response reaches this client. Verify the branch head without
+      // the aborted sync signal before reporting cancellation or failure.
+      let observedRef;
+      try {
+        observedRef = await gh(`/git/ref/heads/${branch}`, {}, true);
+      } catch (verificationError) {
+        const error = new Error(
+          `The GitHub ref update returned an error and its outcome could not be verified. Check the "${branch}" branch on GitHub before retrying. Update error: ${String(publishError?.message || publishError)}. Verification error: ${String(verificationError?.message || verificationError)}`,
+        );
+        error.name = 'PublicationUncertainError';
+        throw error;
+      }
+
+      if (observedRef?.object?.sha === commit.sha) {
+        // The server committed the ref update despite the lost/aborted response.
+        // Report success rather than incorrectly telling the user it was cancelled.
+        onProgress?.({
+          stage: 'done',
+          current: 1,
+          total: 1,
+          changed: changedConversations,
+          commit: commit.sha,
+          message: `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit. The response to the final update was interrupted, but GitHub confirms the commit is published.`,
+        });
+        return { total, changed: changedConversations, commit: commit.sha };
+      }
+
+      if (baseCommit && observedRef?.object?.sha === baseCommit.sha) {
+        // The original head is still present, so the attempted update did not
+        // become visible. Preserve the original error (including cancellation).
+        throw publishError;
+      }
+
+      const error = new Error(
+        `The GitHub ref update returned an error and the branch now points to a different commit. The sync commit may or may not have been published before another update; inspect the "${branch}" branch history before retrying. Update error: ${String(publishError?.message || publishError)}`,
+      );
+      error.name = 'PublicationUncertainError';
+      throw error;
+    }
+
     onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.` });
     return { total, changed: changedConversations, commit: commit.sha };
   } finally {
