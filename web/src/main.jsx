@@ -69,9 +69,9 @@ function renderMarkdown(text) {
         // followed by a fenced quote. Keep the familiar reply-context card.
         let fenceIndex = j + 1;
         while (fenceIndex < blockLines.length && !blockLines[fenceIndex].trim()) fenceIndex++;
-        if (fenceIndex < blockLines.length && /^\\s*`{3,}|^\\s*~{3,}/.test(blockLines[fenceIndex])) {
+        if (fenceIndex < blockLines.length && /^\s*(`{3,}|~{3,})/.test(blockLines[fenceIndex])) {
           const fenceLine = blockLines[fenceIndex];
-          const fence = fenceLine.match(/^\\s*(`{3,}|~{3,})/)?.[1] || '```';
+          const fence = fenceLine.match(/^\s*(`{3,}|~{3,})/)?.[1] || '```';
           const quote = [];
           let k = fenceIndex + 1;
           const marker = fence[0];
