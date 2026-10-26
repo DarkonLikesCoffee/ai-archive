@@ -200,14 +200,16 @@ function parseMetadata(markdown) {
 // Messages are exported as "## <Role>" sections joined by "---". Message
 // bodies are not escaped, and Claude answers often contain a horizontal rule
 // followed by an ordinary "## Section" heading, so only a heading naming a
-// role the exporter writes ("You" or the provider, e.g. "Claude") starts a new
-// message. Without provider metadata, keep the old split-on-any-heading rule.
+// role the exporter writes starts a new message: "You", the provider (e.g.
+// "Claude"), or a raw lowercase role identifier such as "system" (written for
+// any other sender). Without provider metadata, keep the old rule.
 function roleHeadingMatcher(provider) {
   const providerName = String(provider || '').trim().toLowerCase();
   if (!providerName) return () => true;
   return (line) => {
-    const name = line.replace(/^## /, '').trim().toLowerCase();
-    return name === 'you' || name === providerName;
+    const heading = line.replace(/^## /, '').trim();
+    const name = heading.toLowerCase();
+    return name === 'you' || name === providerName || /^[a-z][a-z0-9_-]*$/.test(heading);
   };
 }
 
