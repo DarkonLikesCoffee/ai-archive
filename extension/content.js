@@ -110,14 +110,17 @@
   }
 
   async function fetchAsset(url, name, mime, signal) {
-    if (!url) return null;
+    const label = safeAssetName(name);
+    if (!url) {
+      throw new Error(`Cannot download attachment "${label}": no download URL was provided.`);
+    }
     try {
       const r = await fetch(url, { credentials: 'include', signal });
-      if (!r.ok) return null;
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const buffer = await r.arrayBuffer();
-      if (!buffer.byteLength) return null;
+      if (!buffer.byteLength) throw new Error('the download returned an empty file');
       return {
-        name: safeAssetName(name),
+        name: label,
         mime: mime || r.headers.get('content-type') || 'application/octet-stream',
         base64: bytesToBase64(buffer),
         size: buffer.byteLength,
@@ -125,32 +128,50 @@
       };
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      return null;
+      throw new Error(`Failed to download attachment "${label}": ${e?.message || 'network error'}. Sync stopped before anything was sent to GitHub; retry the sync.`);
     }
   }
 
   async function fetchSandboxFiles(org, conversationId, signal) {
+    const endpoint = `/api/organizations/${org}/conversations/${conversationId}/wiggle/list-files`;
+    let r;
     try {
-      const r = await fetch(`/api/organizations/${org}/conversations/${conversationId}/wiggle/list-files`, {
-        credentials: 'include', signal,
-      });
-      if (!r.ok) return [];
-      const data = await r.json();
-      const files = Array.isArray(data?.files_metadata) ? data.files_metadata : [];
-      const out = [];
-      for (const file of files) {
-        if (!file?.path) continue;
-        const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(file.path)}`;
-        const asset = await fetchAsset(url, file.path.split('/').pop(), file.content_type, signal);
-        if (asset) {
-          out.push({ ...asset, source_path: file.path, source: 'sandbox' });
-        }
-      }
-      return out;
+      r = await fetch(endpoint, { credentials: 'include', signal });
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      return [];
+      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}": ${e?.message || 'network error'}. Sync stopped before anything was sent to GitHub; retry the sync.`);
     }
+    if (!r.ok) {
+      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}" (HTTP ${r.status}). Sync stopped before anything was sent to GitHub; retry the sync.`);
+    }
+
+    let data;
+    try {
+      data = await r.json();
+    } catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      throw new Error(`Claude returned an unreadable sandbox file list for conversation "${conversationId}". Sync stopped before anything was sent to GitHub; retry the sync.`);
+    }
+    if (!Array.isArray(data?.files_metadata)) {
+      throw new Error(`Claude returned an invalid sandbox file list for conversation "${conversationId}". Sync stopped before anything was sent to GitHub; retry the sync.`);
+    }
+
+    const out = [];
+    for (const file of data.files_metadata) {
+      if (!file?.path) {
+        throw new Error(`Claude returned sandbox file metadata without a path for conversation "${conversationId}". Sync stopped before anything was sent to GitHub.`);
+      }
+      const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(file.path)}`;
+      let asset;
+      try {
+        asset = await fetchAsset(url, file.path.split('/').pop() || file.path, file.content_type, signal);
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e;
+        throw new Error(`Failed to download sandbox file "${file.path}": ${e?.message || 'download error'}`);
+      }
+      out.push({ ...asset, source_path: file.path, source: 'sandbox' });
+    }
+    return out;
   }
 
   function isReplyExcerptAttachment(file) {
