@@ -1372,6 +1372,11 @@ test('redacts oversized media payloads nested inside tool results', async () => 
   assert.match(rendered, /Chart generated/);
   assert.match(rendered, /omitted inline payload: 8192 characters/);
   assert.equal(rendered.includes(binaryPayload), false, 'binary data should not inflate the Markdown transcript');
+  assert.equal(
+    handoff.conversations[0].assets.filter((asset) => asset.source === 'message-content').length,
+    0,
+    'images inside fenced tool results must not become unresolved inline-image assets',
+  );
 
   harness.finishFirstHandoff({ ok: true });
 });
@@ -1415,6 +1420,8 @@ test('materializes inline base64 image blocks that have no message.files entry',
   assert.equal(Buffer.from(imageAssets[0].base64, 'base64').toString('utf8'), imageBytes);
   assert.equal(normalized.messages[1].content.includes(imageBase64), false,
     'inline image bytes must not be copied into Markdown text');
+  assert.match(normalized.messages[1].content, /\[\[AI_ARCHIVE_INLINE_IMAGE:0\]\]/,
+    'the image position should be retained for the Markdown renderer');
 
   harness.finishFirstHandoff({ ok: true });
 });

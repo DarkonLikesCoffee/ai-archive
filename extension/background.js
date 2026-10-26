@@ -270,7 +270,9 @@ function attachmentMarkdown(message, assetMap, allAssets) {
   const used = new Set();
 
   const addAsset = (asset) => {
-    if (!asset || used.has(asset.path)) return;
+    // Inline content-block images are rendered at their original position in
+    // the message body, so do not repeat them in the trailing attachment list.
+    if (!asset || used.has(asset.path) || (Array.isArray(asset.inline_image_indices) && asset.inline_image_indices.length)) return;
     used.add(asset.path);
     parts.push(assetMarkdown(asset, asset.path));
   };
@@ -331,13 +333,22 @@ function conversationMarkdown(c, provider, account, assetMap, allAssets) {
         ? provider[0].toUpperCase() + provider.slice(1)
         : m.role;
     const attachments = attachmentMarkdown(m, assetMap, allAssets);
+    const content = String(m.content || '').replace(/\[\[AI_ARCHIVE_INLINE_IMAGE:(\d+)\]\]/g, (marker, rawIndex) => {
+      const imageIndex = Number(rawIndex);
+      const image = allAssets.find((asset) =>
+        Array.isArray(asset.inline_image_indices)
+        && asset.inline_image_indices.includes(imageIndex)
+        && assetMatchesMessage(asset, m, allAssets)
+      );
+      return image ? assetMarkdown(image, image.path) : marker;
+    });
 
     // User attachments/reply excerpts are shown before the user's message, matching
     // Claude's UI. Claude-generated files stay with the Claude response that produced
     // or referenced them, rather than being dumped into a trailing Files section.
     const body = role === 'You'
-      ? [attachments, m.content].filter(Boolean).join('\n\n')
-      : [m.content, attachments].filter(Boolean).join('\n\n');
+      ? [attachments, content].filter(Boolean).join('\n\n')
+      : [content, attachments].filter(Boolean).join('\n\n');
     return `## ${role}\n\n${body}\n`;
   });
 

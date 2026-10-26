@@ -914,3 +914,42 @@ test('renders a shared direct asset in every message that references it', () => 
   const expectedLink = '![shared-report.png](assets/conversation/shared-report.png)';
   assert.equal(markdown.split(expectedLink).length - 1, 2, 'each message should link to the shared file');
 });
+
+
+test('renders inline image markers at their original message position without duplicating them as attachments', () => {
+  const { conversationMarkdown, findMessageAssets } = loadBackgroundAssetHelpers();
+  const imageAsset = {
+    name: 'inline-image-123456789abc.png',
+    mime: 'image/png',
+    source: 'message-content',
+    message_external_id: 'assistant-message',
+    inline_image_indices: [0],
+    path: 'archive/conversations/claude/personal/assets/conversation/image.png',
+    sha256: 'a'.repeat(64),
+    size: 12,
+  };
+  const assistantMessage = {
+    external_id: 'assistant-message',
+    role: 'assistant',
+    content: 'Before image. [[AI_ARCHIVE_INLINE_IMAGE:0]] After image.',
+    files: [],
+    attachments: [],
+    metadata: {},
+  };
+  const allAssets = [imageAsset];
+  const assetMap = new Map();
+
+  assert.deepEqual(findMessageAssets(assistantMessage, allAssets), [imageAsset]);
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-inline-image',
+    title: 'Inline image render',
+    messages: [assistantMessage],
+    message_count: 1,
+  }, 'claude', 'personal', assetMap, allAssets);
+  const link = '![inline-image-123456789abc.png](assets/conversation/image.png)';
+
+  assert.equal(markdown.includes('[[AI_ARCHIVE_INLINE_IMAGE:0]]'), false, 'the image marker must be resolved');
+  assert.equal(markdown.split(link).length - 1, 1, 'the image should be linked exactly once');
+  assert.ok(markdown.indexOf('Before image.') < markdown.indexOf(link));
+  assert.ok(markdown.indexOf(link) < markdown.indexOf('After image.'));
+});
