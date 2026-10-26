@@ -918,11 +918,34 @@
     return new Date(c.updated_at || c.created_at || 0).getTime() || 0;
   }
 
+  // Incremental sync: ask the background which conversations are already
+  // archived completely by the current exporter. Any failure (no settings,
+  // GitHub unavailable, an older background) means a full fetch, as before.
+  function getArchivedState() {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'getArchiveState' }, (response) => {
+          if (chrome.runtime.lastError || !response?.ok || !Array.isArray(response.conversations)) {
+            resolve(null);
+            return;
+          }
+          resolve(new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])));
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
   function sendProgress(payload) {
     chrome.runtime.sendMessage({ type: 'syncProgress', ...payload }).catch(() => {});
   }
 
-  async function runSync(limit = 'all') {
+  // `automatic`: a sync started by the "sync when Claude opens" setting. With
+  // an existing archive it checks every conversation incrementally; without
+  // one (first use, or the archive state cannot be read) it only takes the
+  // latest AUTO_SYNC_LIMIT, so it never starts a full first import by itself.
+  async function runSync(limit = 'all', { automatic = false } = {}) {
     if (syncing) return;
     syncing = true;
     currentAbortController = new AbortController();
@@ -932,7 +955,23 @@
       const org = await getOrg(signal);
       let listData = await list(org, signal);
       listData = [...listData].sort((a, b) => conversationDate(b) - conversationDate(a));
-      const selected = limit === 'all' ? listData : listData.slice(0, Number(limit));
+      // "All conversations" (manual or automatic) does not download conversations
+      // whose archived copy is complete and whose Claude update time has not
+      // changed; they stay exactly as archived. An explicit "Latest N" sync always
+      // re-downloads those N, which is how a user forces a refresh.
+      const archived = limit === 'all' ? await getArchivedState() : null;
+      if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+      if (automatic && !(archived && archived.size)) limit = String(AUTO_SYNC_LIMIT);
+      const candidates = limit === 'all' ? listData : listData.slice(0, Number(limit));
+      const unchangedIds = [];
+      const selected = candidates.filter((c) => {
+        const current = c.updated_at || c.created_at || null;
+        if (archived && current && archived.get(String(c.uuid)) === current) {
+          unchangedIds.push(c.uuid);
+          return false;
+        }
+        return true;
+      });
       const total = selected.length;
       sendProgress({ stage: 'fetching', current: 0, total, selected: limit });
 
@@ -972,7 +1011,7 @@
       // finished; otherwise another startSync message can trigger a second fetch
       // while the first batch is still being committed to GitHub.
       const result = await new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations, skipped, fullList: limit === 'all' }, (response) => {
+        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations, skipped, unchangedIds, fullList: limit === 'all' }, (response) => {
           if (chrome.runtime.lastError) {
             reject(Error(chrome.runtime.lastError.message));
             return;
@@ -1012,7 +1051,7 @@
     const now = Date.now();
     if (now - Number(stored.auto_sync_last_started_at || 0) < AUTO_SYNC_MIN_INTERVAL_MS) return;
     await chrome.storage.local.set({ auto_sync_last_started_at: now });
-    runSync(String(AUTO_SYNC_LIMIT));
+    runSync('all', { automatic: true });
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

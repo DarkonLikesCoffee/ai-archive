@@ -65,7 +65,8 @@ For the web viewer, a second token with **Contents: Read-only** is enough and is
 ### 5. Sync
 
 - With a claude.ai tab open, choose **All conversations** or **Latest N** and click **Sync Claude**. Progress is shown in the popup and the sync can be cancelled at any time; a sync publishes exactly one commit, or nothing if it fails or is cancelled.
-- **Automatically sync when Claude opens**: when enabled, opening a claude.ai page syncs the 20 most recently updated conversations, at most once every 10 minutes. Use a manual **All conversations** sync for the first import.
+- **All conversations syncs are incremental.** A conversation whose Claude update time has not changed since it was archived, and whose archived files are all present, is not downloaded again; the completion message says how many were skipped. A **Latest N** sync always re-downloads those N conversations, which is how to force a refresh. After an extension update that changes the export format, the next sync re-exports every conversation once.
+- **Automatically sync when Claude opens**: when enabled, opening a claude.ai page (at most once every 10 minutes) syncs every conversation that changed since it was archived. Until the archive has its first sync, it only checks the 20 most recently updated conversations, so use a manual **All conversations** sync for the first import.
 - Transient GitHub failures (network errors, 5xx, secondary rate limits) are retried automatically. If a sync still fails, nothing is published and it is safe to sync again; unchanged conversations are not re-uploaded. If one conversation cannot be exported (for example an attachment that will not download), it is skipped, its archived copy stays as it was, the other conversations are still synced, and the completion message names it.
 
 ### 6. Browse the archive

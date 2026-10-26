@@ -110,7 +110,7 @@ $('autoSync').onchange = async () => {
   await chrome.storage.local.set({ auto_sync: $('autoSync').checked, auto_sync_configured: true });
   status.className = 'status ok';
   status.textContent = $('autoSync').checked
-    ? 'Automatic sync enabled: the 20 most recently updated conversations sync when a Claude.ai page opens (at most once every 10 minutes).'
+    ? 'Automatic sync enabled: when a Claude.ai page opens (at most once every 10 minutes), every conversation that changed since it was archived is synced. Until the archive has its first sync, only the 20 most recent are checked.'
     : 'Automatic sync disabled.';
 };
 
