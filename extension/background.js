@@ -178,6 +178,8 @@ function escapeMarkdownLabel(value) {
     .replace(/\r?\n/g, ' ')
     .replace(/\[/g, '\\[')
     .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
     .replace(/([*_\x60!])/g, '\\$1');
 }
 
