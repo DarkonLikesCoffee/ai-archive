@@ -94,37 +94,39 @@
     return `### Claude tool: ${name}\n\n${fence(serialized, 'json')}`;
   }
 
+  function stringifyContentBlock(value) {
+    try {
+      return JSON.stringify(value, (key, item) => {
+        // Avoid embedding large inline media payloads into Markdown. Preserve
+        // metadata and make omitted binary payload explicit.
+        if (typeof item === 'string' && item.length > 256 && /^(data|base64|bytes)$/i.test(key)) {
+          return \`[omitted inline payload: \${item.length} characters]\`;
+        }
+        return item;
+      }, 2);
+    } catch {
+      return String(value);
+    }
+  }
+
   function renderToolResult(block) {
     const parts = Array.isArray(block.content) ? block.content : [block.content];
     const text = parts.map((x) => {
       if (typeof x === 'string') return x;
       if (x?.type === 'text' && typeof x.text === 'string') return x.text;
       if (typeof x?.text === 'string') return x.text;
-      if (x && typeof x === 'object') return JSON.stringify(x, null, 2);
+      if (x && typeof x === 'object') return stringifyContentBlock(x);
       return '';
     }).filter(Boolean).join('\n');
     if (!text) return '';
     const name = block.name || block.tool_name || 'tool';
-    return `### Tool result: ${name}${block.is_error ? ' (error)' : ''}\n\n${fence(text, 'text')}`;
+    return \`### Tool result: \${name}\${block.is_error ? ' (error)' : ''}\n\n\${fence(text, 'text')}\`;
   }
 
   function renderUnknownContentBlock(block) {
     const type = typeof block.type === 'string' && block.type.trim() ? block.type : 'unknown';
-    let serialized;
-    try {
-      serialized = JSON.stringify(block, (key, value) => {
-        // Avoid embedding large inline media payloads into Markdown. The actual
-        // attachment collector handles downloadable files separately; preserve
-        // the block metadata and make any omitted binary payload explicit.
-        if (typeof value === 'string' && value.length > 256 && /^(data|base64|bytes)$/i.test(key)) {
-          return `[omitted inline payload: ${value.length} characters]`;
-        }
-        return value;
-      }, 2);
-    } catch {
-      serialized = String(block);
-    }
-    return `### Claude content block: ${type}\\n\\n${fence(serialized || '{}', 'json')}`;
+    const serialized = stringifyContentBlock(block);
+    return \`### Claude content block: \${type}\n\n\${fence(serialized || '{}', 'json')}\`;
   }
 
   function renderContentBlocks(blocks) {
