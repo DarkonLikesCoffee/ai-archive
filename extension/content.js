@@ -100,7 +100,7 @@
         // Avoid embedding large inline media payloads into Markdown. Preserve
         // metadata and make omitted binary payload explicit.
         if (typeof item === 'string' && item.length > 256 && /^(data|base64|bytes)$/i.test(key)) {
-          return \`[omitted inline payload: \${item.length} characters]\`;
+          return `[omitted inline payload: ${item.length} characters]`;
         }
         return item;
       }, 2);
@@ -120,13 +120,13 @@
     }).filter(Boolean).join('\n');
     if (!text) return '';
     const name = block.name || block.tool_name || 'tool';
-    return \`### Tool result: \${name}\${block.is_error ? ' (error)' : ''}\n\n\${fence(text, 'text')}\`;
+    return `### Tool result: ${name}${block.is_error ? ' (error)' : ''}\n\n${fence(text, 'text')}`;
   }
 
   function renderUnknownContentBlock(block) {
     const type = typeof block.type === 'string' && block.type.trim() ? block.type : 'unknown';
     const serialized = stringifyContentBlock(block);
-    return \`### Claude content block: \${type}\n\n\${fence(serialized || '{}', 'json')}\`;
+    return `### Claude content block: ${type}\n\n${fence(serialized || '{}', 'json')}`;
   }
 
   function renderContentBlocks(blocks) {
