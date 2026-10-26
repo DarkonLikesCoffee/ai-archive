@@ -274,9 +274,11 @@ function attachmentMarkdown(message, assetMap, allAssets) {
     const asset = attachmentAssetForMessage(message, attachment, name, assetMap, assets, allAssets);
     if (asset) {
       addAsset(asset);
-    } else {
+    } else if (!assets.some((candidate) => String(candidate.name || '').toLowerCase() === nameKey)) {
       // Do not inline extracted file contents. If Claude exposes only an extraction,
       // the content-side collector materializes it as a text asset before rendering.
+      // If multiple same-named assets are legitimately associated with this message,
+      // let the loop below render each one rather than showing a misleading placeholder.
       parts.push(`**Attachment: ${name}**`);
     }
   }
