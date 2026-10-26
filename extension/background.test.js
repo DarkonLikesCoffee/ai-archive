@@ -518,3 +518,30 @@ test('refuses to publish an index while an unselected conversation still referen
   );
   assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false, 'the broken index must not be published');
 });
+
+
+test('conversation Markdown paths distinguish IDs with the same first eight characters', () => {
+  const { conversationPath } = loadBackgroundAssetHelpers();
+  const first = conversationPath(
+    { external_id: 'abcdefgh-conversation-one', title: 'Same title' },
+    'claude',
+    'personal',
+  );
+  const second = conversationPath(
+    { external_id: 'abcdefgh-conversation-two', title: 'Same title' },
+    'claude',
+    'personal',
+  );
+
+  assert.notEqual(first, second, 'same-title conversations must not collide on an eight-character ID prefix');
+  assert.match(first, /abcdefgh-conversation-one/);
+  assert.match(second, /abcdefgh-conversation-two/);
+});
+
+test('conversation Markdown paths distinguish IDs that normalize to the same slug', () => {
+  const { conversationPath } = loadBackgroundAssetHelpers();
+  const first = conversationPath({ external_id: 'conversation/a', title: 'Same title' }, 'claude', 'personal');
+  const second = conversationPath({ external_id: 'conversation:a', title: 'Same title' }, 'claude', 'personal');
+
+  assert.notEqual(first, second, 'normalized IDs need a stable uniqueness suffix');
+});
