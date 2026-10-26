@@ -102,13 +102,13 @@ function createHarness(conversation, {
     if (url === '/api/organizations') return jsonResponse([{ uuid: 'org-id' }]);
     if (url === '/api/organizations/org-id/chat_conversations') {
       return jsonResponse(conversationListResponse ?? [{
-        uuid: 'conversation-1',
+        uuid: conversation?.uuid || 'conversation-1',
         name: 'Exporter regression test',
         created_at: '2026-10-26T08:00:00.000Z',
         updated_at: '2026-10-26T08:30:00.000Z',
       }]);
     }
-    if (String(url).includes('/chat_conversations/conversation-1?')) {
+    if (/\/chat_conversations\/[^/?]+\?/.test(String(url))) {
       return jsonResponse(fullConversationResponse ?? conversation);
     }
     if (String(url).includes('/wiggle/list-files')) {
