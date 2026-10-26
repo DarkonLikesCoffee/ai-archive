@@ -416,7 +416,7 @@ test('aborts the sync when a listed sandbox attachment cannot be downloaded', as
       uuid: 'user-message',
       parent_message_uuid: ROOT,
       sender: 'human',
-      content: [{ type: 'text', text: 'Keep the generated file.' }],
+      content: [{ type: 'text', text: 'Keep the generated file at outputs/render.png.' }],
     }],
   };
   const harness = createHarness(conversation, {
