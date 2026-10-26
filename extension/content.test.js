@@ -1287,9 +1287,10 @@ test('preserves unknown content block metadata instead of silently dropping it',
   assert.match(rendered, /audio\/wav/);
   assert.match(rendered, /omitted inline payload: 4096 characters/);
   assert.equal(rendered.includes(largePayload), false, 'large binary payload must not be dumped into Markdown');
-  assert.match(rendered, /Claude content block: citation_reference/);
-  assert.match(rendered, /https:\/\/example\.com\/source/);
-  assert.match(rendered, /The source supports the result/);
+  assert.match(rendered, /Reference: \[Primary source\]\(<https:\/\/example\.com\/source>\)/);
+  assert.match(rendered, /> The source supports the result\./);
+  assert.match(rendered, /"type": "citation_reference"/);
+  assert.match(rendered, /"url": "https:\/\/example\.com\/source"/);
 
   harness.finishFirstHandoff({ ok: true });
 });
@@ -1461,6 +1462,45 @@ test('does not duplicate an image represented by both message.files and a conten
   assert.equal(assets.length, 1, 'identical bytes in the file and content block representations should be deduplicated');
   assert.equal(assets[0].source, 'message');
   assert.equal(Buffer.from(assets[0].base64, 'base64').toString('utf8'), imageBytes);
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('does not turn non-HTTP citation URLs into clickable Markdown links', async () => {
+  const conversation = {
+    uuid: 'conversation-unsafe-reference',
+    name: 'Unsafe citation URL',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Check this source.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{
+          type: 'citation_reference',
+          title: 'Unsafe source',
+          url: 'javascript:alert(1)',
+          citation_id: 'cite-1',
+        }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+
+  assert.equal(rendered.includes('[Unsafe source](<javascript:alert(1)>)'), false);
+  assert.match(rendered, /"url": "javascript:alert\(1\)"/,
+    'unsafe URLs should remain visible as inert metadata rather than being discarded');
 
   harness.finishFirstHandoff({ ok: true });
 });
