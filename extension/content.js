@@ -215,11 +215,19 @@
     return `Sources:\n${lines.join('\n')}`;
   }
 
-  // `inlineImages` receives each inline image block in the order its marker is
-  // emitted, so a marker's index is by construction its position in the list
-  // that collectMessageAssets materializes. A separate traversal would drift
-  // whenever the two disagree about which nested content is rendered.
-  function renderContentBlocks(blocks, inlineImages = []) {
+  // A random per-conversation nonce generated after the Claude payload was
+  // fetched, so no message text, tool output, or citation can contain a
+  // marker that the Markdown renderer would mistake for an inline image.
+  function createInlineMarkerNonce() {
+    return [...crypto.getRandomValues(new Uint8Array(16))]
+      .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  // `inline.images` receives each inline image block in the order its marker
+  // is emitted, so a marker's index is by construction its position in the
+  // list that collectMessageAssets materializes. A separate traversal would
+  // drift whenever the two disagree about which nested content is rendered.
+  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), images: [] }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -232,19 +240,19 @@
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
       if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
-        inlineImages.push(block);
-        return `[[AI_ARCHIVE_INLINE_IMAGE:${inlineImages.length - 1}]]`;
+        inline.images.push(block);
+        return `[[AI_ARCHIVE_INLINE_IMAGE:${inline.nonce}:${inline.images.length - 1}]]`;
       }
       // Preserve common plain-text shapes directly for readability. A block
       // may carry both a text field and nested content (for example a
       // document with embedded images); render both rather than dropping
       // the nested blocks.
       if (typeof block.text === 'string') {
-        const nested = Array.isArray(block.content) ? renderContentBlocks(block.content, inlineImages) : '';
+        const nested = Array.isArray(block.content) ? renderContentBlocks(block.content, inline) : '';
         return [block.text, nested].filter(Boolean).join('\n\n');
       }
       if (typeof block.content === 'string') return block.content;
-      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inlineImages);
+      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inline);
       // Unknown/non-text blocks used to disappear silently. Preserve their type
       // and metadata so citations, media markers, and future block types remain
       // visible to the reader rather than making the transcript look complete.
@@ -764,13 +772,14 @@
 
   async function normalize(c, org, signal) {
     const raw = selectActiveLineage(c);
+    const inlineMarkerNonce = createInlineMarkerNonce();
     const inlineImagesByMessage = new Map();
     const messages = raw.map((m, i) => {
-      const inlineImages = [];
+      const inline = { nonce: inlineMarkerNonce, images: [] };
       const content = Array.isArray(m.content)
-        ? renderContentBlocks(m.content, inlineImages)
+        ? renderContentBlocks(m.content, inline)
         : (typeof m.text === 'string' ? m.text : '');
-      inlineImagesByMessage.set(m, inlineImages);
+      inlineImagesByMessage.set(m, inline.images);
       return {
         external_id: m.uuid || m.id || `${i}`,
         role: m.sender === 'human' ? 'user' : m.sender || 'assistant',
@@ -791,6 +800,7 @@
       source_updated_at: c.updated_at || c.created_at || null,
       message_count: messages.length,
       metadata: { source: 'claude', current_leaf_message_uuid: c.current_leaf_message_uuid || null },
+      inline_marker_nonce: inlineMarkerNonce,
       messages,
       assets,
     };

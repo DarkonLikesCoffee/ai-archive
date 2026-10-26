@@ -159,6 +159,7 @@ function createHarness(conversation, {
     btoa,
     atob,
     crypto: {
+      getRandomValues: (array) => webcrypto.getRandomValues(array),
       subtle: {
         digest: async (...args) => {
           if (cancelOnFirstDigest && !cancelTriggeredDuringDigest) {
@@ -1421,7 +1422,8 @@ test('materializes inline base64 image blocks that have no message.files entry',
   assert.equal(Buffer.from(imageAssets[0].base64, 'base64').toString('utf8'), imageBytes);
   assert.equal(normalized.messages[1].content.includes(imageBase64), false,
     'inline image bytes must not be copied into Markdown text');
-  assert.match(normalized.messages[1].content, /\[\[AI_ARCHIVE_INLINE_IMAGE:0\]\]/,
+  assert.match(normalized.inline_marker_nonce, /^[0-9a-f]{32}$/);
+  assert.ok(normalized.messages[1].content.includes(`[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:0]]`),
     'the image position should be retained for the Markdown renderer');
 
   harness.finishFirstHandoff({ ok: true });
@@ -1784,12 +1786,43 @@ test('numbers inline images in the same order the Markdown markers are emitted',
     return asset ? Buffer.from(asset.base64, 'base64').toString('utf8') : null;
   };
 
+  const marker = (index) => `[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:${index}]]`;
   assert.equal(content,
-    'Document text.\n\n[[AI_ARCHIVE_INLINE_IMAGE:0]]\n\nThen the second image:\n\n[[AI_ARCHIVE_INLINE_IMAGE:1]]');
+    `Document text.\n\n${marker(0)}\n\nThen the second image:\n\n${marker(1)}`);
   assert.equal(bytesAt(0), 'nested image', 'marker 0 must resolve to the nested image');
   assert.equal(bytesAt(1), 'second image', 'marker 1 must resolve to the image after the text');
   assert.equal(normalized.assets.length, 2, 'images inside thinking blocks are not archived');
   assert.equal(content.includes('secret'), false);
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('generates inline image markers that message text cannot contain', async () => {
+  const typed = 'Literal [[AI_ARCHIVE_INLINE_IMAGE:0]] and [[AI_ARCHIVE_INLINE_IMAGE:00000000000000000000000000000000:0]].';
+  const conversation = {
+    uuid: 'conversation-marker-nonce',
+    name: 'Marker nonce',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [
+        { type: 'text', text: typed },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: btoa('real image') } },
+      ],
+    }],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const normalized = handoff.conversations[0];
+
+  assert.match(normalized.inline_marker_nonce, /^[0-9a-f]{32}$/);
+  assert.notEqual(normalized.inline_marker_nonce, '0'.repeat(32));
+  assert.equal(normalized.messages[0].content,
+    `${typed}\n\n[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:0]]`);
 
   harness.finishFirstHandoff({ ok: true });
 });
