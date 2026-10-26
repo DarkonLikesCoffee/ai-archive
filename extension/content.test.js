@@ -32,6 +32,7 @@ function createHarness(conversation, {
   sandboxDownloadDelayMs = 0,
   assetDownloadConcurrency = 3,
   cancelOnFirstDigest = false,
+  storage = null,
 } = {}) {
   const listeners = [];
   const requests = [];
@@ -48,7 +49,19 @@ function createHarness(conversation, {
   let activeDownloads = 0;
   let maxActiveDownloads = 0;
 
+  const storageState = storage ? { ...storage } : null;
   const chrome = {
+    ...(storageState ? {
+      storage: {
+        local: {
+          async get(keys) {
+            return Object.fromEntries((Array.isArray(keys) ? keys : [keys])
+              .filter((key) => key in storageState).map((key) => [key, storageState[key]]));
+          },
+          async set(values) { Object.assign(storageState, values); },
+        },
+      },
+    } : {}),
     runtime: {
       lastError: null,
       onMessage: {
@@ -109,6 +122,9 @@ function createHarness(conversation, {
       }]);
     }
     if (/\/chat_conversations\/[^/?]+\?/.test(String(url))) {
+      if (typeof fullConversationResponse === 'function') {
+        return jsonResponse(fullConversationResponse(String(url).match(/\/chat_conversations\/([^/?]+)\?/)[1]));
+      }
       return jsonResponse(fullConversationResponse ?? conversation);
     }
     if (String(url).includes('/wiggle/list-files')) {
@@ -176,6 +192,7 @@ function createHarness(conversation, {
   return {
     onMessage: listeners[0],
     requests,
+    storageState,
     handoffs,
     progressMessages,
     errorProgress,
@@ -2071,3 +2088,53 @@ test('stores identical inline content from different messages as one shared asse
 
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+const autoSyncSettings = {
+  github_owner: 'owner',
+  github_repo: 'archive',
+  github_token: 'token',
+  auto_sync: true,
+};
+
+function autoSyncConversation(count = 1) {
+  return {
+    uuid: 'conversation-0',
+    name: 'Auto sync',
+    current_leaf_message_uuid: 'm-0',
+    chat_messages: [{ uuid: 'm-0', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'Hi' }] }],
+    count,
+  };
+}
+
+test('automatically syncs the latest conversations when Claude opens and auto sync is on', async () => {
+  const list = Array.from({ length: 25 }, (_, index) => ({
+    uuid: index === 0 ? 'conversation-0' : `older-${index}`,
+    updated_at: `2026-10-${String(26 - index).padStart(2, '0')}T00:00:00Z`,
+  }));
+  const harness = createHarness(autoSyncConversation(), {
+    storage: { ...autoSyncSettings },
+    conversationListResponse: list,
+    fullConversationResponse: (id) => ({ ...autoSyncConversation(), uuid: id }),
+  });
+
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations.length, 20, 'auto sync is limited to the latest 20 conversations');
+  assert.equal(handoff.conversations[0].external_id, 'conversation-0');
+  assert.equal(typeof harness.storageState.auto_sync_last_started_at, 'number');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+for (const [name, settings] of [
+  ['auto sync is off', { ...autoSyncSettings, auto_sync: false }],
+  ['auto sync was never configured', { github_owner: 'owner', github_repo: 'archive', github_token: 'token' }],
+  ['GitHub settings are incomplete', { ...autoSyncSettings, github_token: '' }],
+  ['an automatic sync started less than ten minutes ago', { ...autoSyncSettings, auto_sync_last_started_at: Date.now() - 60_000 }],
+]) {
+  test(`does not start an automatic sync when ${name}`, async () => {
+    const harness = createHarness(autoSyncConversation(), { storage: settings });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(harness.requests.length, 0, 'no Claude request may be made');
+    assert.equal(harness.handoffs.length, 0);
+  });
+}
