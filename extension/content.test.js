@@ -841,3 +841,49 @@ test('refuses malformed message nodes even when they are outside the active bran
   assert.match(error.error, /message at position 2 does not have a valid UUID/);
   assert.equal(harness.handoffs.length, 0, 'malformed response nodes must not be silently omitted from the archive');
 });
+
+
+test('associates a single downloaded direct asset with every message that references it', async () => {
+  const assetUrl = 'https://files.example/shared-report.png';
+  const sharedFile = {
+    file_uuid: 'shared-file-id',
+    file_name: 'shared-report.png',
+    preview_url: assetUrl,
+    mime_type: 'image/png',
+  };
+  const conversation = {
+    uuid: 'conversation-shared-attachment',
+    name: 'Shared attachment reference',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Here is the report.' }],
+        files: [{ ...sharedFile }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'I will refer to that same report.' }],
+        files: [{ ...sharedFile }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: { [assetUrl]: { content: 'shared image bytes', contentType: 'image/png' } },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+
+  assert.equal(assets.length, 1, 'the shared file should only be downloaded and archived once');
+  assert.deepEqual(Array.from(assets[0].message_external_ids), ['user-message', 'assistant-message']);
+  assert.equal(assets[0].message_external_id, 'user-message', 'keep the legacy primary association for compatibility');
+  assert.equal(harness.requests.filter((url) => url === assetUrl).length, 1, 'duplicate references should share one download');
+
+  harness.finishFirstHandoff({ ok: true });
+});
