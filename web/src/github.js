@@ -36,11 +36,15 @@ export async function readIndex(settings) {
   return JSON.parse(await readText(settings, 'archive/index.json'));
 }
 
-export async function readAsset(settings, path) {
+export async function readAsset(settings, path, metadata = null) {
   const apiPath = `/contents/${encodePath(path)}`;
   const f = await githubRequest(settings, apiPath);
+  const storedMime = String(metadata?.mime || '').split(';')[0].trim();
+  const guessedMime = guessMime(path);
   const mime = f.type === 'file'
-    ? (guessMime(path) || f.content_type || 'application/octet-stream')
+    ? (storedMime && storedMime !== 'application/octet-stream'
+      ? storedMime
+      : guessedMime || f.content_type || storedMime || 'application/octet-stream')
     : 'application/octet-stream';
 
   let dataUrl = '';
@@ -107,7 +111,7 @@ function guessMime(path) {
     avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon', pdf: 'application/pdf', txt: 'text/plain',
     json: 'application/json', js: 'text/javascript', ts: 'text/plain', tsx: 'text/plain', jsx: 'text/plain', css: 'text/css',
     html: 'text/html', md: 'text/markdown', py: 'text/plain', java: 'text/plain', zip: 'application/zip',
-  })[ext] || 'application/octet-stream';
+  })[ext] || null;
 }
 
 export async function readConversation(settings, path) {
