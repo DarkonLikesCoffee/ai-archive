@@ -1,13 +1,35 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-26 20:5x UTC, scheduler verification + check-in policy.
+Last updated: 2026-10-26 21:15 UTC — product-completion cycle (#46–#54).
+
+## Product feature inventory (owner priority: finish the product)
+
+Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world verification · ❌ missing
+
+| Area | Feature | Status | PRs |
+|---|---|---|---|
+| Export | Active branch only, ordering, text/markdown, citations, unknown blocks | ✅ | #28–#36, #47 |
+| Export | Inline images/audio/video/documents in place, dedupe, tool-result media | ✅ | #31–#45 |
+| Export | Tool calls with every input field; readable artifact/editor bodies | ✅ | #41, #42, #46 |
+| Export | One bad conversation no longer blocks the rest (skipped + reported) | ✅ | #53 |
+| GitHub | Settings validation (bad token / missing repo / no write access) | ✅ | #50 |
+| GitHub | One atomic commit per sync, stale-branch guard, interrupted-publish check | ✅ | earlier |
+| GitHub | Retry transient failures; explain 401/403/rate limits | ✅ | #50 |
+| GitHub | Automatic sync on Claude open (latest 20, ≤ every 10 min) | ✅ | #48 |
+| GitHub | "Sync all" completeness (no pagination) | 🟡 relies on Claude returning the full list | — |
+| Popup | Progress + Cancel survive reopening the popup mid-fetch | ✅ | #54 |
+| Viewer | Load index/conversations/assets, large files, bounded asset loading, retries | ✅ | #43, #52 |
+| Viewer | Markdown, code, images, citations, tool groups, artifacts, safe rendering | ✅ | #36, #43, #46, #47 |
+| Viewer | Global search, in-conversation find bar, provider/account filters | ✅ (existing) | — |
+| Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
+| All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible in this environment | — |
 
 ## Ground rules followed
 - No force-push, no history rewrite, no deploys/releases.
 - `master` is **not** a protected branch (`protected: false`, no required checks).
-- Merging: only the PRs the owner explicitly asked to be merged ("merge everything yourself": #37–#45).
-  New overnight work is opened as PRs and left for review.
+- Merging: the owner granted autonomy to merge verified changes (tests + build pass, diff reviewed, CI green on
+  the exact head). Squash-merge with expectedHeadSha.
 - Every merge: base retargeted to `master`, `master` merged into the head (no rebase), changed lines
   verified identical to the reviewed PR, local tests run, CI green on that exact head, then squash-merge
   with `expectedHeadSha`.
@@ -36,14 +58,18 @@ Last updated: 2026-10-26 20:5x UTC, scheduler verification + check-in policy.
 - PR #46 (`feat/readable-tool-bodies`): extension 85/85, web 33/33, build OK, CI green.
 - PR #47 (`fix/reader-message-split-on-headings`): extension 84/84, web 32/32, build OK, CI green.
 
-## Open PRs for review (not merged)
-- #46 Show multi-line tool input fields as readable code blocks (approved feature; format change documented)
-- #47 Split archived messages only at role headings
-- #48 Implement automatic sync when a Claude page opens (latest 20, at most every 10 min) — ext 89/89, web 30/30
-- #49 README: describe merged fixes (docs only)
+## Merged in the product-completion cycle
+- #46 readable tool bodies · #47 role-heading message split · #48 automatic sync · #49 README changes
+- #50 GitHub retries + clear auth/permission/rate-limit errors + settings validation
+- #51 installation and setup docs · #52 viewer retries + bounded asset loading
+- #53 skip unexportable conversations instead of failing the whole sync
+- #54 popup progress/Cancel during the fetching phase (open, CI pending at time of writing)
+
+## Process note
+- A merge-conflict resolution on #54 briefly pushed an unparsable test file because a `grep`-based check did not
+  stop the command chain. Fixed in the next commit; commits are now gated on the parsed `# fail 0` count.
 
 ## Findings needing an owner decision
-- Automatic sync: implemented as opt-in in PR #48 (owner asked for autonomous development; review before merge).
 - Unverified risk: `/chat_conversations` is fetched once without pagination. If claude.ai paginates, "sync all"
   could silently miss older conversations. Needs a real-account check. No evidence either way in the repo or the
   uploaded design conversation; speculative paging was NOT added (if the API ignored paging params, the existing
