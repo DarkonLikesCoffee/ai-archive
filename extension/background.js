@@ -437,10 +437,25 @@ async function sync(conversations, onProgress) {
 
     let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
     const indexFile = ref ? await getFile('archive/index.json', branch) : null;
-    if (indexFile?.content) {
+    if (indexFile) {
+      let indexContent = indexFile.content;
+      // The GitHub Contents API omits file content for larger files and reports
+      // encoding "none". Never interpret that response as a missing index: a
+      // limited sync would then publish an index containing only selected chats.
+      if (typeof indexContent !== 'string' || (!indexContent && indexFile.sha)) {
+        if (!indexFile.sha) {
+          throw new Error('GitHub returned no readable content or blob SHA for archive/index.json. No archive changes were published.');
+        }
+        const blob = await gh(`/git/blobs/${encodeURIComponent(indexFile.sha)}`);
+        if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
+          throw new Error('GitHub could not return the full archive/index.json blob. No archive changes were published.');
+        }
+        indexContent = blob.content;
+      }
+
       let parsedIndex;
       try {
-        parsedIndex = JSON.parse(base64DecodeContent(indexFile.content));
+        parsedIndex = JSON.parse(base64DecodeContent(indexContent));
       } catch {
         // Never silently replace a corrupt index with a partial one. The index is
         // the web app's navigation/search catalogue; rebuilding it from a limited

@@ -150,7 +150,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0 }) {
+function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0 }) {
   const listeners = [];
   const requests = [];
   const baseSha = 'base-commit';
@@ -234,9 +234,22 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
       });
     }
     if (pathname.endsWith('/contents/archive/index.json') && method === 'GET') {
-      return indexText == null
-        ? response({ message: 'Not Found' }, 404)
-        : response({ content: Buffer.from(indexText, 'utf8').toString('base64'), encoding: 'base64' });
+      if (indexText == null) return response({ message: 'Not Found' }, 404);
+      if (indexEncoding === 'none') {
+        return response({
+          sha: 'large-index-blob',
+          content: '',
+          encoding: 'none',
+          size: Buffer.byteLength(indexText, 'utf8'),
+        });
+      }
+      return response({ content: Buffer.from(indexText, 'utf8').toString('base64'), encoding: 'base64' });
+    }
+    if (pathname.endsWith('/git/blobs/large-index-blob') && method === 'GET') {
+      return response({
+        encoding: 'base64',
+        content: Buffer.from(indexText, 'utf8').toString('base64'),
+      });
     }
     if (pathname.endsWith('/git/blobs') && method === 'POST') {
       activeBlobRequests += 1;
@@ -759,4 +772,45 @@ test('uploads blobs with bounded concurrency and reads settings only once per sy
   assert.equal(metrics.blobCount, 14, '12 assets, one conversation Markdown file, and one index blob should be created');
   const treeRequest = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST');
   assert.equal(treeRequest.body.tree.filter(item => item.sha).length, 14);
+});
+
+
+
+test('preserves unselected conversations when GitHub omits a large index file from Contents response', async () => {
+  const unselectedEntry = {
+    id: 'older-conversation',
+    provider: 'claude',
+    account: 'personal',
+    path: 'archive/conversations/claude/personal/older-conversation.md',
+    title: 'Older conversation that was not selected',
+    model: 'test-model',
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-02T00:00:00.000Z',
+    message_count: 2,
+    assets: [],
+    format_version: 4,
+    preview: 'An older preview',
+    search_text: 'older conversation search content',
+    content_sha256: 'previous-content-hash',
+  };
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [unselectedEntry] });
+  const harness = makeBackgroundSyncHarness({ indexText, indexEncoding: 'none' });
+
+  const result = await harness.sync(sampleConversation(), () => {});
+  assert.equal(result.changed, 1);
+
+  assert.ok(
+    harness.requests.some((request) => request.pathname.endsWith('/git/blobs/large-index-blob') && request.method === 'GET'),
+    'the exporter should read the full index via the Git blob endpoint',
+  );
+  const blobWrites = harness.requests.filter((request) => request.pathname.endsWith('/git/blobs') && request.method === 'POST');
+  const nextIndex = JSON.parse(blobWrites.at(-1).body.content);
+  assert.ok(
+    nextIndex.conversations.some((entry) => entry.id === 'older-conversation'),
+    'an unselected conversation must remain in the index after a limited sync',
+  );
+  assert.ok(
+    nextIndex.conversations.some((entry) => entry.id === 'conversation-123456'),
+    'the selected conversation should also be included in the next index',
+  );
 });

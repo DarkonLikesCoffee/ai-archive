@@ -29,6 +29,19 @@ function base64ToDataUrl(content, mime = 'application/octet-stream') {
 
 export async function readText(settings, path) {
   const f = await githubRequest(settings, `/contents/${encodePath(path)}`);
+  // GitHub's Contents API can omit content for files larger than its inline
+  // response limit. Resolve the blob by SHA instead of decoding an empty value.
+  if (f?.encoding === 'none' || (typeof f?.content !== 'string' && f?.sha)) {
+    if (!f?.sha) throw new Error(`GitHub returned no readable content or blob SHA for ${path}.`);
+    const blob = await githubRequest(settings, `/git/blobs/${encodeURIComponent(f.sha)}`);
+    if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
+      throw new Error(`GitHub could not return the full file contents for ${path}.`);
+    }
+    return decodeBase64(blob.content);
+  }
+  if (typeof f?.content !== 'string') {
+    throw new Error(`GitHub returned an invalid Contents API response for ${path}.`);
+  }
   return decodeBase64(f.content);
 }
 

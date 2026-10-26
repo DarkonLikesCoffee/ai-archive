@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseConversationMarkdown, readAsset } from './github.js';
+import { parseConversationMarkdown, readAsset, readText } from './github.js';
 
 test('parses canonical metadata, title, and messages', () => {
   const markdown = `<!-- AI_ARCHIVE_METADATA
@@ -226,4 +226,48 @@ test('uses archived MIME metadata to preview an image whose filename has no reco
   assert.equal(asset.mime, 'image/png');
   assert.equal(asset.dataUrl, `data:image/png;base64,${imageBase64}`);
   assert.equal(calls.length, 2, 'the reader should fetch metadata and the binary blob');
+});
+
+
+
+test('reads large GitHub text files through the blob API when Contents omits content', async (t) => {
+  const expectedText = JSON.stringify({
+    version: 2,
+    conversations: [{ id: 'older-conversation', search_text: 'a'.repeat(12000) }],
+  });
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    const value = String(url);
+    calls.push(value);
+    const payload = value.endsWith('/contents/archive/index.json')
+      ? {
+          type: 'file',
+          encoding: 'none',
+          content: '',
+          sha: 'large-index-sha',
+          size: expectedText.length,
+        }
+      : value.endsWith('/git/blobs/large-index-sha')
+        ? {
+            encoding: 'base64',
+            content: Buffer.from(expectedText, 'utf8').toString('base64'),
+          }
+        : null;
+
+    if (!payload) throw new Error(`Unexpected test request: ${value}`);
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify(payload),
+    };
+  });
+
+  const result = await readText(
+    { owner: 'example', repo: 'archive', token: 'test-token' },
+    'archive/index.json',
+  );
+
+  assert.equal(result, expectedText);
+  assert.equal(calls.length, 2, 'the reader should fetch Contents metadata then the exact Git blob');
+  assert.ok(calls[1].endsWith('/git/blobs/large-index-sha'));
 });
