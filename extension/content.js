@@ -435,15 +435,11 @@
 
       if (!scopedMatch && !sandboxMatch) {
         throw new Error(
-          `Cannot safely export Claude conversation "${dataConversationLabel(message)}": attachment "${name}" has no downloadable URL and no matching archiveable file was found. Sync stopped before anything was sent to GitHub; retry or inspect the attachment in Claude.`,
+          `Cannot safely export Claude conversation "${conversationId}": attachment "${name}" has no downloadable URL and no matching archiveable file was found. Sync stopped before anything was sent to GitHub; retry or inspect the attachment in Claude.`,
         );
       }
     }
     return assets;
-  }
-
-  function dataConversationLabel(message) {
-    return String(message?.uuid || message?.id || 'unknown message');
   }
 
   function selectActiveLineage(data) {
