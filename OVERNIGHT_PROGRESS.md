@@ -76,7 +76,8 @@ Secondary items left (none blocks the product):
 - #53 skip unexportable conversations instead of failing the whole sync
 - #54 popup progress/Cancel during the fetching phase
 - #55 report archived conversations a full sync did not receive
-- #56 escape filenames in unarchived-attachment placeholders (minor finding; CI pending at time of writing)
+- #56 escape filenames in unarchived-attachment placeholders
+- Final master `d95d9ee`: syntax OK, extension 102/102, web 39/39, build OK
 
 ## Process note
 - A merge-conflict resolution on #54 briefly pushed an unparsable test file because a `grep`-based check did not
