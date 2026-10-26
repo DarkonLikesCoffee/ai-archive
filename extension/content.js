@@ -96,10 +96,12 @@
 
   function stringifyContentBlock(value) {
     try {
-      return JSON.stringify(value, (key, item) => {
-        // Avoid embedding large inline media payloads into Markdown. Preserve
-        // metadata and make omitted binary payload explicit.
-        if (typeof item === 'string' && item.length > 256 && /^(data|base64|bytes)$/i.test(key)) {
+      return JSON.stringify(value, function (key, item) {
+        // Avoid embedding base64 media data or other large inline payloads into
+        // Markdown. Preserve metadata and make omitted data explicit.
+        const base64Data = key === 'data' && this?.type === 'base64';
+        if (typeof item === 'string' && /^(data|base64|bytes)$/i.test(key)
+          && (item.length > 256 || base64Data)) {
           return `[omitted inline payload: ${item.length} characters]`;
         }
         return item;
@@ -170,6 +172,32 @@
       binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
     }
     return btoa(binary);
+  }
+
+  function base64ToBytes(value) {
+    const normalized = String(value || '').replace(/\s+/g, '');
+    let binary;
+    try {
+      binary = atob(normalized);
+    } catch {
+      throw new Error('Claude returned an invalid base64 image content block.');
+    }
+    if (!binary.length) throw new Error('Claude returned an empty base64 image content block.');
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  }
+
+  function collectInlineImageBlocks(value, result = []) {
+    if (Array.isArray(value)) {
+      for (const item of value) collectInlineImageBlocks(item, result);
+      return result;
+    }
+    if (!value || typeof value !== 'object') return result;
+    if (value.type === 'image' && value.source?.type === 'base64'
+      && typeof value.source.data === 'string') {
+      result.push(value);
+    }
+    if (Array.isArray(value.content)) collectInlineImageBlocks(value.content, result);
+    return result;
   }
 
   async function sha256Bytes(buffer) {
@@ -325,6 +353,15 @@
     const seen = new Set();
     const messageAssetFingerprints = new Set();
     const messageScopedFingerprints = new WeakMap();
+    const messageScopedHashes = new WeakMap();
+    const hashesForMessage = (message) => {
+      let hashes = messageScopedHashes.get(message);
+      if (!hashes) {
+        hashes = new Set();
+        messageScopedHashes.set(message, hashes);
+      }
+      return hashes;
+    };
     const fingerprintsForMessage = (message) => {
       let fingerprints = messageScopedFingerprints.get(message);
       if (!fingerprints) {
@@ -404,6 +441,7 @@
       // deduplicate its extracted-content representation independently for each.
       for (const referencedMessage of messageReferences) {
         fingerprintsForMessage(referencedMessage).add(fingerprint);
+        hashesForMessage(referencedMessage).add(asset.sha256);
       }
     }
 
@@ -458,6 +496,49 @@
           message_external_id: messageId,
         });
         scopedFingerprints.add(fingerprint);
+        hashesForMessage(message).add(hash);
+      }
+    }
+
+    // Inline base64 image blocks are sometimes present in Claude's message
+    // content without a corresponding message.files entry. Materialize those
+    // bytes as normal assets so the Markdown renderer can link/embed them.
+    const imageExtensions = {
+      'image/avif': 'avif',
+      'image/bmp': 'bmp',
+      'image/gif': 'gif',
+      'image/jpeg': 'jpg',
+      'image/png': 'png',
+      'image/svg+xml': 'svg',
+      'image/webp': 'webp',
+    };
+    for (const message of messages) {
+      const imageBlocks = collectInlineImageBlocks(message.content);
+      for (let index = 0; index < imageBlocks.length; index++) {
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        const block = imageBlocks[index];
+        const source = block.source;
+        const bytes = base64ToBytes(source.data);
+        const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        const hash = await sha256Bytes(buffer);
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        const hashes = hashesForMessage(message);
+        if (hashes.has(hash)) continue;
+
+        const mime = typeof source.media_type === 'string' && source.media_type.startsWith('image/')
+          ? source.media_type
+          : 'image/png';
+        const extension = imageExtensions[mime] || 'img';
+        assets.push({
+          name: `inline-image-${hash.slice(0, 12)}.${extension}`,
+          mime,
+          base64: bytesToBase64(buffer),
+          size: bytes.byteLength,
+          sha256: hash,
+          source: 'message-content',
+          message_external_id: message.uuid || message.id || null,
+        });
+        hashes.add(hash);
       }
     }
 
