@@ -44,7 +44,7 @@ function renderMarkdown(text) {
         return `<span class="md-image-placeholder" data-md-image="${escapeHtml(path)}">🖼️ ${escapeHtml(alt)}</span>`;
       },
       renderLink: ({ href, text: label }) => {
-        const path = String(href ?? '').replace(/\\\\/g, '/');
+        const path = String(href ?? '').replace(/\\/g, '/');
         if (/^(?:assets\/|archive\/.*\/assets\/)/.test(path)) {
           return `<span class="md-attachment-placeholder" data-md-attachment="${escapeHtml(path)}">${label}</span>`;
         }
@@ -61,7 +61,7 @@ function renderMarkdown(text) {
     let j = 0;
     while (j < blockLines.length) {
       const line = blockLines[j];
-      const replyMatch = line.match(/^\\*\\*Attachment: (excerpt_from_previous_claude_message\\.txt)\\*\\*$/i);
+      const replyMatch = line.match(/^\*\*Attachment: (excerpt_from_previous_claude_message\.txt)\*\*$/i);
       if (replyMatch) {
         flushMarkdown();
 
@@ -75,8 +75,11 @@ function renderMarkdown(text) {
           const quote = [];
           let k = fenceIndex + 1;
           const marker = fence[0];
-          const closePattern = new RegExp(`^\\\\s*${marker}{${fence.length},}\\\\s*$`);
-          while (k < blockLines.length && !closePattern.test(blockLines[k])) quote.push(blockLines[k++]);
+          const isClosingFence = (candidate) => {
+            const match = candidate.match(/^\s*(`{3,}|~{3,})\s*$/);
+            return Boolean(match && match[1][0] === marker && match[1].length >= fence.length);
+          };
+          while (k < blockLines.length && !isClosingFence(blockLines[k])) quote.push(blockLines[k++]);
           if (k < blockLines.length) k++;
           const quotedHtml = inlineMarkdown(quote.join('\n')).replace(/\n/g, '<br>');
           html.push(`<div class="reply-context"><div class="reply-context-icon">↩</div><div class="reply-context-main"><div class="reply-context-label"><strong>Claude</strong><span>replying to a message</span></div><div class="reply-context-quote">${quotedHtml}</div></div></div>`);
