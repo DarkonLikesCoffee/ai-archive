@@ -223,10 +223,11 @@
       .map((byte) => byte.toString(16).padStart(2, '0')).join('');
   }
 
-  // `inline.blocks` receives each inline image block in the order its marker
-  // is emitted, so a marker's index is by construction its position in the
-  // list that collectMessageAssets materializes. A separate traversal would
-  // drift whenever the two disagree about which nested content is rendered.
+  // `inline.blocks` receives each inline base64 block (images, audio, video,
+  // documents) in the order its marker is emitted, so a marker's index is by
+  // construction its position in the list that collectMessageAssets
+  // materializes. A separate traversal would drift whenever the two disagree
+  // about which nested content is rendered.
   function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), blocks: [] }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
@@ -239,7 +240,9 @@
       }
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
-      if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
+      // Any block carrying its bytes as a base64 source is archived as a file
+      // and replaced by a marker, so payloads never enter the Markdown.
+      if (block.source?.type === 'base64' && typeof block.source.data === 'string') {
         inline.blocks.push(block);
         return `[[AI_ARCHIVE_INLINE_ASSET:${inline.nonce}:${inline.blocks.length - 1}]]`;
       }
@@ -288,9 +291,9 @@
     try {
       binary = atob(normalized);
     } catch {
-      throw new Error('Claude returned an invalid base64 image content block.');
+      throw new Error('Claude returned an invalid base64 inline content block. Sync stopped before anything was sent to GitHub.');
     }
-    if (!binary.length) throw new Error('Claude returned an empty base64 image content block.');
+    if (!binary.length) throw new Error('Claude returned an empty base64 inline content block. Sync stopped before anything was sent to GitHub.');
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   }
 
@@ -594,10 +597,10 @@
       }
     }
 
-    // Inline base64 image blocks are sometimes present in Claude's message
-    // content without a corresponding message.files entry. Materialize those
-    // bytes as normal assets so the Markdown renderer can link/embed them.
-    const imageExtensions = {
+    // Inline base64 blocks are sometimes present in Claude's message content
+    // without a corresponding message.files entry. Materialize those bytes as
+    // normal assets so the Markdown renderer can embed images and link the rest.
+    const inlineExtensions = {
       'image/avif': 'avif',
       'image/bmp': 'bmp',
       'image/gif': 'gif',
@@ -605,11 +608,23 @@
       'image/png': 'png',
       'image/svg+xml': 'svg',
       'image/webp': 'webp',
+      'audio/aac': 'aac',
+      'audio/flac': 'flac',
+      'audio/mp4': 'm4a',
+      'audio/mpeg': 'mp3',
+      'audio/ogg': 'ogg',
+      'audio/wav': 'wav',
+      'audio/webm': 'webm',
+      'video/mp4': 'mp4',
+      'video/ogg': 'ogv',
+      'video/quicktime': 'mov',
+      'video/webm': 'webm',
+      'application/pdf': 'pdf',
     };
     for (const message of messages) {
-      // Exactly the image blocks renderContentBlocks emitted markers for, in
-      // marker order. Images inside tool input/results or thinking blocks are
-      // rendered (redacted) or omitted there, so they never receive a marker.
+      // Exactly the blocks renderContentBlocks emitted markers for, in marker
+      // order. Media inside tool input/results or thinking blocks is rendered
+      // (redacted) or omitted there, so it never receives a marker.
       const inlineBlocks = inlineBlocksByMessage.get(message) || [];
       for (let index = 0; index < inlineBlocks.length; index++) {
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
@@ -641,12 +656,26 @@
           continue;
         }
 
-        const mime = typeof source.media_type === 'string' && source.media_type.startsWith('image/')
-          ? source.media_type
-          : 'image/png';
-        const extension = imageExtensions[mime] || 'img';
+        const sourceMime = typeof source.media_type === 'string'
+          ? source.media_type.toLowerCase().split(';')[0].trim()
+          : '';
+        // Image blocks keep their historical PNG fallback and names, so
+        // already-archived inline images keep the same asset paths.
+        const mime = block.type === 'image'
+          ? (sourceMime.startsWith('image/') ? sourceMime : 'image/png')
+          : (sourceMime || 'application/octet-stream');
+        const kind = ['image', 'audio', 'video'].find((prefix) => mime.startsWith(`${prefix}/`)) || 'file';
+        const extension = inlineExtensions[mime] || (kind === 'image' ? 'img' : 'bin');
+        // Non-image blocks such as documents can carry a title; keep it as
+        // the filename rather than losing it with the replaced block.
+        const titled = block.type !== 'image' && typeof block.title === 'string' && block.title.trim()
+          ? safeAssetName(block.title)
+          : null;
+        const name = titled
+          ? (titled.toLowerCase().endsWith(`.${extension}`) ? titled : `${titled}.${extension}`)
+          : `inline-${kind}-${hash.slice(0, 12)}.${extension}`;
         assets.push({
-          name: `inline-image-${hash.slice(0, 12)}.${extension}`,
+          name,
           mime,
           base64: bytesToBase64(buffer),
           size: bytes.byteLength,

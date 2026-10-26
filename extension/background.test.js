@@ -1166,3 +1166,45 @@ test('keeps internal inline image markers out of the index preview and search te
   assert.equal(entry.search_text.includes(MARKER_NONCE), false);
   assert.ok(entry.search_text.includes('[[AI_ARCHIVE_INLINE_ASSET:0]]'));
 });
+
+test('renders non-image inline assets as links at their original message positions', () => {
+  const { conversationMarkdown } = loadBackgroundAssetHelpers();
+  const asset = (name, mime, index, letter) => ({
+    name,
+    mime,
+    source: 'message-content',
+    message_external_id: 'assistant-message',
+    inline_positions: [{ message_external_id: 'assistant-message', index }],
+    path: `archive/conversations/claude/personal/assets/conversation/${name}`,
+    sha256: letter.repeat(64),
+    size: 12,
+  });
+  const audio = asset('inline-audio-123456789abc.mp3', 'audio/mpeg', 0, 'a');
+  const video = asset('inline-video-23456789abcd.mp4', 'video/mp4', 1, 'b');
+  const message = {
+    external_id: 'assistant-message',
+    role: 'assistant',
+    content: `Before audio. ${marker(0)} Before video. ${marker(1)} After video.`,
+    files: [],
+    attachments: [],
+    metadata: {},
+  };
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-inline-audio-video',
+    title: 'Inline audio/video rendering',
+    inline_marker_nonce: MARKER_NONCE,
+    messages: [message],
+    message_count: 1,
+  }, 'claude', 'personal', new Map(), [audio, video]);
+  const audioLink = '[inline-audio-123456789abc.mp3](assets/conversation/inline-audio-123456789abc.mp3)';
+  const videoLink = '[inline-video-23456789abcd.mp4](assets/conversation/inline-video-23456789abcd.mp4)';
+
+  assert.equal(markdown.includes('AI_ARCHIVE_INLINE_ASSET'), false, 'all markers must resolve');
+  assert.equal(markdown.includes(`!${audioLink}`), false, 'audio is linked, not embedded as an image');
+  assert.equal(markdown.split(audioLink).length - 1, 1, 'audio is linked once, not repeated as an attachment');
+  assert.equal(markdown.split(videoLink).length - 1, 1);
+  assert.ok(markdown.indexOf('Before audio.') < markdown.indexOf(audioLink));
+  assert.ok(markdown.indexOf(audioLink) < markdown.indexOf('Before video.'));
+  assert.ok(markdown.indexOf('Before video.') < markdown.indexOf(videoLink));
+  assert.ok(markdown.indexOf(videoLink) < markdown.indexOf('After video.'));
+});
