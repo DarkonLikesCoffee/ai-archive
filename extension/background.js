@@ -568,14 +568,17 @@ async function sync(conversations, onProgress) {
         };
         delete compacted.search_text;
         map.set(key, compacted);
+        indexNeedsUpdate = true;
       } else {
+        const metadataChanged = archived.search_text_sha256 !== searchTextSha256
+          || archived.search_text_encoding !== 'plain';
         map.set(key, {
           ...archived,
           search_text_sha256: searchTextSha256,
           search_text_encoding: 'plain',
         });
+        if (metadataChanged) indexNeedsUpdate = true;
       }
-      indexNeedsUpdate = true;
     }
 
     const nextIndex = {
