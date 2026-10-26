@@ -84,10 +84,17 @@
     const name = block.name || block.tool_name || 'tool';
     const input = normalizeToolInput(block.input);
 
-    if (input && typeof input === 'object') {
-      const command = input.command || input.cmd || input.shell_command;
-      if (typeof command === 'string') return `### Claude tool: ${name}\n\n${fence(command, 'bash')}`;
-      if (typeof input.code === 'string') return `### Claude tool: ${name}\n\n${fence(input.code, 'text')}`;
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+      // The readable shortcut is lossless only when that field is the whole
+      // input. Tools such as artifacts or the file editor use `command` for a
+      // sub-command (create, str_replace) next to the content they write, so
+      // anything richer falls through to the full JSON below.
+      const fields = Object.keys(input).filter((key) => input[key] !== undefined && input[key] !== null);
+      const only = fields.length === 1 ? fields[0] : null;
+      if (['command', 'cmd', 'shell_command'].includes(only) && typeof input[only] === 'string') {
+        return `### Claude tool: ${name}\n\n${fence(input[only], 'bash')}`;
+      }
+      if (only === 'code' && typeof input.code === 'string') return `### Claude tool: ${name}\n\n${fence(input.code, 'text')}`;
     }
 
     const serialized = typeof input === 'string' ? input : JSON.stringify(input ?? {}, null, 2);
