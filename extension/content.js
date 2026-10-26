@@ -94,7 +94,9 @@
     return `### Claude tool: ${name}\n\n${fence(serialized, 'json')}`;
   }
 
-  function stringifyContentBlock(value) {
+  // `archivedSources` holds base64 source objects whose bytes are archived
+  // separately as message attachments, so the note can say where they went.
+  function stringifyContentBlock(value, archivedSources = null) {
     try {
       return JSON.stringify(value, function (key, item) {
         // Avoid embedding base64 media data or other large inline payloads into
@@ -102,7 +104,9 @@
         const base64Data = key === 'data' && this?.type === 'base64';
         if (typeof item === 'string' && /^(data|base64|bytes)$/i.test(key)
           && (item.length > 256 || base64Data)) {
-          return `[omitted inline payload: ${item.length} characters]`;
+          return archivedSources?.has(this)
+            ? `[omitted inline payload: ${item.length} characters; archived as a message attachment]`
+            : `[omitted inline payload: ${item.length} characters]`;
         }
         return item;
       }, 2);
@@ -111,13 +115,38 @@
     }
   }
 
-  function renderToolResult(block) {
+  // Base64 media inside a tool result (screenshots, generated charts) stays
+  // redacted in the fenced result but is archived as an attachment of the
+  // message. Payloads that do not decode keep the plain redaction note.
+  function collectToolResultMedia(value, inline, archivedSources) {
+    if (Array.isArray(value)) {
+      for (const item of value) collectToolResultMedia(item, inline, archivedSources);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (value.source?.type === 'base64' && typeof value.source.data === 'string') {
+      try {
+        base64ToBytes(value.source.data);
+        inline.attachments.push(value);
+        archivedSources.add(value.source);
+      } catch {
+        // Leave it redacted; a malformed tool payload must not stop the sync.
+      }
+    }
+    if (Array.isArray(value.content)) collectToolResultMedia(value.content, inline, archivedSources);
+  }
+
+  function renderToolResult(block, inline) {
     const parts = Array.isArray(block.content) ? block.content : [block.content];
+    const archivedSources = new Set();
     const text = parts.map((x) => {
       if (typeof x === 'string') return x;
       if (x?.type === 'text' && typeof x.text === 'string') return x.text;
       if (typeof x?.text === 'string') return x.text;
-      if (x && typeof x === 'object') return stringifyContentBlock(x);
+      if (x && typeof x === 'object') {
+        collectToolResultMedia(x, inline, archivedSources);
+        return stringifyContentBlock(x, archivedSources);
+      }
       return '';
     }).filter(Boolean).join('\n');
     if (!text) return '';
@@ -228,7 +257,7 @@
   // construction its position in the list that collectMessageAssets
   // materializes. A separate traversal would drift whenever the two disagree
   // about which nested content is rendered.
-  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), blocks: [] }) {
+  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), blocks: [], attachments: [] }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -239,7 +268,7 @@
         return [block.text || '', renderTextBlockCitations(block.citations)].filter(Boolean).join('\n\n');
       }
       if (block.type === 'tool_use') return renderToolUse(block);
-      if (block.type === 'tool_result') return renderToolResult(block);
+      if (block.type === 'tool_result') return renderToolResult(block, inline);
       // Any block carrying its bytes as a base64 source is archived as a file
       // and replaced by a marker, so payloads never enter the Markdown.
       if (block.source?.type === 'base64' && typeof block.source.data === 'string') {
@@ -445,7 +474,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal, inlineBlocksByMessage = new Map()) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map()) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -623,12 +652,16 @@
     };
     for (const message of messages) {
       // Exactly the blocks renderContentBlocks emitted markers for, in marker
-      // order. Media inside tool input/results or thinking blocks is rendered
-      // (redacted) or omitted there, so it never receives a marker.
-      const inlineBlocks = inlineBlocksByMessage.get(message) || [];
-      for (let index = 0; index < inlineBlocks.length; index++) {
+      // order, followed by tool-result media archived as plain attachments
+      // (index null: no marker, no inline position). Media inside tool input
+      // or thinking blocks is redacted or omitted and is not collected.
+      const inline = inlineByMessage.get(message) || { blocks: [], attachments: [] };
+      const entries = [
+        ...inline.blocks.map((block, index) => ({ block, index })),
+        ...inline.attachments.map((block) => ({ block, index: null })),
+      ];
+      for (const { block, index } of entries) {
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const block = inlineBlocks[index];
         const source = block.source;
         const bytes = base64ToBytes(source.data);
         const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -646,6 +679,7 @@
         // Marker indices restart in every message, and an asset can be shared
         // by several messages, so record which message each position belongs to.
         const addPosition = (asset) => {
+          if (index === null) return;
           const positions = Array.isArray(asset.inline_positions) ? asset.inline_positions : [];
           if (!positions.some((position) => position.message_external_id === messageId && position.index === index)) {
             asset.inline_positions = [...positions, { message_external_id: messageId, index }];
@@ -658,7 +692,8 @@
 
         // The same inline bytes already archived for another message: link this
         // message to that file instead of storing a second copy.
-        const sharedInline = messageId && assets.find((asset) => asset.source === 'message-content' && asset.sha256 === hash);
+        const sharedInline = messageId && assets.find((asset) =>
+          (asset.source === 'message-content' || asset.source === 'tool-result') && asset.sha256 === hash);
         if (sharedInline) {
           const linkedIds = Array.isArray(sharedInline.message_external_ids) && sharedInline.message_external_ids.length
             ? sharedInline.message_external_ids
@@ -693,9 +728,9 @@
           base64: bytesToBase64(buffer),
           size: bytes.byteLength,
           sha256: hash,
-          source: 'message-content',
+          source: index === null ? 'tool-result' : 'message-content',
           message_external_id: messageId,
-          inline_positions: [{ message_external_id: messageId, index }],
+          ...(index === null ? {} : { inline_positions: [{ message_external_id: messageId, index }] }),
         });
         hashes.add(hash);
       }
@@ -815,13 +850,13 @@
   async function normalize(c, org, signal) {
     const raw = selectActiveLineage(c);
     const inlineMarkerNonce = createInlineMarkerNonce();
-    const inlineBlocksByMessage = new Map();
+    const inlineByMessage = new Map();
     const messages = raw.map((m, i) => {
-      const inline = { nonce: inlineMarkerNonce, blocks: [] };
+      const inline = { nonce: inlineMarkerNonce, blocks: [], attachments: [] };
       const content = Array.isArray(m.content)
         ? renderContentBlocks(m.content, inline)
         : (typeof m.text === 'string' ? m.text : '');
-      inlineBlocksByMessage.set(m, inline.blocks);
+      inlineByMessage.set(m, inline);
       return {
         external_id: m.uuid || m.id || `${i}`,
         role: m.sender === 'human' ? 'user' : m.sender || 'assistant',
@@ -833,7 +868,7 @@
       };
     });
 
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineBlocksByMessage);
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',

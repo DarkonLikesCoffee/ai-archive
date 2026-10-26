@@ -1208,3 +1208,35 @@ test('renders non-image inline assets as links at their original message positio
   assert.ok(markdown.indexOf('Before video.') < markdown.indexOf(videoLink));
   assert.ok(markdown.indexOf(videoLink) < markdown.indexOf('After video.'));
 });
+
+test('lists tool result media once as an attachment after the Claude message', () => {
+  const { conversationMarkdown } = loadBackgroundAssetHelpers();
+  const screenshot = {
+    name: 'inline-image-123456789abc.png',
+    mime: 'image/png',
+    source: 'tool-result',
+    message_external_id: 'assistant-message',
+    path: 'archive/conversations/claude/personal/assets/conversation/screenshot.png',
+    sha256: 'c'.repeat(64),
+    size: 12,
+  };
+  const message = {
+    external_id: 'assistant-message',
+    role: 'assistant',
+    content: '### Tool result: screenshot\n\n```text\n{"data": "[omitted inline payload: 16 characters; archived as a message attachment]"}\n```\n\nHere is the page.',
+    files: [],
+    attachments: [],
+    metadata: {},
+  };
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-tool-media',
+    title: 'Tool media',
+    inline_marker_nonce: MARKER_NONCE,
+    messages: [message],
+    message_count: 1,
+  }, 'claude', 'personal', new Map(), [screenshot]);
+  const link = '![inline-image-123456789abc.png](assets/conversation/screenshot.png)';
+
+  assert.equal(markdown.split(link).length - 1, 1);
+  assert.ok(markdown.indexOf('Here is the page.') < markdown.indexOf(link), 'Claude attachments follow the response');
+});
