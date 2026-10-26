@@ -161,8 +161,8 @@
   async function collectMessageAssets(org, conversationId, messages, signal) {
     const assets = [];
     const seen = new Set();
-    const seenNames = new Set();
     const messageAssetFingerprints = new Set();
+    const messageScopedFingerprints = new Set();
 
     // First collect the real binary/image assets exposed directly by messages.
     for (const message of messages) {
@@ -175,10 +175,11 @@
         seen.add(key);
         const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
         if (asset) {
-          assets.push({ ...asset, source: 'message', file_uuid: file.file_uuid || file.uuid || null, message_external_id: message.uuid || message.id || null });
+          const messageId = message.uuid || message.id || null;
+          assets.push({ ...asset, source: 'message', file_uuid: file.file_uuid || file.uuid || null, message_external_id: messageId });
           const nameKey = String(asset.name || '').toLowerCase();
-          seenNames.add(nameKey);
           messageAssetFingerprints.add(`${nameKey}|${asset.sha256}`);
+          messageScopedFingerprints.add(`${messageId || ''}|${nameKey}|${asset.sha256}`);
         }
       }
     }
@@ -197,7 +198,6 @@
       if (nameKey && messageAssetFingerprints.has(`${nameKey}|${asset.sha256}`)) continue;
 
       seen.add(key);
-      if (nameKey) seenNames.add(nameKey);
       assets.push(asset);
     }
 
@@ -210,20 +210,28 @@
         if (!attachment?.extracted_content || isReplyExcerptAttachment(attachment)) continue;
         const name = String(attachment.file_name || attachment.name || 'attachment.txt');
         const nameKey = name.toLowerCase();
-        if (seenNames.has(nameKey)) continue;
         const text = String(attachment.extracted_content);
         const buffer = new TextEncoder().encode(text).buffer;
+        const hash = await sha256Bytes(buffer);
+        const messageId = message.uuid || message.id || null;
+        const fingerprint = `${messageId || ''}|${nameKey}|${hash}`;
+
+        // The same extracted file can be exposed both as a real message asset
+        // and as extracted text. Deduplicate only within the same message and
+        // only when the bytes match; filenames alone are not unique identities.
+        if (messageScopedFingerprints.has(fingerprint)) continue;
+
         assets.push({
           name,
           mime: attachment.file_type || 'text/plain',
           base64: bytesToBase64(buffer),
           size: buffer.byteLength,
-          sha256: await sha256Bytes(buffer),
+          sha256: hash,
           source: 'attachment-extracted',
           attachment_name: name,
-          message_external_id: message.uuid || message.id || null,
+          message_external_id: messageId,
         });
-        seenNames.add(nameKey);
+        messageScopedFingerprints.add(fingerprint);
       }
     }
     return assets;
