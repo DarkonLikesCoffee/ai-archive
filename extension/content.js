@@ -125,8 +125,27 @@
     return `### Tool result: ${name}${block.is_error ? ' (error)' : ''}\n\n${fence(text, 'text')}`;
   }
 
+  function escapeReferenceLabel(value) {
+    return String(value || 'Open reference')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\\/g, '\\\\')
+      .replace(/\r?\n/g, ' ')
+      .replace(/\[/g, '\\[')
+      .replace(/\]/g, '\\]')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)')
+      .replace(/([*_!])/g, '\\$1')
+      .replace(/\x60/g, '\\\x60')
+      .trim() || 'Open reference';
+  }
+
   function renderUnknownContentBlock(block) {
-    const type = typeof block.type === 'string' && block.type.trim() ? block.type : 'unknown';
+    const type = String(typeof block.type === 'string' && block.type.trim() ? block.type : 'unknown')
+      .replace(/[\r\n]+/g, ' ')
+      .replace(/#/g, '\\#')
+      .trim() || 'unknown';
     const serialized = stringifyContentBlock(block);
     const candidateUrl = typeof block.url === 'string' ? block.url
       : (typeof block.href === 'string' ? block.href
@@ -136,19 +155,17 @@
     // destination cannot break out of Markdown's angle-bracket URL form.
     const safeUrl = candidateUrl && /^https?:\/\/[^\s<>]+$/i.test(candidateUrl) ? candidateUrl : null;
     if (!safeUrl) {
-      return `### Claude content block: ${type}\n\n${fence(serialized || '{}', 'json')}`;
+      return \`### Claude content block: \${type}\n\n\${fence(serialized || '{}', 'json')}\`;
     }
 
-    const label = String(block.title || block.label || block.name || block.text || 'Open reference')
-      .replace(/[\[\]\r\n]/g, ' ')
-      .trim() || 'Open reference';
+    const label = escapeReferenceLabel(block.title || block.label || block.name || block.text || 'Open reference');
     const citedText = block.cited_text || block.quote || block.snippet || block.description || null;
-    const reference = `### Reference: [${label}](<${safeUrl}>)`;
+    const reference = \`### Reference: [\${label}](<\${safeUrl}>)\`;
     const excerpt = typeof citedText === 'string' && citedText.trim()
-      ? `\n\n> ${citedText.trim().replace(/\r?\n/g, '\n> ')}`
+      ? \`\n\n> \${citedText.trim().replace(/\r?\n/g, '\n> ')}\`
       : '';
     // Keep provider-specific IDs and offsets in the original serialized block.
-    return `${reference}${excerpt}\n\n${fence(serialized || '{}', 'json')}`;
+    return \`\${reference}\${excerpt}\n\n\${fence(serialized || '{}', 'json')}\`;
   }
 
   function renderContentBlocks(blocks, inlineImageState = { index: 0 }) {
