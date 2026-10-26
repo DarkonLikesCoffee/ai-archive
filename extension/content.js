@@ -215,7 +215,11 @@
     return `Sources:\n${lines.join('\n')}`;
   }
 
-  function renderContentBlocks(blocks, inlineImageState = { index: 0 }) {
+  // `inlineImages` receives each inline image block in the order its marker is
+  // emitted, so a marker's index is by construction its position in the list
+  // that collectMessageAssets materializes. A separate traversal would drift
+  // whenever the two disagree about which nested content is rendered.
+  function renderContentBlocks(blocks, inlineImages = []) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -228,13 +232,19 @@
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
       if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
-        const index = inlineImageState.index++;
-        return `[[AI_ARCHIVE_INLINE_IMAGE:${index}]]`;
+        inlineImages.push(block);
+        return `[[AI_ARCHIVE_INLINE_IMAGE:${inlineImages.length - 1}]]`;
       }
-      // Preserve common plain-text shapes directly for readability.
-      if (typeof block.text === 'string') return block.text;
+      // Preserve common plain-text shapes directly for readability. A block
+      // may carry both a text field and nested content (for example a
+      // document with embedded images); render both rather than dropping
+      // the nested blocks.
+      if (typeof block.text === 'string') {
+        const nested = Array.isArray(block.content) ? renderContentBlocks(block.content, inlineImages) : '';
+        return [block.text, nested].filter(Boolean).join('\n\n');
+      }
       if (typeof block.content === 'string') return block.content;
-      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inlineImageState);
+      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inlineImages);
       // Unknown/non-text blocks used to disappear silently. Preserve their type
       // and metadata so citations, media markers, and future block types remain
       // visible to the reader rather than making the transcript look complete.
@@ -274,24 +284,6 @@
     }
     if (!binary.length) throw new Error('Claude returned an empty base64 image content block.');
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  }
-
-  function collectInlineImageBlocks(value, result = []) {
-    if (Array.isArray(value)) {
-      for (const item of value) collectInlineImageBlocks(item, result);
-      return result;
-    }
-    if (!value || typeof value !== 'object') return result;
-    // These block types are rendered as fenced tool input/results, not as
-    // inline message content, so their nested images must not receive markers
-    // that the Markdown renderer cannot resolve in their original position.
-    if (value.type === 'tool_result' || value.type === 'tool_use') return result;
-    if (value.type === 'image' && value.source?.type === 'base64'
-      && typeof value.source.data === 'string') {
-      result.push(value);
-    }
-    if (Array.isArray(value.content)) collectInlineImageBlocks(value.content, result);
-    return result;
   }
 
   async function sha256Bytes(buffer) {
@@ -442,7 +434,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineImagesByMessage = new Map()) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -607,7 +599,10 @@
       'image/webp': 'webp',
     };
     for (const message of messages) {
-      const imageBlocks = collectInlineImageBlocks(message.content);
+      // Exactly the image blocks renderContentBlocks emitted markers for, in
+      // marker order. Images inside tool input/results or thinking blocks are
+      // rendered (redacted) or omitted there, so they never receive a marker.
+      const imageBlocks = inlineImagesByMessage.get(message) || [];
       for (let index = 0; index < imageBlocks.length; index++) {
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
         const block = imageBlocks[index];
@@ -769,10 +764,13 @@
 
   async function normalize(c, org, signal) {
     const raw = selectActiveLineage(c);
+    const inlineImagesByMessage = new Map();
     const messages = raw.map((m, i) => {
+      const inlineImages = [];
       const content = Array.isArray(m.content)
-        ? renderContentBlocks(m.content)
+        ? renderContentBlocks(m.content, inlineImages)
         : (typeof m.text === 'string' ? m.text : '');
+      inlineImagesByMessage.set(m, inlineImages);
       return {
         external_id: m.uuid || m.id || `${i}`,
         role: m.sender === 'human' ? 'user' : m.sender || 'assistant',
@@ -784,7 +782,7 @@
       };
     });
 
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal);
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineImagesByMessage);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',
