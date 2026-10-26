@@ -156,39 +156,61 @@ function isReplyExcerptAttachment(file) {
   return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
 }
 
-function assetMatchesMessage(asset, message) {
+function assetMatchesMessage(asset, message, allAssets = []) {
   if (!asset || !message) return false;
   const messageId = message.external_id || message.uuid || message.id || null;
-  if (asset.message_external_id && messageId && asset.message_external_id === messageId) return true;
 
+  // A message ID on a directly collected asset is authoritative. Do not let a
+  // matching basename attach that asset to a different message as well.
+  if (asset.message_external_id && messageId) {
+    return asset.message_external_id === messageId;
+  }
+
+  const fileIds = new Set();
   const names = new Set();
   for (const file of (message.files || [])) {
-    if (file?.file_uuid) names.add(`id:${file.file_uuid}`);
-    if (file?.uuid) names.add(`id:${file.uuid}`);
-    if (file?.file_name) names.add(`name:${String(file.file_name).toLowerCase()}`);
-    if (file?.name) names.add(`name:${String(file.name).toLowerCase()}`);
+    if (file?.file_uuid) fileIds.add(String(file.file_uuid));
+    if (file?.uuid) fileIds.add(String(file.uuid));
+    if (file?.file_name) names.add(String(file.file_name).toLowerCase());
+    if (file?.name) names.add(String(file.name).toLowerCase());
   }
   for (const attachment of (message.attachments || [])) {
-    if (attachment?.file_name) names.add(`name:${String(attachment.file_name).toLowerCase()}`);
-    if (attachment?.name) names.add(`name:${String(attachment.name).toLowerCase()}`);
+    if (attachment?.file_uuid) fileIds.add(String(attachment.file_uuid));
+    if (attachment?.uuid) fileIds.add(String(attachment.uuid));
+    if (attachment?.file_name) names.add(String(attachment.file_name).toLowerCase());
+    if (attachment?.name) names.add(String(attachment.name).toLowerCase());
   }
 
-  if (asset.file_uuid && (names.has(`id:${asset.file_uuid}`))) return true;
-  if (asset.name && names.has(`name:${String(asset.name).toLowerCase()}`)) return true;
+  // When Claude provides IDs, a different ID is a mismatch even if filenames
+  // happen to be the same. Only use filename fallback when the message has no IDs.
+  if (asset.file_uuid && fileIds.size) {
+    return fileIds.has(String(asset.file_uuid));
+  }
 
-  // Claude-generated sandbox files are usually mentioned by basename/path in the
-  // tool_use block that created them. Use that as a fallback association so the
-  // file stays beside the corresponding Claude response instead of at the end.
+  // A full sandbox path is the strongest available association for generated files.
   const haystack = JSON.stringify(message.metadata || message).toLowerCase();
-  const sourcePath = String(asset.source_path || '').toLowerCase();
+  const sourcePath = String(asset.source_path || '').replace(/\\/g, '/').toLowerCase();
   const baseName = String(asset.name || '').toLowerCase();
   if (sourcePath && haystack.includes(sourcePath)) return true;
-  if (baseName && baseName.length > 1 && haystack.includes(baseName)) return true;
+
+  // If multiple sandbox files share a basename, matching the basename alone is
+  // ambiguous. Require an explicit path reference rather than attaching each
+  // same-named file to every message that mentions the filename.
+  const sourceBaseName = sourcePath.split('/').pop() || baseName;
+  const ambiguousSandboxName = Boolean(asset.source_path) && allAssets.some((other) =>
+    other !== asset &&
+    other.source_path &&
+    (String(other.source_path).replace(/\\/g, '/').split('/').pop() || String(other.name || '')).toLowerCase() === sourceBaseName
+  );
+  if (ambiguousSandboxName) return false;
+
+  if (baseName && names.has(baseName)) return true;
+  if (baseName.length > 1 && haystack.includes(baseName)) return true;
   return false;
 }
 
 function findMessageAssets(message, allAssets) {
-  return allAssets.filter((asset) => assetMatchesMessage(asset, message));
+  return allAssets.filter((asset) => assetMatchesMessage(asset, message, allAssets));
 }
 
 function attachmentMarkdown(message, assetMap, allAssets) {
