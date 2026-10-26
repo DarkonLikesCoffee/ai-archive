@@ -97,17 +97,22 @@ function filenameSlug(value) {
   return normalized || 'Untitled-conversation';
 }
 
+function stableHash(value) {
+  const text = String(value ?? '');
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
 function conversationPath(c, provider, accountSlug) {
   const externalId = String(c.external_id || 'unknown');
   // Titles and short ID prefixes are not unique. Include a normalized portion
   // of the full ID plus a stable hash so punctuation-normalized IDs also remain
   // distinct, while keeping the filename at a predictable length.
   const idSlug = filenameSlug(externalId).slice(0, 70);
-  let idHash = 2166136261;
-  for (let i = 0; i < externalId.length; i++) {
-    idHash = Math.imul(idHash ^ externalId.charCodeAt(i), 16777619);
-  }
-  const idSuffix = (idHash >>> 0).toString(16).padStart(8, '0');
+  const idSuffix = stableHash(externalId);
   return `archive/conversations/${provider}/${accountSlug}/${filenameSlug(c.title)}--${idSlug}-${idSuffix}.md`;
 }
 
@@ -135,7 +140,11 @@ function assetPath(c, asset, provider, accountSlug, usedPaths) {
   // Use the full, path-safe conversation ID as the directory identity.
   // An 8-character prefix can collide across conversations and let one sync
   // overwrite or delete an asset still referenced by another conversation.
-  const conversationAssetId = filenameSlug(c.external_id || 'unknown').slice(0, 90);
+  // Asset directories need the same collision resistance as Markdown paths.
+  // Slug-only IDs such as "conversation/a" and "conversation:a" normalize to
+  // the same directory and could otherwise overwrite or delete each other's files.
+  const externalId = String(c.external_id || 'unknown');
+  const conversationAssetId = `${filenameSlug(externalId).slice(0, 70)}-${stableHash(externalId)}`;
   let path = `archive/conversations/${provider}/${accountSlug}/assets/${conversationAssetId}/${name}`;
   let n = 2;
   while (usedPaths.has(path)) {
@@ -440,7 +449,7 @@ async function sync(conversations, onProgress) {
     }
 
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
-    const changes = [];
+    let changes = [];
     let changedConversations = 0;
     const total = conversations.length;
 
@@ -499,13 +508,35 @@ async function sync(conversations, onProgress) {
       conversations: [...map.values()].sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '')),
     };
 
+    // A path can be shared by older archives whose conversation IDs normalized
+    // to the same asset directory. Never delete a path that any entry in the
+    // next index still references, even when the selected conversation dropped it.
+    const referencedPaths = new Set(nextIndex.conversations.flatMap((archived) => [
+      archived.path,
+      ...(Array.isArray(archived.assets) ? archived.assets.map((asset) => asset?.path) : []),
+    ]).filter(Boolean));
+    const plannedWritesBeforeCleanup = new Set(changes.filter((change) => !change.delete).map((change) => change.path));
+    const seenDeletes = new Set();
+    changes = changes.filter((change) => {
+      if (!change.delete) return true;
+      if (referencedPaths.has(change.path) || plannedWritesBeforeCleanup.has(change.path)) return false;
+      if (seenDeletes.has(change.path)) return false;
+      seenDeletes.add(change.path);
+      return true;
+    });
+
     // Do not publish an index that points to files missing from GitHub. Missing
     // files for selected conversations are repaired by the planned writes above;
     // missing files for unselected conversations require syncing those conversations.
     const plannedWrites = new Set(changes.filter((change) => !change.delete).map((change) => change.path));
+    const plannedDeletes = new Set(changes.filter((change) => change.delete).map((change) => change.path));
     for (const archived of nextIndex.conversations) {
       const requiredPaths = [archived.path, ...(Array.isArray(archived.assets) ? archived.assets.map((asset) => asset?.path) : [])].filter(Boolean);
-      const missing = requiredPaths.filter((requiredPath) => !existingPaths.has(requiredPath) && !plannedWrites.has(requiredPath));
+      const missing = requiredPaths.filter((requiredPath) =>
+        plannedDeletes.has(requiredPath)
+          ? !plannedWrites.has(requiredPath)
+          : !existingPaths.has(requiredPath) && !plannedWrites.has(requiredPath)
+      );
       if (missing.length) {
         throw new Error(`Archive integrity check failed: ${missing.length} file(s) referenced by "${archived.title || archived.id}" are missing from GitHub (${missing.slice(0, 3).join(', ')}). Sync that conversation to repair it; no archive changes were published.`);
       }
