@@ -147,13 +147,14 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [] }) {
+function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [], failOnce = null }) {
   const listeners = [];
   const requests = [];
   const baseSha = 'base-commit';
   const concurrentSha = 'concurrent-commit';
   let masterRefReads = 0;
   let blobCount = 0;
+  let injectedFailureUsed = false;
   const chrome = {
     storage: {
       local: {
@@ -184,6 +185,11 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
     const pathname = parsed.pathname;
     const method = options.method || 'GET';
     requests.push({ pathname, method, body: options.body ? JSON.parse(options.body) : null });
+
+    if (failOnce && !injectedFailureUsed && method === failOnce.method && pathname.endsWith(failOnce.pathSuffix)) {
+      injectedFailureUsed = true;
+      return response({ message: 'Temporary injected failure' }, failOnce.status || 503);
+    }
 
     if (pathname.endsWith('/git/ref/heads/main')) {
       return response({ message: 'Not Found' }, 404);
@@ -544,4 +550,32 @@ test('conversation Markdown paths distinguish IDs that normalize to the same slu
   const second = conversationPath({ external_id: 'conversation:a', title: 'Same title' }, 'claude', 'personal');
 
   assert.notEqual(first, second, 'normalized IDs need a stable uniqueness suffix');
+});
+
+
+test('recovers after a transient GitHub upload failure without publishing a partial archive', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+    failOnce: { method: 'POST', pathSuffix: '/git/blobs', status: 503 },
+  });
+
+  await assert.rejects(
+    harness.sync(sampleConversation(), () => {}),
+    /GitHub 503:.*Temporary injected failure/,
+  );
+
+  assert.equal(
+    harness.requests.some((request) => request.method === 'PATCH'),
+    false,
+    'a failed upload must never move the branch ref',
+  );
+
+  const retry = await harness.sync(sampleConversation(), () => {});
+  assert.equal(retry.changed, 1, 'a later retry should rebuild and publish the conversation');
+  assert.equal(retry.commit, 'new-commit');
+  assert.equal(
+    harness.requests.some((request) => request.method === 'PATCH'),
+    true,
+    'the successful retry should publish the completed commit',
+  );
 });
