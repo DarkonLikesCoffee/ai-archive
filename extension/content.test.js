@@ -1579,3 +1579,116 @@ test('does not let newline-bearing unknown block types create new Markdown headi
   assert.match(rendered, /Preserve me/);
   harness.finishFirstHandoff({ ok: true });
 });
+
+test('preserves citation sources attached to text blocks', async () => {
+  const conversation = {
+    uuid: 'conversation-text-citations',
+    name: 'Text block citations',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'What does the research say?' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: 'The study found a strong effect.',
+            citations: [
+              // Anthropic API web search shape.
+              {
+                type: 'web_search_result_location',
+                url: 'https://example.com/study',
+                title: 'The [study] *2024*',
+                cited_text: 'A strong effect was observed.',
+                encrypted_index: 'opaque-index',
+              },
+              // The same source cited again must not be listed twice.
+              {
+                type: 'web_search_result_location',
+                url: 'https://example.com/study',
+                title: 'The [study] *2024*',
+                cited_text: 'A strong effect was observed.',
+              },
+              // claude.ai web shape: the URL lives in details.
+              {
+                uuid: 'citation-2',
+                start_index: 4,
+                end_index: 9,
+                details: { type: 'web_search_citation', url: 'https://example.org/review' },
+              },
+              // Document citation without a URL.
+              {
+                type: 'char_location',
+                document_index: 0,
+                document_title: 'Uploaded report.pdf',
+                cited_text: 'Effect size <b>0.8</b>.',
+                start_char_index: 10,
+                end_char_index: 30,
+              },
+              // Unsafe schemes must stay inert.
+              { type: 'web_search_result_location', url: 'javascript:alert(1)', title: 'Unsafe' },
+              // Nothing human-meaningful to show.
+              { uuid: 'citation-empty', start_index: 0, end_index: 1 },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+
+  assert.ok(rendered.startsWith('The study found a strong effect.\n\nSources:\n'), rendered);
+  assert.ok(rendered.includes('- [The \\[study\\] \\*2024\\*](<https://example.com/study>)\n  > A strong effect was observed.'), rendered);
+  assert.equal(rendered.split('https://example.com/study').length - 1, 1, 'duplicate citations must be listed once');
+  assert.ok(rendered.includes('- [https://example.org/review](<https://example.org/review>)'), rendered);
+  assert.ok(rendered.includes('- Uploaded report.pdf\n  > Effect size &lt;b&gt;0.8&lt;/b&gt;.'), rendered);
+  assert.equal(rendered.includes('<javascript:'), false);
+  assert.equal(rendered.includes('](javascript:'), false);
+  assert.ok(rendered.includes('- Unsafe — javascript:alert\\(1\\)'), rendered);
+  assert.equal(rendered.includes('opaque-index'), false, 'opaque provider indexes are not useful in Markdown');
+  assert.equal(rendered.includes('citation-empty'), false);
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('renders plain text blocks without citations unchanged', async () => {
+  const conversation = {
+    uuid: 'conversation-text-no-citations',
+    name: 'No citations',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Hi' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          { type: 'text', text: 'Hello.', citations: [] },
+          { type: 'text', text: 'Again.', citations: null },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations[0].messages[1].content, 'Hello.\n\nAgain.');
+  harness.finishFirstHandoff({ ok: true });
+});

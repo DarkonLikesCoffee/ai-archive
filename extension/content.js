@@ -168,6 +168,53 @@
     return `${reference}${excerpt}\n\n${fence(serialized || '{}', 'json')}`;
   }
 
+  // Text blocks can carry structured citations (Anthropic API locations with
+  // url/title/cited_text, or claude.ai entries whose URL lives in `details`).
+  // Rendering only `text` used to drop every source, so list each distinct
+  // human-meaningful source after the text. Offsets and opaque indexes are
+  // omitted because they mean nothing outside Claude's own UI.
+  function renderTextBlockCitations(citations) {
+    if (!Array.isArray(citations)) return '';
+    const sources = new Map();
+    for (const citation of citations) {
+      if (!citation || typeof citation !== 'object') continue;
+      const details = citation.details && typeof citation.details === 'object' ? citation.details : {};
+      const pick = (...keys) => {
+        for (const key of keys) {
+          for (const value of [citation[key], details[key]]) {
+            if (typeof value === 'string' && value.trim()) return value.trim();
+          }
+        }
+        return null;
+      };
+      const url = pick('url', 'href');
+      const title = pick('title', 'document_title', 'source');
+      const citedText = pick('cited_text', 'quote');
+      if (!url && !title && !citedText) continue;
+
+      const key = `${url || ''}|${url ? '' : (title || '')}`;
+      let source = sources.get(key);
+      if (!source) {
+        source = { url, title, quotes: [] };
+        sources.set(key, source);
+      }
+      if (!source.title && title) source.title = title;
+      if (citedText && !source.quotes.includes(citedText)) source.quotes.push(citedText);
+    }
+    if (!sources.size) return '';
+
+    const lines = [...sources.values()].map(({ url, title, quotes }) => {
+      // Same rule as renderUnknownContentBlock: only HTTP(S) URLs are clickable.
+      const safeUrl = url && /^https?:\/\/[^\s<>]+$/i.test(url) ? url : null;
+      let line;
+      if (safeUrl) line = `- [${escapeReferenceLabel(title || safeUrl)}](<${safeUrl}>)`;
+      else if (url) line = `- ${escapeReferenceLabel(title || 'Source')} — ${escapeReferenceLabel(url)}`;
+      else line = `- ${escapeReferenceLabel(title || 'Quoted source')}`;
+      return [line, ...quotes.map((quote) => `  > ${escapeReferenceLabel(quote)}`)].join('\n');
+    });
+    return `Sources:\n${lines.join('\n')}`;
+  }
+
   function renderContentBlocks(blocks, inlineImageState = { index: 0 }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
@@ -175,7 +222,9 @@
       // Do not leak private reasoning even if a variant happens to expose a
       // generic text/content property as well as the usual thinking field.
       if (block.type === 'thinking') return '';
-      if (block.type === 'text') return block.text || '';
+      if (block.type === 'text') {
+        return [block.text || '', renderTextBlockCitations(block.citations)].filter(Boolean).join('\n\n');
+      }
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
       if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
