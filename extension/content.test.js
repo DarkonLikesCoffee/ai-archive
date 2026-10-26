@@ -157,6 +157,7 @@ function createHarness(conversation, {
     TextEncoder,
     Uint8Array,
     btoa,
+    atob,
     crypto: {
       subtle: {
         digest: async (...args) => {
@@ -1371,6 +1372,88 @@ test('redacts oversized media payloads nested inside tool results', async () => 
   assert.match(rendered, /Chart generated/);
   assert.match(rendered, /omitted inline payload: 8192 characters/);
   assert.equal(rendered.includes(binaryPayload), false, 'binary data should not inflate the Markdown transcript');
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('materializes inline base64 image blocks that have no message.files entry', async () => {
+  const imageBytes = 'inline chart image bytes';
+  const imageBase64 = btoa(imageBytes);
+  const conversation = {
+    uuid: 'conversation-inline-image',
+    name: 'Inline image content block',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Explain this chart.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          { type: 'text', text: 'Here is the chart.' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBase64 } },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const normalized = handoff.conversations[0];
+  const imageAssets = normalized.assets.filter((asset) => asset.source === 'message-content');
+
+  assert.equal(imageAssets.length, 1);
+  assert.equal(imageAssets[0].mime, 'image/png');
+  assert.equal(imageAssets[0].message_external_id, 'assistant-message');
+  assert.equal(Buffer.from(imageAssets[0].base64, 'base64').toString('utf8'), imageBytes);
+  assert.equal(normalized.messages[1].content.includes(imageBase64), false,
+    'inline image bytes must not be copied into Markdown text');
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('does not duplicate an image represented by both message.files and a content block', async () => {
+  const imageBytes = 'same image bytes';
+  const imageBase64 = btoa(imageBytes);
+  const assetUrl = 'https://assets.example/same-inline-image.png';
+  const conversation = {
+    uuid: 'conversation-duplicate-image-representation',
+    name: 'Duplicate image representations',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [
+        { type: 'text', text: 'Please inspect this image.' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBase64 } },
+      ],
+      files: [{
+        file_uuid: 'image-file-id',
+        file_name: 'same-inline-image.png',
+        preview_url: assetUrl,
+        mime_type: 'image/png',
+      }],
+    }],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: { [assetUrl]: { content: imageBytes, contentType: 'image/png' } },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+
+  assert.equal(assets.length, 1, 'identical bytes in the file and content block representations should be deduplicated');
+  assert.equal(assets[0].source, 'message');
+  assert.equal(Buffer.from(assets[0].base64, 'base64').toString('utf8'), imageBytes);
 
   harness.finishFirstHandoff({ ok: true });
 });
