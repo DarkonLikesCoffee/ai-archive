@@ -76,7 +76,7 @@ function loadBackgroundAssetHelpers() {
       sendMessage() { return Promise.resolve(); },
     },
   };
-  const closing = '\\n})();';
+  const closing = '\n})();';
   const closingIndex = backgroundSource.lastIndexOf(closing);
   assert.notEqual(closingIndex, -1, 'background service worker closing marker must exist');
   const sourceWithTestHooks = `${backgroundSource.slice(0, closingIndex)}
