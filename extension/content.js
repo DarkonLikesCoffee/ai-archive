@@ -51,7 +51,10 @@
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
       throw new Error(`Claude returned an invalid payload for conversation "${id}". No archive changes were submitted to GitHub; retry the sync.`);
     }
-    if (data.uuid && data.uuid !== id) {
+    if (typeof data.uuid !== 'string' || !data.uuid.trim()) {
+      throw new Error(`Claude returned a conversation payload without a valid UUID for requested conversation "${id}". No archive changes were submitted to GitHub; retry the sync.`);
+    }
+    if (data.uuid !== id) {
       throw new Error(`Claude returned conversation "${data.uuid}" when "${id}" was requested. No archive changes were submitted to GitHub.`);
     }
     const messages = Array.isArray(data.chat_messages) ? data.chat_messages : data.messages;
