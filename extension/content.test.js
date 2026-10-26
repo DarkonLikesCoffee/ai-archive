@@ -18,12 +18,22 @@ function jsonResponse(value) {
   };
 }
 
-function createHarness(conversation, { sandboxFiles = [], sandboxContents = {}, sandboxContentTypes = {} } = {}) {
+function createHarness(conversation, {
+  sandboxFiles = [],
+  sandboxContents = {},
+  sandboxContentTypes = {},
+  sandboxDownloadStatuses = {},
+  sandboxListStatus = 200,
+  assetResponses = {},
+} = {}) {
   const listeners = [];
   const requests = [];
   const handoffs = [];
+  const progressMessages = [];
   let resolveFirstHandoff;
   const firstHandoff = new Promise((resolve) => { resolveFirstHandoff = resolve; });
+  let resolveErrorProgress;
+  const errorProgress = new Promise((resolve) => { resolveErrorProgress = resolve; });
   let finishFirstHandoff;
 
   const chrome = {
@@ -35,6 +45,10 @@ function createHarness(conversation, { sandboxFiles = [], sandboxContents = {}, 
         },
       },
       sendMessage(message, callback) {
+        if (message.type === 'syncProgress') {
+          progressMessages.push(message);
+          if (message.stage === 'error') resolveErrorProgress(message);
+        }
         if (message.type === 'syncNormalized') {
           handoffs.push(message);
           if (handoffs.length === 1) {
@@ -50,7 +64,20 @@ function createHarness(conversation, { sandboxFiles = [], sandboxContents = {}, 
   };
 
   const fetch = async (url) => {
-    requests.push(String(url));
+    const requestUrl = String(url);
+    requests.push(requestUrl);
+    if (/^https?:\/\//i.test(requestUrl)) {
+      const configured = assetResponses[requestUrl] || {};
+      const status = configured.status ?? 200;
+      const bytes = new TextEncoder().encode(configured.content ?? 'asset bytes');
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        json: async () => ({}),
+        arrayBuffer: async () => bytes.slice().buffer,
+        headers: { get: () => configured.contentType || null },
+      };
+    }
     if (url === '/api/organizations') return jsonResponse([{ uuid: 'org-id' }]);
     if (url === '/api/organizations/org-id/chat_conversations') {
       return jsonResponse([{
@@ -64,15 +91,19 @@ function createHarness(conversation, { sandboxFiles = [], sandboxContents = {}, 
       return jsonResponse(conversation);
     }
     if (String(url).includes('/wiggle/list-files')) {
+      if (sandboxListStatus !== 200) {
+        return { ok: false, status: sandboxListStatus, json: async () => ({ error: 'test failure' }) };
+      }
       return jsonResponse({ files_metadata: sandboxFiles });
     }
     if (String(url).includes('/wiggle/download-file?path=')) {
       const match = String(url).match(/[?&]path=([^&]*)/);
       const filePath = match ? decodeURIComponent(match[1]) : '';
+      const status = sandboxDownloadStatuses[filePath] ?? 200;
       const bytes = new TextEncoder().encode(sandboxContents[filePath] ?? '');
       return {
-        ok: true,
-        status: 200,
+        ok: status >= 200 && status < 300,
+        status,
         json: async () => ({}),
         arrayBuffer: async () => bytes.slice().buffer,
         headers: {
@@ -101,6 +132,8 @@ function createHarness(conversation, { sandboxFiles = [], sandboxContents = {}, 
     onMessage: listeners[0],
     requests,
     handoffs,
+    progressMessages,
+    errorProgress,
     firstHandoff,
     finishFirstHandoff(response) {
       finishFirstHandoff?.(response);
@@ -293,4 +326,83 @@ test('deduplicates extracted attachments by message and content, not filename al
   );
 
   harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('aborts the sync when an explicitly referenced message attachment fails to download', async () => {
+  const assetUrl = 'https://files.example/photo.png';
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Failed attachment download test',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Look at this image.' }],
+      files: [{
+        file_name: 'photo.png',
+        preview_url: assetUrl,
+        mime_type: 'image/png',
+      }],
+    }],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: { [assetUrl]: { status: 503 } },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /photo\.png/);
+  assert.match(error.error, /HTTP 503/);
+  assert.match(error.error, /Sync stopped before anything was sent to GitHub/);
+  assert.equal(harness.handoffs.length, 0, 'no partial conversation batch may reach GitHub sync');
+});
+
+test('aborts the sync when a listed sandbox attachment cannot be downloaded', async () => {
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Failed sandbox download test',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Keep the generated file.' }],
+    }],
+  };
+  const harness = createHarness(conversation, {
+    sandboxFiles: [{ path: 'outputs/render.png', content_type: 'image/png' }],
+    sandboxDownloadStatuses: { 'outputs/render.png': 404 },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /outputs\/render\.png/);
+  assert.match(error.error, /HTTP 404/);
+  assert.equal(harness.handoffs.length, 0, 'a missing sandbox file must stop the archive sync');
+});
+
+test('aborts the sync when the sandbox file list cannot be retrieved', async () => {
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Failed sandbox list test',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Please archive this conversation.' }],
+    }],
+  };
+  const harness = createHarness(conversation, { sandboxListStatus: 503 });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /Could not list Claude sandbox files/);
+  assert.match(error.error, /HTTP 503/);
+  assert.equal(harness.handoffs.length, 0, 'unknown sandbox contents must not be archived as an empty file list');
 });
