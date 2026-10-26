@@ -23,8 +23,11 @@ function createHarness(conversation, {
   sandboxContents = {},
   sandboxContentTypes = {},
   sandboxDownloadStatuses = {},
+  sandboxDownloadDelays = {},
   sandboxListStatus = 200,
   assetResponses = {},
+  downloadDelayMs = 0,
+  sandboxDownloadDelayMs = 0,
 } = {}) {
   const listeners = [];
   const requests = [];
@@ -35,6 +38,8 @@ function createHarness(conversation, {
   let resolveErrorProgress;
   const errorProgress = new Promise((resolve) => { resolveErrorProgress = resolve; });
   let finishFirstHandoff;
+  let activeDownloads = 0;
+  let maxActiveDownloads = 0;
 
   const chrome = {
     runtime: {
@@ -70,13 +75,21 @@ function createHarness(conversation, {
       const configured = assetResponses[requestUrl] || {};
       const status = configured.status ?? 200;
       const bytes = new TextEncoder().encode(configured.content ?? 'asset bytes');
-      return {
-        ok: status >= 200 && status < 300,
-        status,
-        json: async () => ({}),
-        arrayBuffer: async () => bytes.slice().buffer,
-        headers: { get: () => configured.contentType || null },
-      };
+      activeDownloads += 1;
+      maxActiveDownloads = Math.max(maxActiveDownloads, activeDownloads);
+      try {
+        const delay = configured.delayMs ?? downloadDelayMs;
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        return {
+          ok: status >= 200 && status < 300,
+          status,
+          json: async () => ({}),
+          arrayBuffer: async () => bytes.slice().buffer,
+          headers: { get: () => configured.contentType || null },
+        };
+      } finally {
+        activeDownloads -= 1;
+      }
     }
     if (url === '/api/organizations') return jsonResponse([{ uuid: 'org-id' }]);
     if (url === '/api/organizations/org-id/chat_conversations') {
@@ -101,17 +114,25 @@ function createHarness(conversation, {
       const filePath = match ? decodeURIComponent(match[1]) : '';
       const status = sandboxDownloadStatuses[filePath] ?? 200;
       const bytes = new TextEncoder().encode(sandboxContents[filePath] ?? '');
-      return {
-        ok: status >= 200 && status < 300,
-        status,
-        json: async () => ({}),
-        arrayBuffer: async () => bytes.slice().buffer,
-        headers: {
-          get: (name) => name.toLowerCase() === 'content-type'
-            ? (sandboxContentTypes[filePath] || null)
-            : null,
-        },
-      };
+      activeDownloads += 1;
+      maxActiveDownloads = Math.max(maxActiveDownloads, activeDownloads);
+      try {
+        const delay = sandboxDownloadDelays[filePath] ?? sandboxDownloadDelayMs;
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        return {
+          ok: status >= 200 && status < 300,
+          status,
+          json: async () => ({}),
+          arrayBuffer: async () => bytes.slice().buffer,
+          headers: {
+            get: (name) => name.toLowerCase() === 'content-type'
+              ? (sandboxContentTypes[filePath] || null)
+              : null,
+          },
+        };
+      } finally {
+        activeDownloads -= 1;
+      }
     }
     throw new Error(`Unexpected request in test: ${url}`);
   };
@@ -135,6 +156,9 @@ function createHarness(conversation, {
     progressMessages,
     errorProgress,
     firstHandoff,
+    metrics() {
+      return { maxActiveDownloads };
+    },
     finishFirstHandoff(response) {
       finishFirstHandoff?.(response);
     },
@@ -481,4 +505,104 @@ test('refuses duplicate message UUIDs instead of choosing an arbitrary branch no
 
   assert.match(error.error, /message UUID "active-leaf" appears more than once/);
   assert.equal(harness.handoffs.length, 0, 'ambiguous duplicate message IDs must not be archived');
+});
+
+
+test('downloads message and sandbox assets concurrently with a bounded limit and stable order', async () => {
+  const directFiles = Array.from({ length: 5 }, (_, index) => ({
+    file_uuid: `direct-${index + 1}`,
+    file_name: `direct-${index + 1}.txt`,
+    preview_url: `https://assets.example/direct-${index + 1}`,
+  }));
+  const sandboxFiles = Array.from({ length: 5 }, (_, index) => ({
+    path: `outputs/sandbox-${index + 1}.txt`,
+    content_type: 'text/plain',
+  }));
+  const assetResponses = Object.fromEntries(directFiles.map((file, index) => [
+    file.preview_url,
+    { content: `direct content ${index + 1}` },
+  ]));
+  const sandboxContents = Object.fromEntries(sandboxFiles.map((file, index) => [
+    file.path,
+    `sandbox content ${index + 1}`,
+  ]));
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Concurrent attachment downloads',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Keep these files in order.' }],
+      files: directFiles,
+    }],
+  };
+  const harness = createHarness(conversation, {
+    sandboxFiles,
+    sandboxContents,
+    assetResponses,
+    downloadDelayMs: 15,
+    sandboxDownloadDelayMs: 15,
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+
+  assert.equal(assets.length, 10);
+  assert.deepEqual(
+    Array.from(assets.slice(0, 5), (asset) => asset.name),
+    directFiles.map((file) => file.file_name),
+    'message assets should retain their original order',
+  );
+  assert.deepEqual(
+    Array.from(assets.slice(5), (asset) => asset.source_path),
+    sandboxFiles.map((file) => file.path),
+    'sandbox assets should retain the metadata order',
+  );
+  const { maxActiveDownloads } = harness.metrics();
+  assert.ok(maxActiveDownloads > 1, 'independent asset downloads should overlap');
+  assert.ok(maxActiveDownloads <= 3, 'asset downloads must stay within the concurrency limit');
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('stops scheduling sandbox downloads after a failure and never hands off a partial archive', async () => {
+  const sandboxFiles = Array.from({ length: 6 }, (_, index) => ({
+    path: `outputs/file-${index + 1}.txt`,
+    content_type: 'text/plain',
+  }));
+  const sandboxContents = Object.fromEntries(sandboxFiles.map((file) => [file.path, 'valid file']));
+  const sandboxDownloadDelays = Object.fromEntries(sandboxFiles.map((file, index) => [
+    file.path,
+    index === 1 ? 0 : 25,
+  ]));
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Download failure safety',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Keep every file or fail safely.' }],
+    }],
+  };
+  const harness = createHarness(conversation, {
+    sandboxFiles,
+    sandboxContents,
+    sandboxDownloadDelays,
+    sandboxDownloadStatuses: { 'outputs/file-2.txt': 503 },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /Failed to download sandbox file "outputs\/file-2\.txt"/);
+  assert.equal(harness.handoffs.length, 0, 'a failed asset collection must never send a partial conversation to GitHub');
+  const downloadRequests = harness.requests.filter((url) => url.includes('/wiggle/download-file?path='));
+  assert.equal(downloadRequests.length, 3, 'no further downloads should be scheduled after the first failure');
+  assert.ok(harness.metrics().maxActiveDownloads <= 3, 'failed downloads must respect the concurrency limit');
 });
