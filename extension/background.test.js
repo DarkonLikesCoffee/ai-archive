@@ -439,6 +439,17 @@ async function buildIndexEntry(hooks, conversation) {
   const path = hooks.conversationPath(conversation, provider, accountSlug);
   const markdown = hooks.conversationMarkdown(conversation, provider, account, normalized.byKey, normalized.assets);
   const entry = hooks.indexEntry(conversation, path, provider, account, normalized.assets);
+  const searchText = entry.search_text;
+  entry.search_text_sha256 = await hooks.sha256(searchText);
+  if (typeof CompressionStream === 'function') {
+    const stream = new Blob([searchText]).stream().pipeThrough(new CompressionStream('gzip'));
+    const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+    entry.search_text_encoding = 'gzip-base64';
+    entry.search_text_gzip = Buffer.from(bytes).toString('base64');
+    delete entry.search_text;
+  } else {
+    entry.search_text_encoding = 'plain';
+  }
   entry.content_sha256 = await hooks.sha256(markdown);
   return { entry, normalized, markdown };
 }
