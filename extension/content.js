@@ -306,13 +306,21 @@
       sendProgress({ stage: 'preparing', current: 0, total, selected: limit });
       // Data is already normalized above; this stage exists to make the handoff explicit.
       sendProgress({ stage: 'preparing', current: total, total, selected: limit });
-      chrome.runtime.sendMessage({ type: 'syncNormalized', conversations }, (r) => {
-        if (chrome.runtime.lastError) {
-          sendProgress({ stage: 'error', error: chrome.runtime.lastError.message });
-          return;
-        }
-        if (!r?.ok && !r?.cancelled) sendProgress({ stage: 'error', error: r?.error || 'No response' });
+      // Keep the content-script lock until the background sync has actually
+      // finished; otherwise another startSync message can trigger a second fetch
+      // while the first batch is still being committed to GitHub.
+      const result = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations }, (response) => {
+          if (chrome.runtime.lastError) {
+            reject(Error(chrome.runtime.lastError.message));
+            return;
+          }
+          resolve(response);
+        });
       });
+      if (!result?.ok && !result?.cancelled) {
+        sendProgress({ stage: 'error', error: result?.error || 'No response' });
+      }
     } catch (e) {
       if (e.name === 'AbortError') sendProgress({ stage: 'cancelled', message: 'Sync cancelled.' });
       else sendProgress({ stage: 'error', error: e.message });
