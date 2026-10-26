@@ -281,12 +281,26 @@ function attachmentAssetForMessage(message, descriptor, name, assetMap, matchedA
 // Inline image marker indices restart in every message, and one asset can be
 // shared by several messages, so positions are only meaningful together with
 // the message they were recorded for.
-function inlineImageIndicesForMessage(asset, message) {
+function inlineIndicesForMessage(asset, message) {
   const messageId = message?.external_id || message?.uuid || message?.id || null;
-  if (!messageId || !Array.isArray(asset?.inline_image_positions)) return [];
-  return asset.inline_image_positions
+  if (!messageId || !Array.isArray(asset?.inline_positions)) return [];
+  return asset.inline_positions
     .filter((position) => position?.message_external_id === messageId)
     .map((position) => position.index);
+}
+
+// Inline image markers carry the conversation's random nonce (see
+// content.js), so text that merely looks like a marker is never replaced.
+const INLINE_ASSET_MARKER = /\[\[AI_ARCHIVE_INLINE_ASSET:([0-9a-f]{32}):(\d+)\]\]/g;
+
+function isOwnInlineMarker(c, nonce) {
+  return typeof c?.inline_marker_nonce === 'string' && nonce === c.inline_marker_nonce;
+}
+
+// Search text and previews are stored in index.json; keep this sync's
+// internal markers out of them.
+function contentWithoutInlineMarkers(c, content) {
+  return String(content || '').replace(INLINE_ASSET_MARKER, (marker, nonce) => (isOwnInlineMarker(c, nonce) ? '' : marker));
 }
 
 function attachmentMarkdown(message, assetMap, allAssets) {
@@ -298,7 +312,7 @@ function attachmentMarkdown(message, assetMap, allAssets) {
     // Inline content-block images are rendered at their original position in
     // this message body, so do not repeat them in its trailing attachment list.
     // Other messages sharing the asset still list it as a normal attachment.
-    if (!asset || used.has(asset.path) || inlineImageIndicesForMessage(asset, message).length) return;
+    if (!asset || used.has(asset.path) || inlineIndicesForMessage(asset, message).length) return;
     used.add(asset.path);
     parts.push(assetMarkdown(asset, asset.path));
   };
@@ -359,13 +373,19 @@ function conversationMarkdown(c, provider, account, assetMap, allAssets) {
         ? provider[0].toUpperCase() + provider.slice(1)
         : m.role;
     const attachments = attachmentMarkdown(m, assetMap, allAssets);
-    const content = String(m.content || '').replace(/\[\[AI_ARCHIVE_INLINE_IMAGE:(\d+)\]\]/g, (marker, rawIndex) => {
+    const content = String(m.content || '').replace(INLINE_ASSET_MARKER, (marker, nonce, rawIndex) => {
+      // Marker-shaped text from the conversation itself stays verbatim.
+      if (!isOwnInlineMarker(c, nonce)) return marker;
       const imageIndex = Number(rawIndex);
       const image = allAssets.find((asset) =>
-        inlineImageIndicesForMessage(asset, m).includes(imageIndex)
+        inlineIndicesForMessage(asset, m).includes(imageIndex)
         && assetMatchesMessage(asset, m, allAssets)
       );
-      return image ? assetMarkdown(image, image.path) : marker;
+      // Never publish an internal marker or guess another file for it.
+      if (!image) {
+        throw new Error(`Cannot safely export "${c.title || c.external_id}": inline image ${imageIndex} in message "${m.external_id}" has no archived asset. No archive changes were published.`);
+      }
+      return assetMarkdown(image, image.path);
     });
 
     // User attachments/reply excerpts are shown before the user's message, matching
@@ -404,6 +424,7 @@ function normalizeAssetList(c, provider, accountSlug) {
 }
 
 function indexEntry(c, path, provider, account, assets) {
+  const contents = c.messages.map((m) => contentWithoutInlineMarkers(c, m.content));
   return {
     id: c.external_id,
     provider,
@@ -416,8 +437,8 @@ function indexEntry(c, path, provider, account, assets) {
     message_count: c.message_count || c.messages.length,
     assets: assets.map((a) => ({ path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name })),
     format_version: 4,
-    preview: String(c.messages.find((m) => m.content)?.content || '').slice(0, 300),
-    search_text: [c.title, ...c.messages.map((m) => m.content)].join('\n').slice(0, 250000),
+    preview: String(contents.find(Boolean) || '').slice(0, 300),
+    search_text: [c.title, ...contents].join('\n').slice(0, 250000),
   };
 }
 
