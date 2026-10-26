@@ -77,7 +77,7 @@ npm run dev        # open the printed local URL
 # or: npm run build, then serve web/dist with any static file host
 ```
 
-Enter the owner, repository, and the read-only token. The token is stored only in that browser's local storage; **Disconnect** removes it. You can search all conversations from the list and use the in-conversation find bar (Ctrl/Cmd+F) inside a conversation.
+Enter the owner, repository, and the read-only token. The token is stored only in that browser's local storage; **Disconnect** removes it. Search all conversations from the list: every word must appear (in any order), `"quoted phrases"` must appear as written, results are ranked with title matches first, and each result shows where it matched. Inside a conversation, use the find bar (Ctrl/Cmd+F).
 
 ### Known limitations
 
