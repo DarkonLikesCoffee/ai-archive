@@ -1282,7 +1282,7 @@ test('preserves unknown content block metadata instead of silently dropping it',
   const handoff = await harness.firstHandoff;
   const rendered = handoff.conversations[0].messages[1].content;
 
-  assert.match(rendered, /Claude content block: future_media_block/);
+  assert.match(rendered, /### Claude content block: future_media_block\n\n```json/);
   assert.match(rendered, /audio\/wav/);
   assert.match(rendered, /omitted inline payload: 4096 characters/);
   assert.equal(rendered.includes(largePayload), false, 'large binary payload must not be dumped into Markdown');
@@ -1326,6 +1326,51 @@ test('never renders thinking blocks even when they expose generic text fields', 
   assert.equal(rendered.includes('private reasoning A'), false);
   assert.equal(rendered.includes('private reasoning B'), false);
   assert.equal(rendered.includes('private reasoning C'), false);
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('redacts oversized media payloads nested inside tool results', async () => {
+  const binaryPayload = 'B'.repeat(8192);
+  const conversation = {
+    uuid: 'conversation-tool-result-media',
+    name: 'Tool result with inline media',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Generate a chart.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          {
+            type: 'tool_result',
+            name: 'render_chart',
+            content: [
+              { type: 'text', text: 'Chart generated.' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: binaryPayload } },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+
+  assert.match(rendered, /Tool result: render_chart/);
+  assert.match(rendered, /Chart generated/);
+  assert.match(rendered, /omitted inline payload: 8192 characters/);
+  assert.equal(rendered.includes(binaryPayload), false, 'binary data should not inflate the Markdown transcript');
 
   harness.finishFirstHandoff({ ok: true });
 });
