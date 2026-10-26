@@ -97,7 +97,8 @@
       if (only === 'code' && typeof input.code === 'string') return `### Claude tool: ${name}\n\n${fence(input.code, 'text')}`;
     }
 
-    const serialized = typeof input === 'string' ? input : JSON.stringify(input ?? {}, null, 2);
+    // Same redaction as tool results: never dump base64 payloads into Markdown.
+    const serialized = typeof input === 'string' ? input : stringifyContentBlock(input ?? {});
     return `### Claude tool: ${name}\n\n${fence(serialized, 'json')}`;
   }
 

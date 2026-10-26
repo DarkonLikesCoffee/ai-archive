@@ -1387,6 +1387,53 @@ test('keeps every tool input field when the input is more than a bare command or
 });
 
 
+test('redacts inline binary payloads in tool inputs without touching text fields', async () => {
+  const payload = 'A'.repeat(4096);
+  const artifactContent = 'data: keep this text\n'.repeat(40);
+  const input = {
+    filename: 'photo.png',
+    data: payload,
+    image: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+    content: artifactContent,
+  };
+  const conversation = {
+    uuid: 'conversation-tool-input-redaction',
+    name: 'Tool input redaction',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Upload it.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{ type: 'tool_use', name: 'upload_file', input }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+  const exported = JSON.parse(rendered.split('```json\n')[1].split('\n```')[0]);
+
+  assert.equal(rendered.includes(payload), false, 'binary payloads must not be dumped into Markdown');
+  assert.deepEqual(exported, {
+    filename: 'photo.png',
+    data: '[omitted inline payload: 4096 characters]',
+    image: { type: 'base64', media_type: 'image/png', data: '[omitted inline payload: 12 characters]' },
+    content: artifactContent,
+  });
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
 test('redacts oversized media payloads nested inside tool results', async () => {
   const binaryPayload = 'B'.repeat(8192);
   const conversation = {
