@@ -592,6 +592,55 @@ function skippedSummary(skipped) {
   return ` ${skipped.length} conversation${skipped.length === 1 ? '' : 's'} could not be exported and ${skipped.length === 1 ? 'was' : 'were'} left unchanged in the archive: ${listed.join('; ')}${more}. Sync again later to retry ${skipped.length === 1 ? 'it' : 'them'}.`;
 }
 
+// Read the branch head, its full tree, and archive/index.json exactly as a
+// sync sees them. Shared by sync() and the incremental-sync archive state.
+async function loadArchiveSnapshot() {
+  let ref = await getRef();
+  assertNotCancelled();
+  let branch = ref ? ref.ref.split('/').pop() : 'main';
+  let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
+  let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
+  if (baseTree?.truncated) {
+    throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
+  }
+  let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
+
+  let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
+  const indexFile = ref ? await getFile('archive/index.json', branch) : null;
+  if (indexFile) {
+    let indexContent = indexFile.content;
+    // The GitHub Contents API omits file content for larger files and reports
+    // encoding "none". Never interpret that response as a missing index: a
+    // limited sync would then publish an index containing only selected chats.
+    if (typeof indexContent !== 'string' || (!indexContent && indexFile.sha)) {
+      if (!indexFile.sha) {
+        throw new Error('GitHub returned no readable content or blob SHA for archive/index.json. No archive changes were published.');
+      }
+      const blob = await gh(`/git/blobs/${encodeURIComponent(indexFile.sha)}`);
+      if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
+        throw new Error('GitHub could not return the full archive/index.json blob. No archive changes were published.');
+      }
+      indexContent = blob.content;
+    }
+
+    let parsedIndex;
+    try {
+      parsedIndex = JSON.parse(base64DecodeContent(indexContent));
+    } catch {
+      // Never silently replace a corrupt index with a partial one. The index is
+      // the web app's navigation/search catalogue; rebuilding it from a limited
+      // sync could make every unselected conversation disappear from the UI.
+      throw new Error('archive/index.json is invalid JSON. Restore or repair it before syncing; no archive changes were published.');
+    }
+    if (!parsedIndex || !Array.isArray(parsedIndex.conversations)) {
+      throw new Error('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
+    }
+    index = parsedIndex;
+  }
+
+  return { ref, branch, baseCommit, baseTree, existingPaths, index };
+}
+
 // After a full sync, archived conversations that Claude.ai did not list at
 // all were either deleted there or missing from an incomplete list. Their
 // archived copies are kept either way; say so instead of staying silent.
@@ -614,48 +663,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false 
     const account = s.archive_account?.trim() || 'personal';
     const accountSlug = slugify(account);
     const provider = 'claude';
-    let ref = await getRef();
-    assertNotCancelled();
-    let branch = ref ? ref.ref.split('/').pop() : 'main';
-    let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
-    let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
-    if (baseTree?.truncated) {
-      throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
-    }
-    let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
-
-    let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
-    const indexFile = ref ? await getFile('archive/index.json', branch) : null;
-    if (indexFile) {
-      let indexContent = indexFile.content;
-      // The GitHub Contents API omits file content for larger files and reports
-      // encoding "none". Never interpret that response as a missing index: a
-      // limited sync would then publish an index containing only selected chats.
-      if (typeof indexContent !== 'string' || (!indexContent && indexFile.sha)) {
-        if (!indexFile.sha) {
-          throw new Error('GitHub returned no readable content or blob SHA for archive/index.json. No archive changes were published.');
-        }
-        const blob = await gh(`/git/blobs/${encodeURIComponent(indexFile.sha)}`);
-        if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
-          throw new Error('GitHub could not return the full archive/index.json blob. No archive changes were published.');
-        }
-        indexContent = blob.content;
-      }
-
-      let parsedIndex;
-      try {
-        parsedIndex = JSON.parse(base64DecodeContent(indexContent));
-      } catch {
-        // Never silently replace a corrupt index with a partial one. The index is
-        // the web app's navigation/search catalogue; rebuilding it from a limited
-        // sync could make every unselected conversation disappear from the UI.
-        throw new Error('archive/index.json is invalid JSON. Restore or repair it before syncing; no archive changes were published.');
-      }
-      if (!parsedIndex || !Array.isArray(parsedIndex.conversations)) {
-        throw new Error('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
-      }
-      index = parsedIndex;
-    }
+    let { ref, branch, baseCommit, baseTree, existingPaths, index } = await loadArchiveSnapshot();
 
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
     if (fullList) {
