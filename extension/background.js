@@ -1,6 +1,8 @@
 // AI Archive background service worker.
 // Sync state lives here so the popup can open/close without losing progress.
 const API = 'https://api.github.com';
+const BLOB_UPLOAD_CONCURRENCY = 4;
+let activeGitHubSettings = null;
 let syncAbortController = null;
 let cancelRequested = false;
 let syncRunning = false;
@@ -21,7 +23,7 @@ function assertNotCancelled() {
 
 async function gh(path, opts = {}, allowAfterCancel = false) {
   if (!allowAfterCancel) assertNotCancelled();
-  const s = await settings();
+  const s = activeGitHubSettings || await settings();
   if (!s.github_owner || !s.github_repo || !s.github_token) throw Error('Configure GitHub settings in the extension popup first.');
   const headers = {
     Authorization: `Bearer ${s.github_token}`,
@@ -417,6 +419,9 @@ async function sync(conversations, onProgress) {
   activeProgressCallback = onProgress;
   try {
     const s = await settings();
+    // Keep a consistent settings snapshot for this sync and avoid a storage read
+    // for every blob request when exporting large archives.
+    activeGitHubSettings = s;
     const account = s.archive_account?.trim() || 'personal';
     const accountSlug = slugify(account);
     const provider = 'claude';
@@ -564,22 +569,45 @@ async function sync(conversations, onProgress) {
       return { total, changed: 0, commit: null };
     }
 
-    const treeEntries = [];
+    const treeEntries = new Array(changes.length);
     const uploadTotal = changes.filter((x) => !x.delete).length + 1;
     onProgress?.({ stage: 'uploading', current: 0, total: uploadTotal, changed: changedConversations });
     let uploaded = 0;
-    for (let i = 0; i < changes.length; i++) {
-      assertNotCancelled();
-      const change = changes[i];
-      if (change.delete) {
-        treeEntries.push({ path: change.path, mode: '100644', type: 'blob', sha: null });
-        continue;
+    let nextChangeIndex = 0;
+    let firstUploadError = null;
+
+    // Blob writes are independent, so upload a small bounded batch in parallel.
+    // Keep tree entries indexed by the original change order so path updates and
+    // deletions remain deterministic in the final tree payload.
+    async function uploadWorker() {
+      while (true) {
+        if (firstUploadError) return;
+        const i = nextChangeIndex++;
+        if (i >= changes.length) return;
+        const change = changes[i];
+        try {
+          assertNotCancelled();
+          if (change.delete) {
+            treeEntries[i] = { path: change.path, mode: '100644', type: 'blob', sha: null };
+            continue;
+          }
+
+          const blob = await createBlob(change.content, change.encoding || 'utf-8');
+          assertNotCancelled();
+          treeEntries[i] = { path: change.path, mode: '100644', type: 'blob', sha: blob.sha };
+          uploaded += 1;
+          onProgress?.({ stage: 'uploading', current: uploaded, total: uploadTotal, changed: changedConversations });
+        } catch (error) {
+          if (!firstUploadError) firstUploadError = error;
+          return;
+        }
       }
-      const blob = await createBlob(change.content, change.encoding || 'utf-8');
-      treeEntries.push({ path: change.path, mode: '100644', type: 'blob', sha: blob.sha });
-      uploaded += 1;
-      onProgress?.({ stage: 'uploading', current: uploaded, total: uploadTotal, changed: changedConversations });
     }
+
+    const workerCount = Math.min(BLOB_UPLOAD_CONCURRENCY, Math.max(1, changes.length));
+    await Promise.all(Array.from({ length: workerCount }, () => uploadWorker()));
+    if (firstUploadError) throw firstUploadError;
+    assertNotCancelled();
     assertNotCancelled();
     const indexBlob = await createBlob(JSON.stringify(nextIndex, null, 2));
     treeEntries.push({ path: 'archive/index.json', mode: '100644', type: 'blob', sha: indexBlob.sha });
@@ -661,6 +689,7 @@ async function sync(conversations, onProgress) {
     syncRunning = false;
     syncAbortController = null;
     activeProgressCallback = null;
+    activeGitHubSettings = null;
   }
 }
 

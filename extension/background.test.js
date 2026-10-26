@@ -13,12 +13,15 @@ function loadBackgroundWithPendingGitHubRequest() {
   const chrome = {
     storage: {
       local: {
-        get: async () => ({
+        get: async () => {
+          settingsReadCount += 1;
+          return {
           github_owner: 'example-owner',
           github_repo: 'example-archive',
           github_token: 'test-token',
           archive_account: 'personal',
-        }),
+          };
+        },
       },
     },
     runtime: {
@@ -147,7 +150,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null }) {
+function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0 }) {
   const listeners = [];
   const requests = [];
   const baseSha = 'base-commit';
@@ -157,15 +160,21 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
   let injectedFailureUsed = false;
   let cancelTriggered = false;
   let currentHeadSha = baseSha;
+  let settingsReadCount = 0;
+  let activeBlobRequests = 0;
+  let maxActiveBlobRequests = 0;
   const chrome = {
     storage: {
       local: {
-        get: async () => ({
-          github_owner: 'example-owner',
-          github_repo: 'example-archive',
-          github_token: 'test-token',
-          archive_account: 'personal',
-        }),
+        get: async () => {
+          settingsReadCount += 1;
+          return {
+            github_owner: 'example-owner',
+            github_repo: 'example-archive',
+            github_token: 'test-token',
+            archive_account: 'personal',
+          };
+        },
       },
     },
     runtime: {
@@ -230,8 +239,15 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
         : response({ content: Buffer.from(indexText, 'utf8').toString('base64'), encoding: 'base64' });
     }
     if (pathname.endsWith('/git/blobs') && method === 'POST') {
-      blobCount += 1;
-      return response({ sha: `blob-${blobCount}` });
+      activeBlobRequests += 1;
+      maxActiveBlobRequests = Math.max(maxActiveBlobRequests, activeBlobRequests);
+      try {
+        if (blobDelayMs) await new Promise((resolve) => setTimeout(resolve, blobDelayMs));
+        blobCount += 1;
+        return response({ sha: `blob-${blobCount}` });
+      } finally {
+        activeBlobRequests -= 1;
+      }
     }
     if (pathname.endsWith('/git/trees') && method === 'POST') {
       return response({ sha: 'new-tree' });
@@ -269,6 +285,9 @@ globalThis.__testHooks = {
     sync: context.__testHooks.sync,
     hooks: context.__testHooks,
     requests,
+    metrics() {
+      return { settingsReadCount, maxActiveBlobRequests, blobCount };
+    },
   };
 }
 
@@ -708,4 +727,36 @@ test('does not delete a legacy asset path while an unselected conversation still
     false,
     'the shared path must be preserved for the still-indexed unselected conversation',
   );
+});
+
+
+test('uploads blobs with bounded concurrency and reads settings only once per sync', async () => {
+  const conversation = sampleConversation()[0];
+  conversation.assets = Array.from({ length: 12 }, (_, index) => {
+    const content = `asset payload ${index}`;
+    return {
+      name: `asset-${index}.txt`,
+      mime: 'text/plain',
+      base64: btoa(content),
+      size: content.length,
+      sha256: String(index + 1).repeat(64),
+      source: 'sandbox',
+      source_path: `outputs/asset-${index}.txt`,
+    };
+  });
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+    blobDelayMs: 8,
+  });
+
+  const result = await harness.sync([conversation], () => {});
+  const metrics = harness.metrics();
+
+  assert.equal(result.changed, 1);
+  assert.ok(metrics.maxActiveBlobRequests > 1, 'independent blobs should upload in parallel');
+  assert.ok(metrics.maxActiveBlobRequests <= 4, 'blob uploads must stay within the concurrency limit');
+  assert.equal(metrics.settingsReadCount, 1, 'GitHub settings should be read once per sync, not once per request');
+  assert.equal(metrics.blobCount, 14, '12 assets, one conversation Markdown file, and one index blob should be created');
+  const treeRequest = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST');
+  assert.equal(treeRequest.body.tree.filter(item => item.sha).length, 14);
 });
