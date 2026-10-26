@@ -223,11 +223,11 @@
       .map((byte) => byte.toString(16).padStart(2, '0')).join('');
   }
 
-  // `inline.images` receives each inline image block in the order its marker
+  // `inline.blocks` receives each inline image block in the order its marker
   // is emitted, so a marker's index is by construction its position in the
   // list that collectMessageAssets materializes. A separate traversal would
   // drift whenever the two disagree about which nested content is rendered.
-  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), images: [] }) {
+  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), blocks: [] }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -240,8 +240,8 @@
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
       if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
-        inline.images.push(block);
-        return `[[AI_ARCHIVE_INLINE_IMAGE:${inline.nonce}:${inline.images.length - 1}]]`;
+        inline.blocks.push(block);
+        return `[[AI_ARCHIVE_INLINE_ASSET:${inline.nonce}:${inline.blocks.length - 1}]]`;
       }
       // Preserve common plain-text shapes directly for readability. A block
       // may carry both a text field and nested content (for example a
@@ -442,7 +442,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal, inlineImagesByMessage = new Map()) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineBlocksByMessage = new Map()) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -610,10 +610,10 @@
       // Exactly the image blocks renderContentBlocks emitted markers for, in
       // marker order. Images inside tool input/results or thinking blocks are
       // rendered (redacted) or omitted there, so they never receive a marker.
-      const imageBlocks = inlineImagesByMessage.get(message) || [];
-      for (let index = 0; index < imageBlocks.length; index++) {
+      const inlineBlocks = inlineBlocksByMessage.get(message) || [];
+      for (let index = 0; index < inlineBlocks.length; index++) {
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const block = imageBlocks[index];
+        const block = inlineBlocks[index];
         const source = block.source;
         const bytes = base64ToBytes(source.data);
         const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -633,9 +633,9 @@
             // Marker indices restart in every message, and a downloaded file can
             // be shared by several messages, so record which message each
             // position belongs to rather than a bare index.
-            const positions = Array.isArray(existingAsset.inline_image_positions) ? existingAsset.inline_image_positions : [];
+            const positions = Array.isArray(existingAsset.inline_positions) ? existingAsset.inline_positions : [];
             if (!positions.some((position) => position.message_external_id === messageId && position.index === index)) {
-              existingAsset.inline_image_positions = [...positions, { message_external_id: messageId, index }];
+              existingAsset.inline_positions = [...positions, { message_external_id: messageId, index }];
             }
           }
           continue;
@@ -653,7 +653,7 @@
           sha256: hash,
           source: 'message-content',
           message_external_id: messageId,
-          inline_image_positions: [{ message_external_id: messageId, index }],
+          inline_positions: [{ message_external_id: messageId, index }],
         });
         hashes.add(hash);
       }
@@ -773,13 +773,13 @@
   async function normalize(c, org, signal) {
     const raw = selectActiveLineage(c);
     const inlineMarkerNonce = createInlineMarkerNonce();
-    const inlineImagesByMessage = new Map();
+    const inlineBlocksByMessage = new Map();
     const messages = raw.map((m, i) => {
-      const inline = { nonce: inlineMarkerNonce, images: [] };
+      const inline = { nonce: inlineMarkerNonce, blocks: [] };
       const content = Array.isArray(m.content)
         ? renderContentBlocks(m.content, inline)
         : (typeof m.text === 'string' ? m.text : '');
-      inlineImagesByMessage.set(m, inline.images);
+      inlineBlocksByMessage.set(m, inline.blocks);
       return {
         external_id: m.uuid || m.id || `${i}`,
         role: m.sender === 'human' ? 'user' : m.sender || 'assistant',
@@ -791,7 +791,7 @@
       };
     });
 
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineImagesByMessage);
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineBlocksByMessage);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',

@@ -1423,7 +1423,7 @@ test('materializes inline base64 image blocks that have no message.files entry',
   assert.equal(normalized.messages[1].content.includes(imageBase64), false,
     'inline image bytes must not be copied into Markdown text');
   assert.match(normalized.inline_marker_nonce, /^[0-9a-f]{32}$/);
-  assert.ok(normalized.messages[1].content.includes(`[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:0]]`),
+  assert.ok(normalized.messages[1].content.includes(`[[AI_ARCHIVE_INLINE_ASSET:${normalized.inline_marker_nonce}:0]]`),
     'the image position should be retained for the Markdown renderer');
 
   harness.finishFirstHandoff({ ok: true });
@@ -1745,7 +1745,7 @@ test('scopes inline image positions to the message that contains them', async ()
   assert.equal(assets.length, 1, 'the inline copy should reuse the shared file asset');
   assert.deepEqual(JSON.parse(JSON.stringify(assets[0].message_external_ids)), ['first-user-message', 'second-user-message']);
   assert.deepEqual(
-    JSON.parse(JSON.stringify(assets[0].inline_image_positions)),
+    JSON.parse(JSON.stringify(assets[0].inline_positions)),
     [{ message_external_id: 'second-user-message', index: 0 }],
     'the inline position belongs only to the message whose content contains the image',
   );
@@ -1782,11 +1782,11 @@ test('numbers inline images in the same order the Markdown markers are emitted',
   const content = normalized.messages[0].content;
   const bytesAt = (index) => {
     const asset = normalized.assets.find((candidate) =>
-      (candidate.inline_image_positions || []).some((position) => position.index === index));
+      (candidate.inline_positions || []).some((position) => position.index === index));
     return asset ? Buffer.from(asset.base64, 'base64').toString('utf8') : null;
   };
 
-  const marker = (index) => `[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:${index}]]`;
+  const marker = (index) => `[[AI_ARCHIVE_INLINE_ASSET:${normalized.inline_marker_nonce}:${index}]]`;
   assert.equal(content,
     `Document text.\n\n${marker(0)}\n\nThen the second image:\n\n${marker(1)}`);
   assert.equal(bytesAt(0), 'nested image', 'marker 0 must resolve to the nested image');
@@ -1798,7 +1798,7 @@ test('numbers inline images in the same order the Markdown markers are emitted',
 });
 
 test('generates inline image markers that message text cannot contain', async () => {
-  const typed = 'Literal [[AI_ARCHIVE_INLINE_IMAGE:0]] and [[AI_ARCHIVE_INLINE_IMAGE:00000000000000000000000000000000:0]].';
+  const typed = 'Literal [[AI_ARCHIVE_INLINE_ASSET:0]] and [[AI_ARCHIVE_INLINE_ASSET:00000000000000000000000000000000:0]].';
   const conversation = {
     uuid: 'conversation-marker-nonce',
     name: 'Marker nonce',
@@ -1822,7 +1822,7 @@ test('generates inline image markers that message text cannot contain', async ()
   assert.match(normalized.inline_marker_nonce, /^[0-9a-f]{32}$/);
   assert.notEqual(normalized.inline_marker_nonce, '0'.repeat(32));
   assert.equal(normalized.messages[0].content,
-    `${typed}\n\n[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:0]]`);
+    `${typed}\n\n[[AI_ARCHIVE_INLINE_ASSET:${normalized.inline_marker_nonce}:0]]`);
 
   harness.finishFirstHandoff({ ok: true });
 });

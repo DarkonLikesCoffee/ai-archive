@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 const MARKER_NONCE = '0123456789abcdef0123456789abcdef';
-const marker = (index) => `[[AI_ARCHIVE_INLINE_IMAGE:${MARKER_NONCE}:${index}]]`;
+const marker = (index) => `[[AI_ARCHIVE_INLINE_ASSET:${MARKER_NONCE}:${index}]]`;
 
 const backgroundPath = fileURLToPath(new URL('./background.js', import.meta.url));
 const backgroundSource = await readFile(backgroundPath, 'utf8');
@@ -926,7 +926,7 @@ test('renders inline image markers at their original message position without du
     mime: 'image/png',
     source: 'message-content',
     message_external_id: 'assistant-message',
-    inline_image_positions: [{ message_external_id: 'assistant-message', index: 0 }],
+    inline_positions: [{ message_external_id: 'assistant-message', index: 0 }],
     path: 'archive/conversations/claude/personal/assets/conversation/image.png',
     sha256: 'a'.repeat(64),
     size: 12,
@@ -1034,7 +1034,7 @@ test('keeps inline image positions of a shared asset scoped to their own message
     file_uuid: 'shared-file-id',
     message_external_id: 'first-user-message',
     message_external_ids: ['first-user-message', 'second-user-message'],
-    inline_image_positions: [{ message_external_id: 'second-user-message', index: 0 }],
+    inline_positions: [{ message_external_id: 'second-user-message', index: 0 }],
     path: 'archive/conversations/claude/personal/assets/conversation/aaaaaaaa-shared.png',
     sha256: 'a'.repeat(64),
     size: 6,
@@ -1044,7 +1044,7 @@ test('keeps inline image positions of a shared asset scoped to their own message
     mime: 'image/png',
     source: 'message-content',
     message_external_id: 'first-user-message',
-    inline_image_positions: [{ message_external_id: 'first-user-message', index: 0 }],
+    inline_positions: [{ message_external_id: 'first-user-message', index: 0 }],
     path: 'archive/conversations/claude/personal/assets/conversation/bbbbbbbb-inline-image-bbbbbbbbbbbb.png',
     sha256: 'b'.repeat(64),
     size: 3,
@@ -1081,7 +1081,7 @@ test('keeps inline image positions of a shared asset scoped to their own message
   const sharedLink = '![shared.png](assets/conversation/aaaaaaaa-shared.png)';
   const ownLink = '![inline-image-bbbbbbbbbbbb.png](assets/conversation/bbbbbbbb-inline-image-bbbbbbbbbbbb.png)';
 
-  assert.equal(markdown.includes('AI_ARCHIVE_INLINE_IMAGE'), false, 'every marker must be resolved');
+  assert.equal(markdown.includes('AI_ARCHIVE_INLINE_ASSET'), false, 'every marker must be resolved');
   assert.ok(first.includes(ownLink), 'the first message marker must resolve to its own inline image');
   assert.equal(first.split(sharedLink).length - 1, 1,
     'the first message must still list the shared file it was sent with');
@@ -1099,13 +1099,13 @@ test('never replaces marker-shaped text that does not carry the conversation non
     mime: 'image/png',
     source: 'message-content',
     message_external_id: 'user-message',
-    inline_image_positions: [{ message_external_id: 'user-message', index: 0 }],
+    inline_positions: [{ message_external_id: 'user-message', index: 0 }],
     path: 'archive/conversations/claude/personal/assets/conversation/image.png',
     sha256: 'a'.repeat(64),
     size: 12,
   };
-  const legacyLiteral = '[[AI_ARCHIVE_INLINE_IMAGE:0]]';
-  const foreignNonceLiteral = `[[AI_ARCHIVE_INLINE_IMAGE:${'f'.repeat(32)}:0]]`;
+  const legacyLiteral = '[[AI_ARCHIVE_INLINE_ASSET:0]]';
+  const foreignNonceLiteral = `[[AI_ARCHIVE_INLINE_ASSET:${'f'.repeat(32)}:0]]`;
   const message = {
     external_id: 'user-message',
     role: 'user',
@@ -1157,12 +1157,12 @@ test('keeps internal inline image markers out of the index preview and search te
     message_count: 2,
     messages: [
       { external_id: 'image-only', role: 'user', content: marker(0) },
-      { external_id: 'text', role: 'assistant', content: `See ${marker(1)} and [[AI_ARCHIVE_INLINE_IMAGE:0]].` },
+      { external_id: 'text', role: 'assistant', content: `See ${marker(1)} and [[AI_ARCHIVE_INLINE_ASSET:0]].` },
     ],
   }, 'archive/conversations/claude/personal/x.md', 'claude', 'personal', []);
 
-  assert.equal(entry.preview, 'See  and [[AI_ARCHIVE_INLINE_IMAGE:0]].',
+  assert.equal(entry.preview, 'See  and [[AI_ARCHIVE_INLINE_ASSET:0]].',
     'an image-only message is skipped for the preview; literal user text is kept');
   assert.equal(entry.search_text.includes(MARKER_NONCE), false);
-  assert.ok(entry.search_text.includes('[[AI_ARCHIVE_INLINE_IMAGE:0]]'));
+  assert.ok(entry.search_text.includes('[[AI_ARCHIVE_INLINE_ASSET:0]]'));
 });
