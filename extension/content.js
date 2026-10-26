@@ -643,16 +643,29 @@
             : (asset.message_external_id ? [asset.message_external_id] : []);
           return messageId && associatedIds.includes(messageId);
         });
-        if (hashes.has(hash)) {
-          if (existingAsset) {
-            // Marker indices restart in every message, and a downloaded file can
-            // be shared by several messages, so record which message each
-            // position belongs to rather than a bare index.
-            const positions = Array.isArray(existingAsset.inline_positions) ? existingAsset.inline_positions : [];
-            if (!positions.some((position) => position.message_external_id === messageId && position.index === index)) {
-              existingAsset.inline_positions = [...positions, { message_external_id: messageId, index }];
-            }
+        // Marker indices restart in every message, and an asset can be shared
+        // by several messages, so record which message each position belongs to.
+        const addPosition = (asset) => {
+          const positions = Array.isArray(asset.inline_positions) ? asset.inline_positions : [];
+          if (!positions.some((position) => position.message_external_id === messageId && position.index === index)) {
+            asset.inline_positions = [...positions, { message_external_id: messageId, index }];
           }
+        };
+        if (hashes.has(hash)) {
+          if (existingAsset) addPosition(existingAsset);
+          continue;
+        }
+
+        // The same inline bytes already archived for another message: link this
+        // message to that file instead of storing a second copy.
+        const sharedInline = messageId && assets.find((asset) => asset.source === 'message-content' && asset.sha256 === hash);
+        if (sharedInline) {
+          const linkedIds = Array.isArray(sharedInline.message_external_ids) && sharedInline.message_external_ids.length
+            ? sharedInline.message_external_ids
+            : [sharedInline.message_external_id];
+          sharedInline.message_external_ids = [...linkedIds, messageId];
+          addPosition(sharedInline);
+          hashes.add(hash);
           continue;
         }
 

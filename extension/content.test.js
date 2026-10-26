@@ -1921,3 +1921,42 @@ test('does not materialize inline audio nested inside a fenced tool result', asy
   assert.match(normalized.messages[1].content, /"media_type": "audio\/mpeg"/);
   harness.finishFirstHandoff({ ok: true });
 });
+
+test('stores identical inline content from different messages as one shared asset', async () => {
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: btoa('same bytes') } };
+  const conversation = {
+    uuid: 'conversation-shared-inline-bytes',
+    name: 'Shared inline bytes',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Here.' }, image],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'Echo:' }, { type: 'text', text: 'again' }, image, image],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = JSON.parse(JSON.stringify(handoff.conversations[0].assets));
+
+  assert.equal(assets.length, 1, 'identical bytes are archived once');
+  assert.equal(assets[0].message_external_id, 'user-message');
+  assert.deepEqual(assets[0].message_external_ids, ['user-message', 'assistant-message']);
+  assert.deepEqual(assets[0].inline_positions, [
+    { message_external_id: 'user-message', index: 0 },
+    { message_external_id: 'assistant-message', index: 0 },
+    { message_external_id: 'assistant-message', index: 1 },
+  ]);
+
+  harness.finishFirstHandoff({ ok: true });
+});
