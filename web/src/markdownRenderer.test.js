@@ -66,3 +66,18 @@ test('preserves line breaks in paragraphs', () => {
   const html = renderMarkdownWithMarked('First line\nSecond line');
   assert.match(html, /First line<br>\s*Second line/);
 });
+
+
+test('allows the reader to replace image and attachment rendering', () => {
+  const html = renderMarkdownWithMarked(
+    '![photo](assets/photo_01.jpg)\n\n[notes](assets/notes.txt)',
+    {
+      renderImage: ({ href, text }) => `<span data-md-image="${href}">${text}</span>`,
+      renderLink: ({ href, text }) => href.startsWith('assets/')
+        ? `<span data-md-attachment="${href}">${text}</span>`
+        : undefined,
+    },
+  );
+  assert.match(html, /data-md-image="assets\/photo_01\.jpg"/);
+  assert.match(html, /data-md-attachment="assets\/notes\.txt"/);
+});
