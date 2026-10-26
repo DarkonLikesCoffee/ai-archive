@@ -4,6 +4,14 @@ A personal, portable archive for AI conversations. GitHub is the source of truth
 
 ## What changed in this version
 
+### Unreleased — export fidelity and reader fixes (#29–#45)
+
+- **Inline media is archived in place.** Base64 images, audio, video, and documents (for example PDFs) inside a message are saved as assets and linked at their original position; images embed, other files link. Identical content is stored once, even when several messages contain it.
+- **Tool output is no longer lost.** Every tool input field is kept (artifact content, file-editor paths and text, command descriptions), and media returned by tools (screenshots, charts, audio) is archived as an attachment of the message. Binary payloads never enter the Markdown; they appear as `[omitted inline payload: N characters]`.
+- **Citations and references are kept.** Sources attached to Claude's text are listed after the text as safe links with their quoted passages; unknown content blocks are preserved as readable metadata instead of disappearing.
+- **Correct image placement.** Inline images resolve to the right file at the right position, including shared files and nested content, and text that merely looks like an internal image marker is left untouched.
+- **Safer web reader.** HTML in archived link labels can no longer execute, `javascript:` links are not clickable, and attachments whose names contain brackets (for example `Screenshot [2].png`) now display.
+
 ### v0.5.5 — inline images, contextual files, and reply excerpts
 
 - Exports only the **currently active Claude branch** using `current_leaf_message_uuid` + `parent_message_uuid`, so edited messages and abandoned responses are not archived as if they were still visible.
