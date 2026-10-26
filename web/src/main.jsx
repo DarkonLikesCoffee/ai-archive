@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { readConversation, readIndex, readAsset, githubRequest } from './github';
 import { renderMarkdownWithMarked } from './markdownRenderer.js';
+import { assetPlaceholderPaths } from './assetPlaceholders.js';
 import './styles.css';
 
 const KEY = 'ai_archive_github_v3';
@@ -358,15 +359,15 @@ function Message({ message, assets, assetBusy }) {
   useEffect(() => {
     let cancelled=false;
     const run=async()=>{
-      const imageMatches=[...String(message.content).matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)].map(m=>m[1]);
-      const attachmentMatches=[...String(message.content).matchAll(/\[[^\]]+\]\(([^)]+)\)/g)].map(m=>m[1]);
-      const unique=[...new Set([...imageMatches, ...attachmentMatches])];
-      if(!unique.length) return;
       let rendered=renderMarkdown(message.content).__html;
-      for(const path of unique){
+      // Take paths from the placeholders the renderer produced, so every link
+      // Marked parsed (including labels with escaped brackets) is resolved.
+      const placeholders=assetPlaceholderPaths(rendered);
+      if(!placeholders.length) return;
+      for(const {path, attribute} of placeholders){
         const cleanPath=decodeURIComponent(String(path||'')).replace(/^\.\//,'').split('#')[0].split('?')[0];
         const asset=assets[path] || assets[cleanPath] || assets[cleanPath.split('/').pop()] || assets[cleanPath.split('/').pop().toLowerCase()];
-        const escapedPath=path.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+        const escapedPath=attribute.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
         if(asset?.dataUrl && isImageAsset(asset)){
           rendered=rendered.replace(new RegExp(`<span class=\"md-image-placeholder\" data-md-image=\"${escapedPath}\">[^<]*</span>`, 'g'), `<img class=\"md-image\" src=\"${asset.dataUrl}\" alt=\"${escapeHtml(asset.name)}\" />`);
         }
