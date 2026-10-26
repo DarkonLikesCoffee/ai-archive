@@ -1239,3 +1239,93 @@ test('refuses an active lineage whose intermediate message has no parent pointer
   assert.match(error.error, /message "middle-message" has no parent_message_uuid/);
   assert.equal(harness.handoffs.length, 0, 'a truncated intermediate chain must not be exported');
 });
+
+
+test('preserves unknown content block metadata instead of silently dropping it', async () => {
+  const largePayload = 'A'.repeat(4096);
+  const conversation = {
+    uuid: 'conversation-unknown-block',
+    name: 'Unknown content block preservation',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Review these results.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          { type: 'text', text: 'The result is available.' },
+          {
+            type: 'future_media_block',
+            media_type: 'audio/wav',
+            data: largePayload,
+            transcript_id: 'transcript-123',
+          },
+          {
+            type: 'citation_reference',
+            title: 'Primary source',
+            url: 'https://example.com/source',
+            cited_text: 'The source supports the result.',
+          },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+
+  assert.match(rendered, /Claude content block: future_media_block/);
+  assert.match(rendered, /audio\/wav/);
+  assert.match(rendered, /omitted inline payload: 4096 characters/);
+  assert.equal(rendered.includes(largePayload), false, 'large binary payload must not be dumped into Markdown');
+  assert.match(rendered, /Claude content block: citation_reference/);
+  assert.match(rendered, /https:\/\/example\.com\/source/);
+  assert.match(rendered, /The source supports the result/);
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('never renders thinking blocks even when they expose generic text fields', async () => {
+  const conversation = {
+    uuid: 'conversation-thinking-safety',
+    name: 'Thinking exclusion check',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Answer this.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'private reasoning A', text: 'private reasoning B', content: 'private reasoning C' },
+          { type: 'text', text: 'The final answer.' },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+
+  assert.match(rendered, /The final answer/);
+  assert.equal(rendered.includes('private reasoning A'), false);
+  assert.equal(rendered.includes('private reasoning B'), false);
+  assert.equal(rendered.includes('private reasoning C'), false);
+
+  harness.finishFirstHandoff({ ok: true });
+});
