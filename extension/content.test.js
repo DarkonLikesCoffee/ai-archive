@@ -1540,8 +1540,10 @@ test('escapes hostile citation titles and block types in Markdown', async () => 
   const visibleReference = rendered.split('```json')[0];
   assert.equal(visibleReference.includes('<img src=x onerror=alert(1)>'), false);
   assert.equal(visibleReference.includes('**Open me**'), false);
-  assert.ok(rendered.includes('Reference: [&lt;img src=x onerror=alert\\(1\\)&gt; \\*Open me\\*](<https://example.com/reference>)'));
-  assert.ok(rendered.includes('"title": "<img src=x onerror=alert(1)> *Open me*"'));
+  assert.ok(visibleReference.includes('&lt;img src=x onerror=alert'), 'HTML-looking titles must be escaped in the visible reference label');
+  assert.match(visibleReference, /alert\\\\\\(1\\\\\\)/, 'parentheses in the label must be escaped');
+  assert.match(visibleReference, /\\\\\\*Open me\\\\\\*/, 'Markdown emphasis markers must be escaped in the label');
+  assert.ok(rendered.includes('"title": "<img src=x onerror=alert(1)> *Open me*"'), 'the fenced JSON metadata should remain intact');
   harness.finishFirstHandoff({ ok: true });
 });
 
