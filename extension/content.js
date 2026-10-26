@@ -972,7 +972,7 @@
       // finished; otherwise another startSync message can trigger a second fetch
       // while the first batch is still being committed to GitHub.
       const result = await new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations, skipped }, (response) => {
+        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations, skipped, fullList: limit === 'all' }, (response) => {
           if (chrome.runtime.lastError) {
             reject(Error(chrome.runtime.lastError.message));
             return;
