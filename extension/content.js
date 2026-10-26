@@ -109,7 +109,7 @@
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
-  async function fetchAsset(url, name, mime = 'application/octet-stream', signal) {
+  async function fetchAsset(url, name, mime, signal) {
     if (!url) return null;
     try {
       const r = await fetch(url, { credentials: 'include', signal });
@@ -162,6 +162,7 @@
     const assets = [];
     const seen = new Set();
     const seenNames = new Set();
+    const messageAssetFingerprints = new Set();
 
     // First collect the real binary/image assets exposed directly by messages.
     for (const message of messages) {
@@ -175,7 +176,9 @@
         const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
         if (asset) {
           assets.push({ ...asset, source: 'message', file_uuid: file.file_uuid || file.uuid || null, message_external_id: message.uuid || message.id || null });
-          seenNames.add(String(name).toLowerCase());
+          const nameKey = String(asset.name || '').toLowerCase();
+          seenNames.add(nameKey);
+          messageAssetFingerprints.add(`${nameKey}|${asset.sha256}`);
         }
       }
     }
@@ -186,7 +189,13 @@
       const key = `${asset.source_path}|${asset.sha256}`;
       const nameKey = String(asset.name || '').toLowerCase();
       if (seen.has(key)) continue;
-      if (nameKey && seenNames.has(nameKey)) continue;
+
+      // A name is not a unique file identity: Claude can produce the same
+      // basename in different folders with different contents. Deduplicate a
+      // sandbox copy only when a message asset already has both the same name
+      // and the same content hash.
+      if (nameKey && messageAssetFingerprints.has(`${nameKey}|${asset.sha256}`)) continue;
+
       seen.add(key);
       if (nameKey) seenNames.add(nameKey);
       assets.push(asset);
