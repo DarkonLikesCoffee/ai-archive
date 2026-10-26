@@ -592,8 +592,16 @@ function skippedSummary(skipped) {
   return ` ${skipped.length} conversation${skipped.length === 1 ? '' : 's'} could not be exported and ${skipped.length === 1 ? 'was' : 'were'} left unchanged in the archive: ${listed.join('; ')}${more}. Sync again later to retry ${skipped.length === 1 ? 'it' : 'them'}.`;
 }
 
-async function sync(conversations, onProgress, skipped = []) {
-  const skippedNote = skippedSummary(skipped);
+// After a full sync, archived conversations that Claude.ai did not list at
+// all were either deleted there or missing from an incomplete list. Their
+// archived copies are kept either way; say so instead of staying silent.
+function unlistedSummary(count) {
+  if (!count) return '';
+  return ` ${count} archived conversation${count === 1 ? ' was' : 's were'} not returned by Claude.ai in this full sync (deleted there, or Claude's list was incomplete); ${count === 1 ? 'its archived copy was' : 'their archived copies were'} kept.`;
+}
+
+async function sync(conversations, onProgress, skipped = [], { fullList = false } = {}) {
+  let skippedNote = skippedSummary(skipped);
   syncRunning = true;
   cancelRequested = false;
   syncAbortController = new AbortController();
@@ -650,6 +658,14 @@ async function sync(conversations, onProgress, skipped = []) {
     }
 
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
+    if (fullList) {
+      const listed = new Set([
+        ...conversations.map((c) => String(c.external_id)),
+        ...(Array.isArray(skipped) ? skipped.map((item) => String(item.id)) : []),
+      ]);
+      const unlisted = index.conversations.filter((x) => x.provider === provider && x.account === account && !listed.has(String(x.id)));
+      skippedNote += unlistedSummary(unlisted.length);
+    }
     let changes = [];
     let changedConversations = 0;
     let indexNeedsUpdate = false;
@@ -974,7 +990,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
 
-    sync(msg.conversations, broadcast, Array.isArray(msg.skipped) ? msg.skipped : [])
+    sync(msg.conversations, broadcast, Array.isArray(msg.skipped) ? msg.skipped : [], { fullList: msg.fullList === true })
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((e) => {
         if (e.name === 'AbortError' || e.message === '__SYNC_CANCELLED__') {
