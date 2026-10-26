@@ -98,8 +98,17 @@ function filenameSlug(value) {
 }
 
 function conversationPath(c, provider, accountSlug) {
-  const shortId = String(c.external_id || 'unknown').slice(0, 8);
-  return `archive/conversations/${provider}/${accountSlug}/${filenameSlug(c.title)}--${shortId}.md`;
+  const externalId = String(c.external_id || 'unknown');
+  // Titles and short ID prefixes are not unique. Include a normalized portion
+  // of the full ID plus a stable hash so punctuation-normalized IDs also remain
+  // distinct, while keeping the filename at a predictable length.
+  const idSlug = filenameSlug(externalId).slice(0, 70);
+  let idHash = 2166136261;
+  for (let i = 0; i < externalId.length; i++) {
+    idHash = Math.imul(idHash ^ externalId.charCodeAt(i), 16777619);
+  }
+  const idSuffix = (idHash >>> 0).toString(16).padStart(8, '0');
+  return `archive/conversations/${provider}/${accountSlug}/${filenameSlug(c.title)}--${idSlug}-${idSuffix}.md`;
 }
 
 function escapeMd(text) {
