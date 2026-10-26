@@ -257,6 +257,7 @@ function attachmentMarkdown(message, assetMap, allAssets) {
 
   for (const attachment of (message.attachments || [])) {
     const name = attachment?.file_name || attachment?.name || 'attachment';
+    const nameKey = String(name).toLowerCase();
 
     // Claude uses this synthetic attachment when the user replies to selected text
     // from an earlier Claude message. Keep the excerpt inline, before the user's
@@ -405,7 +406,11 @@ async function sync(conversations, onProgress) {
     assertNotCancelled();
     let branch = ref ? ref.ref.split('/').pop() : 'main';
     let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
-    let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}`) : null;
+    let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
+    if (baseTree?.truncated) {
+      throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
+    }
+    let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
 
     let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
     const indexFile = ref ? await getFile('archive/index.json', branch) : null;
@@ -450,7 +455,9 @@ async function sync(conversations, onProgress) {
         || previous.path !== path
         || previous.format_version !== 4
         || previous.content_sha256 !== entry.content_sha256
-        || previousAssetSignature !== currentAssetSignature;
+        || previousAssetSignature !== currentAssetSignature
+        || !existingPaths.has(path)
+        || previousAssets.some((asset) => asset?.path && !existingPaths.has(asset.path));
 
       if (changed) changedConversations += 1;
       if (changed && previous?.path && previous.path !== path) {
@@ -469,7 +476,7 @@ async function sync(conversations, onProgress) {
         changes.push({ path, content: markdown, encoding: 'utf-8' });
         for (const asset of normalizedAssets.assets) {
           const previousAsset = previousAssets.find((a) => a.path === asset.path && a.sha256 === asset.sha256);
-          if (!previousAsset) {
+          if (!previousAsset || !existingPaths.has(asset.path)) {
             changes.push({ path: asset.path, content: asset.base64, encoding: 'base64' });
           }
         }
@@ -483,6 +490,18 @@ async function sync(conversations, onProgress) {
       conversations: [...map.values()].sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '')),
     };
 
+    // Do not publish an index that points to files missing from GitHub. Missing
+    // files for selected conversations are repaired by the planned writes above;
+    // missing files for unselected conversations require syncing those conversations.
+    const plannedWrites = new Set(changes.filter((change) => !change.delete).map((change) => change.path));
+    for (const archived of nextIndex.conversations) {
+      const requiredPaths = [archived.path, ...(Array.isArray(archived.assets) ? archived.assets.map((asset) => asset?.path) : [])].filter(Boolean);
+      const missing = requiredPaths.filter((requiredPath) => !existingPaths.has(requiredPath) && !plannedWrites.has(requiredPath));
+      if (missing.length) {
+        throw new Error(`Archive integrity check failed: ${missing.length} file(s) referenced by "${archived.title || archived.id}" are missing from GitHub (${missing.slice(0, 3).join(', ')}). Sync that conversation to repair it; no archive changes were published.`);
+      }
+    }
+
     // An empty repository has no ref/base tree. GitHub will reject /git/blobs
     // with 409 until the repository has its first commit, so initialize it
     // before using the Git Database API.
@@ -493,7 +512,11 @@ async function sync(conversations, onProgress) {
       if (!ref) throw Error('GitHub repository was initialized but no branch could be found.');
       branch = ref.ref.split('/').pop();
       baseCommit = await gh(`/git/commits/${ref.object.sha}`);
-      baseTree = await gh(`/git/trees/${baseCommit.tree.sha}`);
+      baseTree = await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`);
+      if (baseTree?.truncated) {
+        throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
+      }
+      existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
     }
 
     if (changedConversations === 0 && ref) {

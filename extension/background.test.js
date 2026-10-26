@@ -147,7 +147,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false }) {
+function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [] }) {
   const listeners = [];
   const requests = [];
   const baseSha = 'base-commit';
@@ -197,7 +197,19 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false }
       return response({ sha: baseSha, tree: { sha: 'base-tree' } });
     }
     if (pathname.endsWith('/git/trees/base-tree') && method === 'GET') {
-      return response({ sha: 'base-tree', tree: [] });
+      let indexedPaths = [];
+      try {
+        const parsedIndex = JSON.parse(indexText || '{}');
+        indexedPaths = (parsedIndex.conversations || []).flatMap((entry) => [
+          entry.path,
+          ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : []),
+        ]).filter(Boolean);
+      } catch {}
+      const missing = new Set(missingPaths);
+      return response({
+        sha: 'base-tree',
+        tree: [...new Set(indexedPaths)].filter((path) => !missing.has(path)).map((path) => ({ path, type: 'blob', mode: '100644', sha: `existing-${path}` })),
+      });
     }
     if (pathname.endsWith('/contents/archive/index.json') && method === 'GET') {
       return indexText == null
@@ -452,4 +464,57 @@ test('re-syncing identical conversation data creates no commit', async () => {
   assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/blobs') && request.method === 'POST'), false);
   assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST'), false);
   assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false);
+});
+
+
+test('repairs a missing asset for a selected conversation by uploading it again', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const conversation = sampleConversation()[0];
+  conversation.assets = [{
+    name: 'diagram.png',
+    mime: 'image/png',
+    base64: btoa('image bytes'),
+    size: 11,
+    sha256: 'abcd5678' + 'e'.repeat(56),
+    source: 'message',
+    message_external_id: 'message-1',
+  }];
+  const { entry } = await buildIndexEntry(hooks, conversation);
+  const missingAssetPath = entry.assets[0].path;
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [entry] }),
+    missingPaths: [missingAssetPath],
+  });
+
+  const result = await harness.sync([conversation], () => {});
+  assert.equal(result.changed, 1, 'the missing asset should mark the conversation as changed');
+  assert.ok(harness.requests.some((request) => request.pathname.endsWith('/git/blobs') && request.method === 'POST'), 'the missing asset should be uploaded');
+  const treeRequest = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST');
+  assert.ok(treeRequest.body.tree.some((item) => item.path === missingAssetPath && item.sha), 'the repaired asset should be written into the new tree');
+});
+
+test('refuses to publish an index while an unselected conversation still references a missing file', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const unselected = sampleConversation()[0];
+  unselected.external_id = 'unselected-conversation';
+  unselected.title = 'Unselected conversation';
+  const { entry } = await buildIndexEntry(hooks, unselected);
+  const missingAssetPath = 'archive/conversations/claude/personal/assets/unselected-conversation/missing.png';
+  entry.assets = [{
+    path: missingAssetPath,
+    name: 'missing.png',
+    sha256: 'missing',
+    size: 10,
+    mime: 'image/png',
+  }];
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [entry] }),
+    missingPaths: [missingAssetPath],
+  });
+
+  await assert.rejects(
+    harness.sync(sampleConversation(), () => {}),
+    /Archive integrity check failed:.*missing\.png.*Sync that conversation to repair it/,
+  );
+  assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false, 'the broken index must not be published');
 });
