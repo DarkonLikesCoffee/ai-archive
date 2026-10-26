@@ -80,6 +80,10 @@
     return `${ticks}${language}\n${value}\n${ticks}`;
   }
 
+  // Closes a tool section that holds more than one fence; the web reader's
+  // toolSections.js recognizes it, and GitHub hides it as an HTML comment.
+  const TOOL_SECTION_END = '<!-- /tool -->';
+
   function renderToolUse(block) {
     const name = block.name || block.tool_name || 'tool';
     const input = normalizeToolInput(block.input);
@@ -95,6 +99,25 @@
         return `### Claude tool: ${name}\n\n${fence(input[only], 'bash')}`;
       }
       if (only === 'code' && typeof input.code === 'string') return `### Claude tool: ${name}\n\n${fence(input.code, 'text')}`;
+
+      // Multi-line text (artifact content, file contents, replacements) is
+      // unreadable as an escaped JSON string. Give each such field its own
+      // fence after the remaining metadata, and close the section with an
+      // explicit marker so the web reader keeps every fence inside the tool.
+      // Payload keys stay in the redacted JSON even when line-wrapped.
+      const bodyKeys = fields.filter((key) => typeof input[key] === 'string'
+        && input[key].includes('\n') && !/^(data|base64|bytes)$/i.test(key));
+      if (bodyKeys.length) {
+        const metadata = Object.fromEntries(Object.entries(input).filter(([key]) => !bodyKeys.includes(key)));
+        const language = typeof input.language === 'string' && /^[\w+#.-]{1,32}$/.test(input.language)
+          ? input.language
+          : 'text';
+        const parts = [`### Claude tool: ${name}`];
+        if (Object.keys(metadata).length) parts.push(fence(stringifyContentBlock(metadata), 'json'));
+        for (const key of bodyKeys) parts.push(`**${escapeReferenceLabel(key)}**`, fence(input[key], language));
+        parts.push(TOOL_SECTION_END);
+        return parts.join('\n\n');
+      }
     }
 
     // Same redaction as tool results: never dump base64 payloads into Markdown.

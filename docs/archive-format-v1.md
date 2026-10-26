@@ -84,6 +84,31 @@ Rules:
 6. Unknown role headings must be preserved rather than discarded.
 7. Message content is Markdown and must be treated as opaque message data by the archive layer.
 
+## Tool sections
+
+Tool calls and results inside a message are H3 sections:
+`### Claude tool: <name>` or `### Tool result: <name>`.
+
+- A section normally holds exactly one fenced block (a bare command, code, or
+  the tool input as JSON; or the fenced tool result). Readers end such a
+  section at that block's closing fence.
+- When a tool input has multi-line text fields (for example artifact
+  `content`, `file_text`, `new_str`), the section holds the remaining metadata
+  as a JSON block, then each such field as `**<field>**` followed by its own
+  fenced block, and ends with a line containing only `<!-- /tool -->`.
+  Readers keep every block up to that line inside the tool section; fenced
+  content is skipped while looking for it. GitHub hides the line as an HTML
+  comment.
+- Binary payloads (`data`, `base64`, `bytes`) are never written into tool
+  sections. They appear as `[omitted inline payload: N characters]`; tool-result
+  media that could be decoded is additionally archived as an attachment of the
+  message (`; archived as a message attachment`).
+
+Compatibility: sections without the end line are read exactly as before, so
+existing files stay readable and are not migrated. A conversation whose tool
+inputs contain multi-line text is rewritten in the new form the next time it
+is synced, which updates its `content_sha256` in the index.
+
 ## Attachments
 
 Attachments are repository files, not embedded binary data in the conversation Markdown.
