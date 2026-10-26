@@ -1504,3 +1504,76 @@ test('does not turn non-HTTP citation URLs into clickable Markdown links', async
 
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+test('escapes hostile citation titles and block types in Markdown', async () => {
+  const conversation = {
+    uuid: 'conversation-hostile-citation-title',
+    name: 'Citation label escaping',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Review the reference.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{
+          type: 'citation_reference',
+          title: '<img src=x onerror=alert(1)> *Open me*',
+          url: 'https://example.com/reference',
+          cited_text: 'This is the cited source.',
+        }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+
+  assert.equal(rendered.includes('<img src=x onerror=alert(1)>'), false);
+  assert.equal(rendered.includes('**Open me**'), false);
+  assert.match(rendered, /Reference: \[&lt;img src=x onerror=alert\(1\)&gt; \\*Open me\\*\]\(<https:\/\/example\.com\/reference>\)/);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('does not let newline-bearing unknown block types create new Markdown headings', async () => {
+  const conversation = {
+    uuid: 'conversation-hostile-block-type',
+    name: 'Block type heading escaping',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Check the attachment metadata.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{
+          type: 'future_block\n## Injected heading',
+          value: 'Preserve me',
+        }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const rendered = handoff.conversations[0].messages[1].content;
+
+  assert.equal(rendered.includes('\n## Injected heading'), false);
+  assert.match(rendered, /Claude content block: future_block \\# Injected heading/);
+  assert.match(rendered, /Preserve me/);
+  harness.finishFirstHandoff({ ok: true });
+});
