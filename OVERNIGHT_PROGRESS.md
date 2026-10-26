@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-26, autonomous continuation (PRs #48, #49).
+Last updated: 2026-10-26 20:5x UTC, scheduler verification + check-in policy.
 
 ## Ground rules followed
 - No force-push, no history rewrite, no deploys/releases.
@@ -50,6 +50,32 @@ Last updated: 2026-10-26, autonomous continuation (PRs #48, #49).
   duplicate-UUID guard would fail every sync).
 - Message separator ambiguity remains for bodies containing `---` + `## You`/`## Claude`; a real fix needs an
   explicit separator in the export format, which would rewrite every archived conversation once (owner decision).
+
+## Scheduler behavior and check-in policy
+
+Verified 2026-10-26 with a probe (trig_01X1rgvyHPMXZtWqx7se3MnL):
+- `send_later` only supports a fixed delay or an absolute time (1-minute granularity). There is no
+  "start after the current run ends" option. The probe set at 20:47:19 for 20:49:00 fired at 20:49:32 (~30 s late).
+- A check-in firing **during an active run does not start a parallel run**: it is queued for this session and was
+  read via `ReadNotifications` inside the running turn (20:50:49). Queued items that are not read during a turn
+  wake the session after the turn ends (observed for GitHub events queued 19:32–19:42 while a turn was running).
+- Not verified: behavior if a run is cut off mid-way (container restart). The next run recovers from Git state and
+  this file.
+
+Policy:
+1. Finish the current task, push, and update this file before scheduling anything.
+2. Keep **exactly one** pending check-in, always bound to this session (`send_later`). Before scheduling, list
+   triggers and delete any other pending check-in. Never use `create_new_session_on_fire` or another session for
+   repo work, since those could run in parallel on the same repository.
+3. Useful verifiable work remains → schedule the next check-in with a 1-minute delay as the run's last action, so
+   the next run starts within ~1–1.5 min of this one ending (or right after it, if the run outlasts the delay).
+4. No useful work (only waiting on owner review or decisions) → long fallback: ~50 min, then ~4 h; stop after 3
+   check-ins in a row that find nothing new. GitHub events on watched PRs wake the session anyway.
+5. Every run starts with `ReadNotifications`; a check-in already read during a turn counts as consumed, so the
+   same work is not repeated.
+
+Soak test (20:47–20:50 UTC): extension + web suites run 23 times each on master and the heads of #46, #47, #48 —
+no failures (no flaky tests found).
 
 ## Blockers / notes
 - `fix/materialize-inline-audio-video` (no PR) is superseded by #40 and contains a `'\\n\\n'`
