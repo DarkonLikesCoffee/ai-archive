@@ -175,10 +175,10 @@ function escapeMarkdownLabel(value) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/\\/g, '\\\\')
-    .replace(/\\r?\\n/g, ' ')
-    .replace(/\\[/g, '\\\\[')
-    .replace(/\\]/g, '\\\\]')
-    .replace(/([*_\x60!])/g, '\\\\$1');
+    .replace(/\r?\n/g, ' ')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/([*_\x60!])/g, '\\$1');
 }
 
 function assetMarkdown(asset, path) {
