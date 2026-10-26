@@ -1014,6 +1014,6 @@ test('escapes HTML and Markdown formatting characters in attachment labels', () 
 
   assert.equal(markdown.includes('<img src=x onerror=alert(1)>'), false);
   assert.equal(markdown.includes('**unsafe**'), false);
-  assert.match(markdown, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.ok(markdown.includes('&lt;img src=x onerror=alert\\(1\\)&gt;'));
   assert.match(markdown, /&amp; notes\.txt/);
 });
