@@ -867,3 +867,50 @@ test('compacts legacy search text to gzip without rewriting unchanged conversati
   );
   assert.equal(compactedEntry.search_text_sha256.length, 64, 'the uncompressed search text should retain a stable integrity hash');
 });
+
+
+test('renders a shared direct asset in every message that references it', () => {
+  const { assetMatchesMessage, findMessageAssets, conversationMarkdown } = loadBackgroundAssetHelpers();
+  const asset = {
+    name: 'shared-report.png',
+    mime: 'image/png',
+    file_uuid: 'shared-file-id',
+    message_external_id: 'user-message',
+    message_external_ids: ['user-message', 'assistant-message'],
+    path: 'archive/conversations/claude/personal/assets/conversation/shared-report.png',
+    sha256: 'a'.repeat(64),
+    size: 17,
+  };
+  const userMessage = {
+    external_id: 'user-message',
+    role: 'user',
+    content: 'Here is the report.',
+    files: [{ file_uuid: 'shared-file-id', file_name: 'shared-report.png' }],
+    attachments: [],
+    metadata: {},
+  };
+  const assistantMessage = {
+    external_id: 'assistant-message',
+    role: 'assistant',
+    content: 'I will refer to that same report.',
+    files: [{ file_uuid: 'shared-file-id', file_name: 'shared-report.png' }],
+    attachments: [],
+    metadata: {},
+  };
+  const allAssets = [asset];
+  const assetMap = new Map([['id:shared-file-id', asset], ['name:shared-report.png', asset]]);
+
+  assert.equal(assetMatchesMessage(asset, userMessage, allAssets), true);
+  assert.equal(assetMatchesMessage(asset, assistantMessage, allAssets), true);
+  assert.deepEqual(findMessageAssets(userMessage, allAssets), [asset]);
+  assert.deepEqual(findMessageAssets(assistantMessage, allAssets), [asset]);
+
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-shared-attachment',
+    title: 'Shared attachment reference',
+    messages: [userMessage, assistantMessage],
+    message_count: 2,
+  }, 'claude', 'personal', assetMap, allAssets);
+  const expectedLink = '![shared-report.png](assets/conversation/shared-report.png)';
+  assert.equal(markdown.split(expectedLink).length - 1, 2, 'each message should link to the shared file');
+});
