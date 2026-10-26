@@ -660,3 +660,52 @@ test('cancelling during blob upload does not publish and a later retry can succe
   assert.equal(retry.commit, 'new-commit');
   assert.equal(retry.changed, 1);
 });
+
+
+test('asset paths distinguish conversation IDs that normalize to the same slug', () => {
+  const { assetPath } = loadBackgroundAssetHelpers();
+  const asset = { name: 'shared.txt', sha256: 'abcd1234' + 'c'.repeat(56) };
+  const first = assetPath({ external_id: 'conversation/a' }, asset, 'claude', 'personal', new Set());
+  const second = assetPath({ external_id: 'conversation:a' }, asset, 'claude', 'personal', new Set());
+
+  assert.notEqual(first, second, 'normalized conversation IDs must not share an asset directory');
+});
+
+test('does not delete a legacy asset path while an unselected conversation still references it', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const selected = sampleConversation()[0];
+  const oldAssetPath = 'archive/conversations/claude/personal/assets/conversation-shared/abcd1234-report.txt';
+  const previousSelected = {
+    id: selected.external_id,
+    provider: 'claude',
+    account: 'personal',
+    path: hooks.conversationPath(selected, 'claude', 'personal'),
+    title: selected.title,
+    model: selected.model,
+    created_at: selected.source_created_at,
+    updated_at: selected.source_updated_at,
+    message_count: selected.message_count,
+    assets: [{ path: oldAssetPath, sha256: 'abcd1234', size: 12, mime: 'text/plain', name: 'report.txt' }],
+    format_version: 4,
+    content_sha256: 'previous-content-hash',
+  };
+  const unselected = {
+    ...previousSelected,
+    id: 'conversation-unselected',
+    title: 'Unselected conversation',
+    path: hooks.conversationPath({ ...selected, external_id: 'conversation-unselected', title: 'Unselected conversation' }, 'claude', 'personal'),
+    assets: [{ path: oldAssetPath, sha256: 'abcd1234', size: 12, mime: 'text/plain', name: 'report.txt' }],
+  };
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previousSelected, unselected] }),
+  });
+
+  await harness.sync([selected], () => {});
+  const treeRequest = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST');
+  assert.ok(treeRequest, 'the changed conversation should produce a tree');
+  assert.equal(
+    treeRequest.body.tree.some((entry) => entry.path === oldAssetPath && entry.sha === null),
+    false,
+    'the shared path must be preserved for the still-indexed unselected conversation',
+  );
+});
