@@ -1333,6 +1333,59 @@ test('never renders thinking blocks even when they expose generic text fields', 
 });
 
 
+test('keeps every tool input field when the input is more than a bare command or code', async () => {
+  const artifactContent = 'def hello():\n    print("hi")\n';
+  const conversation = {
+    uuid: 'conversation-tool-input-fields',
+    name: 'Tool input fields',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Write the script.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          // `command` is an artifacts sub-command here, not a shell line.
+          { type: 'tool_use', name: 'artifacts', input: { command: 'create', id: 'hello', title: 'Hello', language: 'python', content: artifactContent } },
+          { type: 'tool_use', name: 'str_replace_based_edit_tool', input: { command: 'str_replace', path: '/app/main.py', old_str: 'a = 1', new_str: 'a = 2' } },
+          { type: 'tool_use', name: 'bash_tool', input: { command: 'ls -la', description: 'List files' } },
+          { type: 'tool_use', name: 'repl', input: { code: 'console.log(1)', timeout: 30 } },
+          // A bare command or bare code keeps the readable fenced shortcut.
+          { type: 'tool_use', name: 'bash', input: { command: 'ls' } },
+          { type: 'tool_use', name: 'repl', input: JSON.stringify({ code: 'print(2)' }) },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const sections = handoff.conversations[0].messages[1].content.split('\n\n### ');
+  const json = (section) => JSON.parse(section.split('```json\n')[1].split('\n```')[0]);
+
+  assert.equal(sections.length, 6);
+  assert.deepEqual(json(sections[0]), conversation.chat_messages[1].content[0].input,
+    'artifact content and metadata must survive');
+  assert.deepEqual(json(sections[1]), conversation.chat_messages[1].content[1].input);
+  assert.deepEqual(json(sections[2]), { command: 'ls -la', description: 'List files' });
+  assert.deepEqual(json(sections[3]), { code: 'console.log(1)', timeout: 30 });
+  assert.equal(sections[4], 'Claude tool: bash\n\n```bash\nls\n```');
+  assert.equal(sections[5], 'Claude tool: repl\n\n```text\nprint(2)\n```');
+  for (const section of sections) {
+    assert.equal((section.match(/^```/gm) || []).length, 2, 'each tool keeps exactly one fenced block for the web reader');
+  }
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
 test('redacts oversized media payloads nested inside tool results', async () => {
   const binaryPayload = 'B'.repeat(8192);
   const conversation = {
