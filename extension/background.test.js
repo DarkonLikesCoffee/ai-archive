@@ -63,3 +63,72 @@ test('ignores duplicate normalized sync messages while a GitHub sync is running'
   assert.equal(duplicateResponse?.ok, true);
   assert.equal(duplicateResponse?.alreadyRunning, true);
 });
+
+
+function loadBackgroundAssetHelpers() {
+  const listeners = [];
+  const chrome = {
+    storage: { local: { get: async () => ({}) } },
+    runtime: {
+      onMessage: {
+        addListener(listener) { listeners.push(listener); },
+      },
+      sendMessage() { return Promise.resolve(); },
+    },
+  };
+  const sourceWithTestHooks = backgroundSource.replace(
+    /\\}\\)\\(\\);\\s*$/,
+    'globalThis.__testHooks = { assetMatchesMessage, findMessageAssets }; })();',
+  );
+  assert.notEqual(sourceWithTestHooks, backgroundSource, 'test hooks must be injected inside the background service worker');
+  const context = { chrome, AbortController, fetch: () => new Promise(() => {}) };
+  vm.runInNewContext(sourceWithTestHooks, context, { filename: 'extension/background.js' });
+  assert.equal(listeners.length, 1);
+  return context.__testHooks;
+}
+
+test('does not associate a message-scoped asset with another message that has the same filename', () => {
+  const { assetMatchesMessage } = loadBackgroundAssetHelpers();
+  const asset = {
+    name: 'report.txt',
+    file_uuid: 'file-a',
+    message_external_id: 'assistant-message',
+  };
+  const otherMessage = {
+    external_id: 'user-message',
+    files: [{ file_uuid: 'file-a', file_name: 'report.txt' }],
+    metadata: { content: [{ type: 'text', text: 'report.txt' }] },
+  };
+
+  assert.equal(assetMatchesMessage(asset, otherMessage, [asset]), false);
+  assert.equal(assetMatchesMessage(asset, { external_id: 'assistant-message' }, [asset]), true);
+});
+
+test('does not use a filename fallback when a message exposes a different file UUID', () => {
+  const { assetMatchesMessage } = loadBackgroundAssetHelpers();
+  const asset = { name: 'report.txt', file_uuid: 'file-a' };
+  const message = {
+    external_id: 'message-1',
+    files: [{ file_uuid: 'file-b', file_name: 'report.txt' }],
+  };
+
+  assert.equal(assetMatchesMessage(asset, message, [asset]), false);
+});
+
+test('associates same-named sandbox assets only when their full paths identify them', () => {
+  const { findMessageAssets } = loadBackgroundAssetHelpers();
+  const first = { name: 'report.txt', source_path: 'outputs/first/report.txt' };
+  const second = { name: 'report.txt', source_path: 'outputs/second/report.txt' };
+  const allAssets = [first, second];
+  const firstMessage = {
+    external_id: 'assistant-1',
+    metadata: { content: [{ type: 'tool_use', input: { command: 'cat outputs/first/report.txt' } }] },
+  };
+  const ambiguousMessage = {
+    external_id: 'assistant-2',
+    metadata: { content: [{ type: 'text', text: 'The report.txt file is ready.' }] },
+  };
+
+  assert.deepEqual(findMessageAssets(firstMessage, allAssets), [first]);
+  assert.deepEqual(findMessageAssets(ambiguousMessage, allAssets), []);
+});
