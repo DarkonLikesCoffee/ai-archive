@@ -1423,7 +1423,7 @@ test('materializes inline base64 image blocks that have no message.files entry',
   assert.equal(normalized.messages[1].content.includes(imageBase64), false,
     'inline image bytes must not be copied into Markdown text');
   assert.match(normalized.inline_marker_nonce, /^[0-9a-f]{32}$/);
-  assert.ok(normalized.messages[1].content.includes(`[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:0]]`),
+  assert.ok(normalized.messages[1].content.includes(`[[AI_ARCHIVE_INLINE_ASSET:${normalized.inline_marker_nonce}:0]]`),
     'the image position should be retained for the Markdown renderer');
 
   harness.finishFirstHandoff({ ok: true });
@@ -1745,7 +1745,7 @@ test('scopes inline image positions to the message that contains them', async ()
   assert.equal(assets.length, 1, 'the inline copy should reuse the shared file asset');
   assert.deepEqual(JSON.parse(JSON.stringify(assets[0].message_external_ids)), ['first-user-message', 'second-user-message']);
   assert.deepEqual(
-    JSON.parse(JSON.stringify(assets[0].inline_image_positions)),
+    JSON.parse(JSON.stringify(assets[0].inline_positions)),
     [{ message_external_id: 'second-user-message', index: 0 }],
     'the inline position belongs only to the message whose content contains the image',
   );
@@ -1782,11 +1782,11 @@ test('numbers inline images in the same order the Markdown markers are emitted',
   const content = normalized.messages[0].content;
   const bytesAt = (index) => {
     const asset = normalized.assets.find((candidate) =>
-      (candidate.inline_image_positions || []).some((position) => position.index === index));
+      (candidate.inline_positions || []).some((position) => position.index === index));
     return asset ? Buffer.from(asset.base64, 'base64').toString('utf8') : null;
   };
 
-  const marker = (index) => `[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:${index}]]`;
+  const marker = (index) => `[[AI_ARCHIVE_INLINE_ASSET:${normalized.inline_marker_nonce}:${index}]]`;
   assert.equal(content,
     `Document text.\n\n${marker(0)}\n\nThen the second image:\n\n${marker(1)}`);
   assert.equal(bytesAt(0), 'nested image', 'marker 0 must resolve to the nested image');
@@ -1798,7 +1798,7 @@ test('numbers inline images in the same order the Markdown markers are emitted',
 });
 
 test('generates inline image markers that message text cannot contain', async () => {
-  const typed = 'Literal [[AI_ARCHIVE_INLINE_IMAGE:0]] and [[AI_ARCHIVE_INLINE_IMAGE:00000000000000000000000000000000:0]].';
+  const typed = 'Literal [[AI_ARCHIVE_INLINE_ASSET:0]] and [[AI_ARCHIVE_INLINE_ASSET:00000000000000000000000000000000:0]].';
   const conversation = {
     uuid: 'conversation-marker-nonce',
     name: 'Marker nonce',
@@ -1822,7 +1822,102 @@ test('generates inline image markers that message text cannot contain', async ()
   assert.match(normalized.inline_marker_nonce, /^[0-9a-f]{32}$/);
   assert.notEqual(normalized.inline_marker_nonce, '0'.repeat(32));
   assert.equal(normalized.messages[0].content,
-    `${typed}\n\n[[AI_ARCHIVE_INLINE_IMAGE:${normalized.inline_marker_nonce}:0]]`);
+    `${typed}\n\n[[AI_ARCHIVE_INLINE_ASSET:${normalized.inline_marker_nonce}:0]]`);
 
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('materializes non-image inline base64 blocks as linked assets in marker order', async () => {
+  const media = (type, mediaType, bytes, extra = {}) => ({ type, source: { type: 'base64', media_type: mediaType, data: btoa(bytes) }, ...extra });
+  const conversation = {
+    uuid: 'conversation-inline-media',
+    name: 'Inline media blocks',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [
+          { type: 'text', text: 'Read this report.' },
+          media('document', 'application/pdf', 'pdf bytes', { title: 'Quarterly report' }),
+        ],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          { type: 'text', text: 'Audio first:' },
+          media('audio', 'audio/mpeg', 'audio bytes'),
+          { type: 'text', text: 'Video next:' },
+          media('video', 'video/mp4', 'video bytes'),
+          media('future_media', undefined, 'unknown bytes'),
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const normalized = handoff.conversations[0];
+  const marker = (index) => `[[AI_ARCHIVE_INLINE_ASSET:${normalized.inline_marker_nonce}:${index}]]`;
+  const summary = JSON.parse(JSON.stringify(normalized.assets.map((asset) => [
+    asset.name.replace(/[0-9a-f]{12}/, '<hash>'),
+    asset.mime,
+    asset.message_external_id,
+    asset.inline_positions,
+    Buffer.from(asset.base64, 'base64').toString('utf8'),
+  ])));
+
+  assert.deepEqual(summary, [
+    ['Quarterly-report.pdf', 'application/pdf', 'user-message', [{ message_external_id: 'user-message', index: 0 }], 'pdf bytes'],
+    ['inline-audio-<hash>.mp3', 'audio/mpeg', 'assistant-message', [{ message_external_id: 'assistant-message', index: 0 }], 'audio bytes'],
+    ['inline-video-<hash>.mp4', 'video/mp4', 'assistant-message', [{ message_external_id: 'assistant-message', index: 1 }], 'video bytes'],
+    ['inline-file-<hash>.bin', 'application/octet-stream', 'assistant-message', [{ message_external_id: 'assistant-message', index: 2 }], 'unknown bytes'],
+  ]);
+  assert.equal(normalized.messages[0].content, `Read this report.\n\n${marker(0)}`);
+  assert.equal(normalized.messages[1].content,
+    `Audio first:\n\n${marker(0)}\n\nVideo next:\n\n${marker(1)}\n\n${marker(2)}`);
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('does not materialize inline audio nested inside a fenced tool result', async () => {
+  const audioBase64 = btoa('tool result sound');
+  const conversation = {
+    uuid: 'conversation-tool-result-audio',
+    name: 'Tool result audio block',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Generate a sound.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{
+          type: 'tool_result',
+          name: 'generate_audio',
+          content: [{ type: 'audio', source: { type: 'base64', media_type: 'audio/mpeg', data: audioBase64 } }],
+        }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const normalized = handoff.conversations[0];
+
+  assert.equal(normalized.assets.length, 0, 'tool result media must not create an orphaned asset');
+  assert.equal(normalized.messages[1].content.includes('AI_ARCHIVE_INLINE_ASSET'), false);
+  assert.equal(normalized.messages[1].content.includes(audioBase64), false);
+  assert.match(normalized.messages[1].content, /"media_type": "audio\/mpeg"/);
   harness.finishFirstHandoff({ ok: true });
 });

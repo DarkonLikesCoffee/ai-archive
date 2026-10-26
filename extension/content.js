@@ -223,11 +223,12 @@
       .map((byte) => byte.toString(16).padStart(2, '0')).join('');
   }
 
-  // `inline.images` receives each inline image block in the order its marker
-  // is emitted, so a marker's index is by construction its position in the
-  // list that collectMessageAssets materializes. A separate traversal would
-  // drift whenever the two disagree about which nested content is rendered.
-  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), images: [] }) {
+  // `inline.blocks` receives each inline base64 block (images, audio, video,
+  // documents) in the order its marker is emitted, so a marker's index is by
+  // construction its position in the list that collectMessageAssets
+  // materializes. A separate traversal would drift whenever the two disagree
+  // about which nested content is rendered.
+  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), blocks: [] }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -239,9 +240,11 @@
       }
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
-      if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
-        inline.images.push(block);
-        return `[[AI_ARCHIVE_INLINE_IMAGE:${inline.nonce}:${inline.images.length - 1}]]`;
+      // Any block carrying its bytes as a base64 source is archived as a file
+      // and replaced by a marker, so payloads never enter the Markdown.
+      if (block.source?.type === 'base64' && typeof block.source.data === 'string') {
+        inline.blocks.push(block);
+        return `[[AI_ARCHIVE_INLINE_ASSET:${inline.nonce}:${inline.blocks.length - 1}]]`;
       }
       // Preserve common plain-text shapes directly for readability. A block
       // may carry both a text field and nested content (for example a
@@ -288,9 +291,9 @@
     try {
       binary = atob(normalized);
     } catch {
-      throw new Error('Claude returned an invalid base64 image content block.');
+      throw new Error('Claude returned an invalid base64 inline content block. Sync stopped before anything was sent to GitHub.');
     }
-    if (!binary.length) throw new Error('Claude returned an empty base64 image content block.');
+    if (!binary.length) throw new Error('Claude returned an empty base64 inline content block. Sync stopped before anything was sent to GitHub.');
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   }
 
@@ -442,7 +445,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal, inlineImagesByMessage = new Map()) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineBlocksByMessage = new Map()) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -594,10 +597,10 @@
       }
     }
 
-    // Inline base64 image blocks are sometimes present in Claude's message
-    // content without a corresponding message.files entry. Materialize those
-    // bytes as normal assets so the Markdown renderer can link/embed them.
-    const imageExtensions = {
+    // Inline base64 blocks are sometimes present in Claude's message content
+    // without a corresponding message.files entry. Materialize those bytes as
+    // normal assets so the Markdown renderer can embed images and link the rest.
+    const inlineExtensions = {
       'image/avif': 'avif',
       'image/bmp': 'bmp',
       'image/gif': 'gif',
@@ -605,15 +608,27 @@
       'image/png': 'png',
       'image/svg+xml': 'svg',
       'image/webp': 'webp',
+      'audio/aac': 'aac',
+      'audio/flac': 'flac',
+      'audio/mp4': 'm4a',
+      'audio/mpeg': 'mp3',
+      'audio/ogg': 'ogg',
+      'audio/wav': 'wav',
+      'audio/webm': 'webm',
+      'video/mp4': 'mp4',
+      'video/ogg': 'ogv',
+      'video/quicktime': 'mov',
+      'video/webm': 'webm',
+      'application/pdf': 'pdf',
     };
     for (const message of messages) {
-      // Exactly the image blocks renderContentBlocks emitted markers for, in
-      // marker order. Images inside tool input/results or thinking blocks are
-      // rendered (redacted) or omitted there, so they never receive a marker.
-      const imageBlocks = inlineImagesByMessage.get(message) || [];
-      for (let index = 0; index < imageBlocks.length; index++) {
+      // Exactly the blocks renderContentBlocks emitted markers for, in marker
+      // order. Media inside tool input/results or thinking blocks is rendered
+      // (redacted) or omitted there, so it never receives a marker.
+      const inlineBlocks = inlineBlocksByMessage.get(message) || [];
+      for (let index = 0; index < inlineBlocks.length; index++) {
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const block = imageBlocks[index];
+        const block = inlineBlocks[index];
         const source = block.source;
         const bytes = base64ToBytes(source.data);
         const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -633,27 +648,41 @@
             // Marker indices restart in every message, and a downloaded file can
             // be shared by several messages, so record which message each
             // position belongs to rather than a bare index.
-            const positions = Array.isArray(existingAsset.inline_image_positions) ? existingAsset.inline_image_positions : [];
+            const positions = Array.isArray(existingAsset.inline_positions) ? existingAsset.inline_positions : [];
             if (!positions.some((position) => position.message_external_id === messageId && position.index === index)) {
-              existingAsset.inline_image_positions = [...positions, { message_external_id: messageId, index }];
+              existingAsset.inline_positions = [...positions, { message_external_id: messageId, index }];
             }
           }
           continue;
         }
 
-        const mime = typeof source.media_type === 'string' && source.media_type.startsWith('image/')
-          ? source.media_type
-          : 'image/png';
-        const extension = imageExtensions[mime] || 'img';
+        const sourceMime = typeof source.media_type === 'string'
+          ? source.media_type.toLowerCase().split(';')[0].trim()
+          : '';
+        // Image blocks keep their historical PNG fallback and names, so
+        // already-archived inline images keep the same asset paths.
+        const mime = block.type === 'image'
+          ? (sourceMime.startsWith('image/') ? sourceMime : 'image/png')
+          : (sourceMime || 'application/octet-stream');
+        const kind = ['image', 'audio', 'video'].find((prefix) => mime.startsWith(`${prefix}/`)) || 'file';
+        const extension = inlineExtensions[mime] || (kind === 'image' ? 'img' : 'bin');
+        // Non-image blocks such as documents can carry a title; keep it as
+        // the filename rather than losing it with the replaced block.
+        const titled = block.type !== 'image' && typeof block.title === 'string' && block.title.trim()
+          ? safeAssetName(block.title)
+          : null;
+        const name = titled
+          ? (titled.toLowerCase().endsWith(`.${extension}`) ? titled : `${titled}.${extension}`)
+          : `inline-${kind}-${hash.slice(0, 12)}.${extension}`;
         assets.push({
-          name: `inline-image-${hash.slice(0, 12)}.${extension}`,
+          name,
           mime,
           base64: bytesToBase64(buffer),
           size: bytes.byteLength,
           sha256: hash,
           source: 'message-content',
           message_external_id: messageId,
-          inline_image_positions: [{ message_external_id: messageId, index }],
+          inline_positions: [{ message_external_id: messageId, index }],
         });
         hashes.add(hash);
       }
@@ -773,13 +802,13 @@
   async function normalize(c, org, signal) {
     const raw = selectActiveLineage(c);
     const inlineMarkerNonce = createInlineMarkerNonce();
-    const inlineImagesByMessage = new Map();
+    const inlineBlocksByMessage = new Map();
     const messages = raw.map((m, i) => {
-      const inline = { nonce: inlineMarkerNonce, images: [] };
+      const inline = { nonce: inlineMarkerNonce, blocks: [] };
       const content = Array.isArray(m.content)
         ? renderContentBlocks(m.content, inline)
         : (typeof m.text === 'string' ? m.text : '');
-      inlineImagesByMessage.set(m, inline.images);
+      inlineBlocksByMessage.set(m, inline.blocks);
       return {
         external_id: m.uuid || m.id || `${i}`,
         role: m.sender === 'human' ? 'user' : m.sender || 'assistant',
@@ -791,7 +820,7 @@
       };
     });
 
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineImagesByMessage);
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineBlocksByMessage);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',
