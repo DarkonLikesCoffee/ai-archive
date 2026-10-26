@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-26, end of overnight run.
+Last updated: 2026-10-26, autonomous continuation (PRs #48, #49).
 
 ## Ground rules followed
 - No force-push, no history rewrite, no deploys/releases.
@@ -36,18 +36,20 @@ Last updated: 2026-10-26, end of overnight run.
 - PR #46 (`feat/readable-tool-bodies`): extension 85/85, web 33/33, build OK, CI green.
 - PR #47 (`fix/reader-message-split-on-headings`): extension 84/84, web 32/32, build OK, CI green.
 
-## Open PRs for review (not merged overnight)
+## Open PRs for review (not merged)
 - #46 Show multi-line tool input fields as readable code blocks (approved feature; format change documented)
 - #47 Split archived messages only at role headings
+- #48 Implement automatic sync when a Claude page opens (latest 20, at most every 10 min) — ext 89/89, web 30/30
+- #49 README: describe merged fixes (docs only)
 
 ## Findings needing an owner decision
-- Popup "Automatic sync" toggle is saved but nothing implements it (no alarms/listeners, no `alarms`
-  permission). It reports "Automatic sync enabled." without effect. Implementing it would commit to GitHub
-  unattended, so it was not built overnight. Options: implement with `chrome.alarms`, or hide the toggle.
+- Automatic sync: implemented as opt-in in PR #48 (owner asked for autonomous development; review before merge).
 - Unverified risk: `/chat_conversations` is fetched once without pagination. If claude.ai paginates, "sync all"
-  could silently miss older conversations. Needs a real-account check.
+  could silently miss older conversations. Needs a real-account check. No evidence either way in the repo or the
+  uploaded design conversation; speculative paging was NOT added (if the API ignored paging params, the existing
+  duplicate-UUID guard would fail every sync).
 - Message separator ambiguity remains for bodies containing `---` + `## You`/`## Claude`; a real fix needs an
-  explicit separator in the export format.
+  explicit separator in the export format, which would rewrite every archived conversation once (owner decision).
 
 ## Blockers / notes
 - `fix/materialize-inline-audio-video` (no PR) is superseded by #40 and contains a `'\\n\\n'`
