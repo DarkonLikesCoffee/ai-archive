@@ -1389,16 +1389,83 @@ test('keeps every tool input field when the input is more than a bare command or
   const json = (section) => JSON.parse(section.split('```json\n')[1].split('\n```')[0]);
 
   assert.equal(sections.length, 6);
-  assert.deepEqual(json(sections[0]), conversation.chat_messages[1].content[0].input,
-    'artifact content and metadata must survive');
+  // Multi-line fields get their own readable fence; see the next test.
+  assert.equal(sections[0], [
+    '### Claude tool: artifacts',
+    '',
+    '```json\n{\n  "command": "create",\n  "id": "hello",\n  "title": "Hello",\n  "language": "python"\n}\n```',
+    '',
+    '**content**',
+    '',
+    '```python\ndef hello():\n    print("hi")\n\n```',
+    '',
+    '<!-- /tool -->',
+  ].join('\n'), 'artifact content and metadata must survive');
   assert.deepEqual(json(sections[1]), conversation.chat_messages[1].content[1].input);
   assert.deepEqual(json(sections[2]), { command: 'ls -la', description: 'List files' });
   assert.deepEqual(json(sections[3]), { code: 'console.log(1)', timeout: 30 });
   assert.equal(sections[4], 'Claude tool: bash\n\n```bash\nls\n```');
   assert.equal(sections[5], 'Claude tool: repl\n\n```text\nprint(2)\n```');
-  for (const section of sections) {
-    assert.equal((section.match(/^```/gm) || []).length, 2, 'each tool keeps exactly one fenced block for the web reader');
+  for (const section of sections.slice(1)) {
+    assert.equal((section.match(/^```/gm) || []).length, 2, 'inputs without multi-line text keep one fenced block');
+    assert.equal(section.includes('<!-- /tool -->'), false);
   }
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('renders multi-line tool input fields as readable fences closed by an end marker', async () => {
+  const fileText = 'line one\n```\nline with fence\n<!-- /tool -->\n';
+  const wrappedBase64 = `${'A'.repeat(76)}\n${'B'.repeat(76)}\n${'C'.repeat(200)}`;
+  const conversation = {
+    uuid: 'conversation-tool-bodies',
+    name: 'Tool bodies',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Edit the file.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          // No usable language: body fences fall back to text; key labels are escaped.
+          { type: 'tool_use', name: 'str_replace_based_edit_tool', input: { command: 'create', path: '/a.md', language: 'x`y', file_text: fileText } },
+          // Line-wrapped base64 is a payload, not a readable body: it stays redacted in the JSON.
+          { type: 'tool_use', name: 'upload', input: { name: 'f.bin', data: wrappedBase64 } },
+          // Only multi-line fields: no empty metadata fence.
+          { type: 'tool_use', name: 'notes', input: { body_text: 'a\nb' } },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const content = handoff.conversations[0].messages[1].content;
+  const sections = content.split('\n\n### ');
+
+  assert.equal(sections[0], [
+    '### Claude tool: str_replace_based_edit_tool',
+    '',
+    '```json\n{\n  "command": "create",\n  "path": "/a.md",\n  "language": "x`y"\n}\n```',
+    '',
+    '**file\\_text**',
+    '',
+    '````text\nline one\n```\nline with fence\n<!-- /tool -->\n\n````',
+    '',
+    '<!-- /tool -->',
+  ].join('\n'));
+  assert.equal(sections[1].includes(wrappedBase64), false, 'line-wrapped base64 must not be dumped');
+  assert.match(sections[1], /"data": "\[omitted inline payload: 354 characters\]"/);
+  assert.equal(sections[1].includes('<!-- /tool -->'), false);
+  assert.equal(sections[2], 'Claude tool: notes\n\n**body\\_text**\n\n```text\na\nb\n```\n\n<!-- /tool -->');
 
   harness.finishFirstHandoff({ ok: true });
 });
@@ -1444,8 +1511,9 @@ test('redacts inline binary payloads in tool inputs without touching text fields
     filename: 'photo.png',
     data: '[omitted inline payload: 4096 characters]',
     image: { type: 'base64', media_type: 'image/png', data: '[omitted inline payload: 12 characters]' },
-    content: artifactContent,
   });
+  // The multi-line text field is exported verbatim in its own fence.
+  assert.ok(rendered.includes(`**content**\n\n\`\`\`text\n${artifactContent}\n\`\`\``));
 
   harness.finishFirstHandoff({ ok: true });
 });
