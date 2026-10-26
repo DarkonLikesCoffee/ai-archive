@@ -8,6 +8,19 @@ let syncAbortController = null;
 let cancelRequested = false;
 let syncRunning = false;
 let lastSyncState = { stage: 'idle' };
+// The fetching phase runs in the Claude tab's content script. Remember its
+// progress so a reopened popup still shows the running sync and can cancel
+// it. Content progress older than this is treated as finished (for example
+// when the Claude tab was closed mid-fetch).
+const CONTENT_PROGRESS_STALE_MS = 5 * 60 * 1000;
+const CONTENT_ACTIVE_STAGES = ['fetching', 'preparing'];
+let contentSyncState = null;
+
+function contentSyncRunning() {
+  return Boolean(contentSyncState
+    && CONTENT_ACTIVE_STAGES.includes(contentSyncState.stage)
+    && Date.now() - contentSyncState.at <= CONTENT_PROGRESS_STALE_MS);
+}
 
 async function settings() {
   return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account']);
@@ -915,11 +928,27 @@ async function sync(conversations, onProgress) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'syncProgress' && sender?.tab) {
+    const { type, ...progress } = msg;
+    contentSyncState = { ...progress, tabId: sender.tab.id, at: Date.now() };
+    return false;
+  }
   if (msg.type === 'getSyncState') {
-    sendResponse({ running: syncRunning, ...lastSyncState });
+    if (!syncRunning && contentSyncRunning()) {
+      const { at, tabId, ...progress } = contentSyncState;
+      sendResponse({ running: true, ...progress });
+    } else {
+      sendResponse({ running: syncRunning, ...lastSyncState });
+    }
     return false;
   }
   if (msg.type === 'cancelSync') {
+    // The popup may have been reopened on another tab: stop the fetch in the
+    // Claude tab that is actually running it.
+    if (contentSyncRunning() && contentSyncState.tabId != null) {
+      try { chrome.tabs?.sendMessage?.(contentSyncState.tabId, { type: 'cancelSync' })?.catch?.(() => {}); } catch {}
+      contentSyncState = { ...contentSyncState, stage: 'cancelled' };
+    }
     cancelRequested = true;
     syncAbortController?.abort();
     broadcast({ stage: 'cancelled', message: 'Sync cancelled.' });
