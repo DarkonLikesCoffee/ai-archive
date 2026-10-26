@@ -364,12 +364,19 @@
   function selectActiveLineage(data) {
     const raw = Array.isArray(data?.chat_messages) ? data.chat_messages : (Array.isArray(data?.messages) ? data.messages : []);
     const leaf = data?.current_leaf_message_uuid;
-    if (!leaf) return raw;
-
     const conversationLabel = String(data?.name || data?.uuid || 'Untitled conversation');
     const byId = new Map();
-    for (const message of raw) {
-      if (!message?.uuid) continue;
+
+    // Message IDs are the only reliable way to validate branch ancestry and
+    // connect exported assets to their source messages. Never silently omit
+    // malformed nodes or choose one of two duplicate IDs.
+    for (const [index, message] of raw.entries()) {
+      if (!message || typeof message !== 'object' || Array.isArray(message)
+        || typeof message.uuid !== 'string' || !message.uuid.trim()) {
+        throw new Error(
+          `Cannot safely export Claude conversation "${conversationLabel}": message at position ${index + 1} does not have a valid UUID. No archive changes were submitted to GitHub.`,
+        );
+      }
       if (byId.has(message.uuid)) {
         throw new Error(
           `Cannot safely export Claude conversation "${conversationLabel}": message UUID "${message.uuid}" appears more than once. No archive changes were submitted to GitHub.`,
@@ -377,6 +384,10 @@
       }
       byId.set(message.uuid, message);
     }
+
+    // Some API responses do not include a leaf pointer. In that case retain
+    // every message, but only after validating every node above.
+    if (!leaf) return raw;
 
     let current = byId.get(leaf);
     if (!current) {
@@ -389,7 +400,7 @@
     const chain = [];
     const seen = new Set();
     while (current) {
-      if (!current.uuid || seen.has(current.uuid)) {
+      if (seen.has(current.uuid)) {
         throw new Error(
           `Cannot safely export Claude conversation "${conversationLabel}": the active message lineage contains a cycle or an invalid message ID. No archive changes were submitted to GitHub.`,
         );

@@ -793,3 +793,51 @@ test('refuses a full-conversation payload with no messages array', async () => {
   assert.match(error.error, /without a valid messages array/);
   assert.equal(harness.handoffs.length, 0, 'incomplete response must not become an empty archived conversation');
 });
+
+
+test('refuses malformed or ambiguous message nodes when no active leaf pointer is provided', async () => {
+  const cases = [
+    ['non-object message', [null], /message at position 1 does not have a valid UUID/],
+    ['missing UUID', [{ sender: 'human', content: [{ type: 'text', text: 'hello' }] }], /message at position 1 does not have a valid UUID/],
+    ['empty UUID', [{ uuid: '   ', sender: 'human' }], /message at position 1 does not have a valid UUID/],
+    ['duplicate UUID', [
+      { uuid: 'duplicate-message', sender: 'human' },
+      { uuid: 'duplicate-message', sender: 'assistant' },
+    ], /message UUID "duplicate-message" appears more than once/],
+  ];
+
+  for (const [label, chat_messages, expected] of cases) {
+    const conversation = {
+      uuid: 'conversation-no-leaf',
+      name: 'Message integrity test',
+      current_leaf_message_uuid: null,
+      chat_messages,
+    };
+    const harness = createHarness(conversation);
+
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const error = await harness.errorProgress;
+
+    assert.match(error.error, expected, label);
+    assert.equal(harness.handoffs.length, 0, `invalid message data must not be handed off: ${label}`);
+  }
+});
+
+test('refuses malformed message nodes even when they are outside the active branch', async () => {
+  const conversation = {
+    uuid: 'conversation-bad-abandoned-node',
+    name: 'Malformed abandoned branch node',
+    current_leaf_message_uuid: 'active-leaf',
+    chat_messages: [
+      { uuid: 'active-leaf', parent_message_uuid: ROOT, sender: 'assistant', content: [{ type: 'text', text: 'Active answer' }] },
+      { sender: 'assistant', content: [{ type: 'text', text: 'Malformed abandoned answer' }] },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /message at position 2 does not have a valid UUID/);
+  assert.equal(harness.handoffs.length, 0, 'malformed response nodes must not be silently omitted from the archive');
+});
