@@ -128,7 +128,27 @@
   function renderUnknownContentBlock(block) {
     const type = typeof block.type === 'string' && block.type.trim() ? block.type : 'unknown';
     const serialized = stringifyContentBlock(block);
-    return `### Claude content block: ${type}\n\n${fence(serialized || '{}', 'json')}`;
+    const candidateUrl = typeof block.url === 'string' ? block.url
+      : (typeof block.href === 'string' ? block.href
+        : (typeof block.source?.url === 'string' ? block.source.url : null));
+    // Only make explicit HTTP(S) URLs clickable. Other schemes remain visible
+    // as inert metadata; whitespace and angle brackets are rejected so the
+    // destination cannot break out of Markdown's angle-bracket URL form.
+    const safeUrl = candidateUrl && /^https?:\/\/[^\s<>]+$/i.test(candidateUrl) ? candidateUrl : null;
+    if (!safeUrl) {
+      return `### Claude content block: ${type}\n\n${fence(serialized || '{}', 'json')}`;
+    }
+
+    const label = String(block.title || block.label || block.name || block.text || 'Open reference')
+      .replace(/[\[\]\r\n]/g, ' ')
+      .trim() || 'Open reference';
+    const citedText = block.cited_text || block.quote || block.snippet || block.description || null;
+    const reference = `### Reference: [${label}](<${safeUrl}>)`;
+    const excerpt = typeof citedText === 'string' && citedText.trim()
+      ? `\n\n> ${citedText.trim().replace(/\r?\n/g, '\n> ')}`
+      : '';
+    // Keep provider-specific IDs and offsets in the original serialized block.
+    return `${reference}${excerpt}\n\n${fence(serialized || '{}', 'json')}`;
   }
 
   function renderContentBlocks(blocks, inlineImageState = { index: 0 }) {
