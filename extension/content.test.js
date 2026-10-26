@@ -1415,6 +1415,8 @@ test('materializes inline base64 image blocks that have no message.files entry',
   assert.equal(Buffer.from(imageAssets[0].base64, 'base64').toString('utf8'), imageBytes);
   assert.equal(normalized.messages[1].content.includes(imageBase64), false,
     'inline image bytes must not be copied into Markdown text');
+  assert.match(normalized.messages[1].content, /\[\[AI_ARCHIVE_INLINE_IMAGE:0\]\]/,
+    'the image position should be retained for the Markdown renderer');
 
   harness.finishFirstHandoff({ ok: true });
 });
