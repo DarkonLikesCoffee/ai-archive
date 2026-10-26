@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { readConversation, readIndex, readAsset, githubRequest } from './github';
 import { renderMarkdownWithMarked } from './markdownRenderer.js';
 import { assetPlaceholderPaths } from './assetPlaceholders.js';
+import { terminatedToolSectionEnd } from './toolSections.js';
 import './styles.css';
 
 const KEY = 'ai_archive_github_v3';
@@ -125,13 +126,22 @@ function renderMarkdown(text) {
       let fence = null;
       let sawClosedFence = false;
 
+      // A section closed by an explicit end marker (metadata plus readable
+      // bodies, e.g. artifact content) keeps every fence up to the marker.
+      const end = terminatedToolSectionEnd(lines, i - 1);
+      if (end >= 0) {
+        body.push(...lines.slice(i, end));
+        i = end + 1;
+        sawClosedFence = true;
+      }
+
       // Tool sections produced by the archive exporter normally contain one
       // fenced block (the command/input or the tool result).  The important
       // distinction here is that a normal assistant response can follow the
       // tool result in the SAME message.  The old parser consumed that prose
       // as part of the final tool, which made the real Claude response appear
       // to be hidden inside the collapsed tool group.
-      while (i < lines.length) {
+      while (end < 0 && i < lines.length) {
         const line = lines[i];
 
         // Only treat a line as a section boundary when we are NOT in the
@@ -261,6 +271,12 @@ function extractCopyMarkdown(source) {
     // Claude tool sections are implementation details, not part of the
     // assistant's actual answer. Skip each tool heading and its fenced body.
     if (/^### (Claude tool|Tool result): /.test(line)) {
+      const end = terminatedToolSectionEnd(lines, i);
+      if (end >= 0) {
+        i = end + 1;
+        while (i < lines.length && !lines[i].trim()) i++;
+        continue;
+      }
       i++;
       let fence = null;
       let closed = false;
