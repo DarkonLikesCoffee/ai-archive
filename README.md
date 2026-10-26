@@ -33,6 +33,58 @@ A personal, portable archive for AI conversations. GitHub is the source of truth
 - The web app searches the index and opens the Markdown conversation from GitHub.
 - No Supabase, no custom server, and no GitHub Gists.
 
+## Installation and setup
+
+You need Chrome (or another Chromium browser that supports Manifest V3 extensions), a Claude.ai account, and a GitHub account. Node.js 22 is only needed to run the web viewer.
+
+### 1. Create the archive repository
+
+Create a **private** GitHub repository for the archive, for example `ai-conversation-archive`. It can be completely empty; the first sync initializes it.
+
+### 2. Create GitHub tokens
+
+Create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new):
+
+- **Repository access:** only the archive repository.
+- **Permissions → Contents:** **Read and write** for the extension, which commits the archive.
+
+For the web viewer, a second token with **Contents: Read-only** is enough and is the safer choice.
+
+### 3. Install the extension
+
+1. Open `chrome://extensions` and enable **Developer mode**.
+2. Click **Load unpacked** and select this repository's `extension/` folder.
+3. Optional: edit `extension/config.js` to prefill your GitHub owner and repository name in the popup.
+
+### 4. Connect the extension to GitHub
+
+1. Open [claude.ai](https://claude.ai) and sign in.
+2. Click the AI Archive extension icon, enter the owner, repository, and the read-and-write token, and choose an account name (for example `personal` or `work`; it separates archives from different Claude accounts).
+3. Click **Save GitHub settings**. The extension checks the repository first and tells you if the token is invalid, the repository cannot be found, or the token cannot write to it.
+
+### 5. Sync
+
+- With a claude.ai tab open, choose **All conversations** or **Latest N** and click **Sync Claude**. Progress is shown in the popup and the sync can be cancelled at any time; a sync publishes exactly one commit, or nothing if it fails or is cancelled.
+- **Automatically sync when Claude opens**: when enabled, opening a claude.ai page syncs the 20 most recently updated conversations, at most once every 10 minutes. Use a manual **All conversations** sync for the first import.
+- Transient GitHub failures (network errors, 5xx, secondary rate limits) are retried automatically. If a sync still fails, nothing is published and it is safe to sync again; unchanged conversations are not re-uploaded.
+
+### 6. Browse the archive
+
+```bash
+cd web
+npm install
+npm run dev        # open the printed local URL
+# or: npm run build, then serve web/dist with any static file host
+```
+
+Enter the owner, repository, and the read-only token. The token is stored only in that browser's local storage; **Disconnect** removes it. You can search all conversations from the list and use the in-conversation find bar (Ctrl/Cmd+F) inside a conversation.
+
+### Known limitations
+
+- Claude.ai is the only provider so far.
+- The extension reads Claude.ai's internal web API, which can change without notice.
+- **All conversations** relies on Claude.ai returning the full conversation list in one response, which is how it is read today. This has not been verified against very large accounts.
+
 ## Repository layout
 
 ```text
