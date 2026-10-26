@@ -196,6 +196,10 @@
       return result;
     }
     if (!value || typeof value !== 'object') return result;
+    // These block types are rendered as fenced tool input/results, not as
+    // inline message content, so their nested images must not receive markers
+    // that the Markdown renderer cannot resolve in their original position.
+    if (value.type === 'tool_result' || value.type === 'tool_use') return result;
     if (value.type === 'image' && value.source?.type === 'base64'
       && typeof value.source.data === 'string') {
       result.push(value);
