@@ -406,3 +406,79 @@ test('aborts the sync when the sandbox file list cannot be retrieved', async () 
   assert.match(error.error, /HTTP 503/);
   assert.equal(harness.handoffs.length, 0, 'unknown sandbox contents must not be archived as an empty file list');
 });
+
+
+test('refuses to export all messages when the active Claude leaf cannot be found', async () => {
+  const conversation = {
+    uuid: 'conversation-bad-leaf',
+    name: 'Missing active leaf',
+    current_leaf_message_uuid: 'leaf-not-returned',
+    chat_messages: [
+      { uuid: 'old-question', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'Old question' }] },
+      { uuid: 'old-answer', parent_message_uuid: 'old-question', sender: 'assistant', content: [{ type: 'text', text: 'Old answer' }] },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /current_leaf_message_uuid "leaf-not-returned" was not found/);
+  assert.equal(harness.handoffs.length, 0, 'an ambiguous conversation must not be sent to the GitHub sync');
+});
+
+test('refuses to export a partial lineage when a parent message is missing', async () => {
+  const conversation = {
+    uuid: 'conversation-missing-parent',
+    name: 'Missing parent',
+    current_leaf_message_uuid: 'active-leaf',
+    chat_messages: [
+      { uuid: 'active-leaf', parent_message_uuid: 'missing-parent', sender: 'human', content: [{ type: 'text', text: 'Follow-up' }] },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /parent message "missing-parent".*was not found/);
+  assert.equal(harness.handoffs.length, 0, 'a partial active branch must not be archived');
+});
+
+test('refuses to export an active lineage with a cyclic parent chain', async () => {
+  const conversation = {
+    uuid: 'conversation-cycle',
+    name: 'Cyclic lineage',
+    current_leaf_message_uuid: 'message-a',
+    chat_messages: [
+      { uuid: 'message-a', parent_message_uuid: 'message-b', sender: 'assistant', content: [{ type: 'text', text: 'A' }] },
+      { uuid: 'message-b', parent_message_uuid: 'message-a', sender: 'human', content: [{ type: 'text', text: 'B' }] },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /active message lineage contains a cycle/);
+  assert.equal(harness.handoffs.length, 0, 'a cyclic branch must not be archived');
+});
+
+test('refuses duplicate message UUIDs instead of choosing an arbitrary branch node', async () => {
+  const conversation = {
+    uuid: 'conversation-duplicate-ids',
+    name: 'Duplicate message IDs',
+    current_leaf_message_uuid: 'active-leaf',
+    chat_messages: [
+      { uuid: 'active-leaf', parent_message_uuid: ROOT, sender: 'assistant', content: [{ type: 'text', text: 'First copy' }] },
+      { uuid: 'active-leaf', parent_message_uuid: ROOT, sender: 'assistant', content: [{ type: 'text', text: 'Second copy' }] },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /message UUID "active-leaf" appears more than once/);
+  assert.equal(harness.handoffs.length, 0, 'ambiguous duplicate message IDs must not be archived');
+});
