@@ -206,7 +206,7 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false }
     throw new Error(`Unexpected test request: ${method} ${pathname}`);
   };
 
-  const context = { chrome, fetch, AbortController, TextEncoder, Uint8Array, crypto: webcrypto, btoa, atob };
+  const context = { chrome, fetch, AbortController, TextEncoder, TextDecoder, Uint8Array, crypto: webcrypto, btoa, atob };
   vm.runInNewContext(`${backgroundSource}
 globalThis.__testHooks = { sync };
 `, context, { filename: 'extension/background.js' });
