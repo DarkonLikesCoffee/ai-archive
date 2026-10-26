@@ -25,6 +25,8 @@ function createHarness(conversation, {
   sandboxDownloadStatuses = {},
   sandboxDownloadDelays = {},
   sandboxListStatus = 200,
+  conversationListResponse = null,
+  fullConversationResponse = null,
   assetResponses = {},
   downloadDelayMs = 0,
   sandboxDownloadDelayMs = 0,
@@ -99,15 +101,15 @@ function createHarness(conversation, {
     }
     if (url === '/api/organizations') return jsonResponse([{ uuid: 'org-id' }]);
     if (url === '/api/organizations/org-id/chat_conversations') {
-      return jsonResponse([{
-        uuid: 'conversation-1',
+      return jsonResponse(conversationListResponse ?? [{
+        uuid: conversation?.uuid || 'conversation-1',
         name: 'Exporter regression test',
         created_at: '2026-10-26T08:00:00.000Z',
         updated_at: '2026-10-26T08:30:00.000Z',
       }]);
     }
-    if (String(url).includes('/chat_conversations/conversation-1?')) {
-      return jsonResponse(conversation);
+    if (/\/chat_conversations\/[^/?]+\?/.test(String(url))) {
+      return jsonResponse(fullConversationResponse ?? conversation);
     }
     if (String(url).includes('/wiggle/list-files')) {
       if (sandboxListStatus !== 200) {
@@ -726,4 +728,68 @@ test('cancelling while hashing an extracted attachment prevents the GitHub hando
 
   assert.equal(outcome, 'cancelled', 'the cancellation message should win before any archive handoff');
   assert.equal(harness.handoffs.length, 0, 'a cancelled normalization must not be handed to GitHub');
+});
+
+
+test('refuses malformed Claude conversation-list payloads before fetching conversations', async () => {
+  for (const [label, payload, expected] of [
+    ['object instead of array', { conversations: [] }, /invalid conversation list/],
+    ['missing UUID', [{ name: 'No ID' }], /without a valid UUID/],
+    ['duplicate UUID', [{ uuid: 'conversation-1' }, { uuid: 'conversation-1' }], /duplicate conversation UUID/],
+  ]) {
+    const harness = createHarness({
+      uuid: 'conversation-1',
+      current_leaf_message_uuid: 'message-1',
+      chat_messages: [{ uuid: 'message-1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'hello' }] }],
+    }, { conversationListResponse: payload });
+
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const error = await harness.errorProgress;
+    assert.match(error.error, expected, label);
+    assert.equal(
+      harness.requests.some((url) => url.includes('/chat_conversations/conversation-1?')),
+      false,
+      `the full conversation should not be fetched for invalid list case: ${label}`,
+    );
+    assert.equal(harness.handoffs.length, 0, 'invalid list data must never reach GitHub');
+  }
+});
+
+test('refuses a full-conversation response whose UUID differs from the requested conversation', async () => {
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Exporter regression test',
+    current_leaf_message_uuid: 'message-1',
+    chat_messages: [{
+      uuid: 'message-1',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'hello' }],
+    }],
+  };
+  const harness = createHarness(conversation, {
+    fullConversationResponse: { ...conversation, uuid: 'different-conversation' },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /returned conversation "different-conversation" when "conversation-1" was requested/);
+  assert.equal(harness.handoffs.length, 0, 'mismatched conversation data must not be archived under the wrong ID');
+});
+
+test('refuses a full-conversation payload with no messages array', async () => {
+  const harness = createHarness({
+    uuid: 'conversation-1',
+    name: 'Incomplete response',
+    current_leaf_message_uuid: null,
+  }, {
+    fullConversationResponse: { uuid: 'conversation-1', name: 'Incomplete response' },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /without a valid messages array/);
+  assert.equal(harness.handoffs.length, 0, 'incomplete response must not become an empty archived conversation');
 });

@@ -14,13 +14,51 @@
   async function list(org, signal) {
     const r = await fetch(`/api/organizations/${org}/chat_conversations`, { credentials: 'include', signal });
     if (!r.ok) throw Error(`Claude conversations: ${r.status}`);
-    return r.json();
+
+    let data;
+    try {
+      data = await r.json();
+    } catch {
+      throw new Error('Claude returned an unreadable conversation list. No archive changes were submitted to GitHub; retry the sync.');
+    }
+    if (!Array.isArray(data)) {
+      throw new Error('Claude returned an invalid conversation list (expected an array). No archive changes were submitted to GitHub; retry the sync.');
+    }
+
+    const seenIds = new Set();
+    for (const conversation of data) {
+      if (!conversation || typeof conversation !== 'object' || typeof conversation.uuid !== 'string' || !conversation.uuid.trim()) {
+        throw new Error('Claude returned a conversation without a valid UUID. No archive changes were submitted to GitHub; retry the sync.');
+      }
+      if (seenIds.has(conversation.uuid)) {
+        throw new Error(`Claude returned duplicate conversation UUID "${conversation.uuid}". No archive changes were submitted to GitHub; retry the sync.`);
+      }
+      seenIds.add(conversation.uuid);
+    }
+    return data;
   }
 
   async function full(org, id, signal) {
     const r = await fetch(`/api/organizations/${org}/chat_conversations/${id}?tree=True&rendering_mode=messages&render_all_tools=true`, { credentials: 'include', signal });
     if (!r.ok) throw Error(`Claude conversation ${id}: ${r.status}`);
-    return r.json();
+
+    let data;
+    try {
+      data = await r.json();
+    } catch {
+      throw new Error(`Claude returned unreadable data for conversation "${id}". No archive changes were submitted to GitHub; retry the sync.`);
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error(`Claude returned an invalid payload for conversation "${id}". No archive changes were submitted to GitHub; retry the sync.`);
+    }
+    if (data.uuid && data.uuid !== id) {
+      throw new Error(`Claude returned conversation "${data.uuid}" when "${id}" was requested. No archive changes were submitted to GitHub.`);
+    }
+    const messages = Array.isArray(data.chat_messages) ? data.chat_messages : data.messages;
+    if (!Array.isArray(messages)) {
+      throw new Error(`Claude returned conversation "${id}" without a valid messages array. No archive changes were submitted to GitHub; retry the sync.`);
+    }
+    return data;
   }
 
   function normalizeToolInput(input) {
