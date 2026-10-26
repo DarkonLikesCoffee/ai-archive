@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { readConversation, readIndex, readAsset, githubRequest } from './github';
-import hljs from 'highlight.js/lib/common';
+import { renderMarkdownWithMarked } from './markdownRenderer.js';
 import './styles.css';
 
 const KEY = 'ai_archive_github_v3';
@@ -25,26 +25,6 @@ function Settings({ initial, onSave }) {
 }
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function highlightCode(source, language='') {
-  const text = String(source);
-  const lang = String(language).toLowerCase().replace(/^language-/, '').trim();
-
-  // Match GitHub/Discord Markdown semantics: an explicitly supplied,
-  // supported fence language gets syntax highlighting. An unlabeled fence
-  // stays plain text instead of guessing a language and producing noisy or
-  // incorrect highlighting. The language registry comes from highlight.js,
-  // not from a hand-maintained list in the app.
-  if (!lang) return escapeHtml(text);
-
-  try {
-    if (hljs.getLanguage(lang)) {
-      return hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
-    }
-  } catch {}
-
-  return escapeHtml(text);
-}
-
 function renderMarkdown(text) {
   const source = String(text || '');
   const lines = source.split('\n');
@@ -53,57 +33,55 @@ function renderMarkdown(text) {
 
   function renderNormalLines(blockLines) {
     const html = [];
+    let normalLines = [];
+
+    // Preserve the reader's attachment placeholders while delegating standard
+    // Markdown parsing (lists, headings, nested quotes, tables, emphasis, etc.)
+    // to Marked. The Message component later resolves these placeholders.
+    const markdownOptions = {
+      renderImage: ({ href, text: alt }) => {
+        const path = String(href ?? '');
+        return `<span class="md-image-placeholder" data-md-image="${escapeHtml(path)}">🖼️ ${escapeHtml(alt)}</span>`;
+      },
+      renderLink: ({ href, text: label }) => {
+        const path = String(href ?? '').replace(/\\/g, '/');
+        if (/^(?:assets\/|archive\/.*\/assets\/)/.test(path)) {
+          return `<span class="md-attachment-placeholder" data-md-attachment="${escapeHtml(path)}">${label}</span>`;
+        }
+        return undefined;
+      },
+    };
+
+    function flushMarkdown() {
+      if (!normalLines.length) return;
+      html.push(renderMarkdownWithMarked(normalLines.join('\n'), markdownOptions));
+      normalLines = [];
+    }
+
     let j = 0;
     while (j < blockLines.length) {
       const line = blockLines[j];
-
-      // Markdown blockquotes can contain blank lines between quoted lines.
-      // Consume the whole quoted run as one block so each quoted paragraph or
-      // bullet does not become a separate visual quote card.
-      if (/^\s*> ?/.test(line)) {
-        const quoteLines = [];
-        let q = j;
-        while (q < blockLines.length) {
-          if (/^\s*> ?/.test(blockLines[q])) {
-            quoteLines.push(blockLines[q].replace(/^\s*> ?/, ''));
-            q++;
-            continue;
-          }
-          if (!blockLines[q].trim()) {
-            let next = q + 1;
-            while (next < blockLines.length && !blockLines[next].trim()) next++;
-            if (next < blockLines.length && /^\s*> ?/.test(blockLines[next])) {
-              quoteLines.push('');
-              q = next;
-              continue;
-            }
-          }
-          break;
-        }
-        html.push(`<blockquote>${renderNormalLines(quoteLines)}</blockquote>`);
-        j = q;
-        continue;
-      }
-
-      // Claude represents a reply-to-selected-text as an attachment named
-      // excerpt_from_previous_claude_message.txt followed by the quoted text.
-      // Render that as a proper reply context card instead of exposing the
-      // implementation detail as a file/code block.
       const replyMatch = line.match(/^\*\*Attachment: (excerpt_from_previous_claude_message\.txt)\*\*$/i);
       if (replyMatch) {
-        // The attachment header and the fenced quote are two separate
-        // Markdown paragraphs in the exported file, so there is always a
-        // blank line between them. Skip it before looking for the fence.
-        let f = j + 1;
-        while (f < blockLines.length && !blockLines[f].trim()) f++;
-        if (f < blockLines.length && /^```/.test(blockLines[f])) {
-          const fenceLine = blockLines[f];
-          const fence = fenceLine.match(/^(`{3,})/)?.[1] || '```';
+        flushMarkdown();
+
+        // Claude exports selected-text context as a synthetic attachment
+        // followed by a fenced quote. Keep the familiar reply-context card.
+        let fenceIndex = j + 1;
+        while (fenceIndex < blockLines.length && !blockLines[fenceIndex].trim()) fenceIndex++;
+        if (fenceIndex < blockLines.length && /^\s*(`{3,}|~{3,})/.test(blockLines[fenceIndex])) {
+          const fenceLine = blockLines[fenceIndex];
+          const fence = fenceLine.match(/^\s*(`{3,}|~{3,})/)?.[1] || '```';
           const quote = [];
-          let k = f + 1;
-          while (k < blockLines.length && !blockLines[k].startsWith(fence)) { quote.push(blockLines[k]); k++; }
+          let k = fenceIndex + 1;
+          const marker = fence[0];
+          const isClosingFence = (candidate) => {
+            const match = candidate.match(/^\s*(`{3,}|~{3,})\s*$/);
+            return Boolean(match && match[1][0] === marker && match[1].length >= fence.length);
+          };
+          while (k < blockLines.length && !isClosingFence(blockLines[k])) quote.push(blockLines[k++]);
           if (k < blockLines.length) k++;
-          const quotedHtml = inlineMarkdown(quote.join('\n')).replace(/\n/g,'<br>');
+          const quotedHtml = inlineMarkdown(quote.join('\n')).replace(/\n/g, '<br>');
           html.push(`<div class="reply-context"><div class="reply-context-icon">↩</div><div class="reply-context-main"><div class="reply-context-label"><strong>Claude</strong><span>replying to a message</span></div><div class="reply-context-quote">${quotedHtml}</div></div></div>`);
           j = k;
           while (j < blockLines.length && !blockLines[j].trim()) j++;
@@ -111,29 +89,11 @@ function renderMarkdown(text) {
         }
       }
 
-      const fenceMatch = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
-      if (fenceMatch) {
-        const fence = fenceMatch[1];
-        const marker = fence[0];
-        const lang = fenceMatch[2].trim();
-        const buf = [];
-        j++;
-        while (j < blockLines.length) {
-          const closeMatch = blockLines[j].match(new RegExp(`^\\s*${marker}{${fence.length},}\\s*$`));
-          if (closeMatch) { j++; break; }
-          buf.push(blockLines[j]);
-          j++;
-        }
-        const codeClass = lang ? ` class="language-${escapeHtml(lang)}"` : '';
-        html.push(`<div class="code-block"><pre><code${codeClass}>${highlightCode(buf.join('\n'), lang)}</code></pre></div>`);
-        continue;
-      }
-      if (/^#{1,3} /.test(line)) { const m=line.match(/^(#{1,3}) (.*)$/); html.push(`<h${m[1].length}>${inlineMarkdown(m[2])}</h${m[1].length}>`); j++; continue; }
-      if (/^[-*] /.test(line)) { const items=[]; while(j<blockLines.length && /^[-*] /.test(blockLines[j])) { items.push(`<li>${inlineMarkdown(blockLines[j].slice(2))}</li>`); j++; } html.push(`<ul>${items.join('')}</ul>`); continue; }
-      if (!line.trim()) { j++; continue; }
-      const para=[line]; j++; while(j<blockLines.length && blockLines[j].trim() && !/^#{1,3} |^[-*] |^\s*(`{3,}|~{3,})/.test(blockLines[j])) { para.push(blockLines[j]); j++; }
-      html.push(`<p>${inlineMarkdown(para.join('\n')).replace(/\n/g,'<br>')}</p>`);
+      normalLines.push(line);
+      j++;
     }
+
+    flushMarkdown();
     return html.join('\n');
   }
 
