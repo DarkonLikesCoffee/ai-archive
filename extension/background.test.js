@@ -300,12 +300,13 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
   vm.runInNewContext(`${fastSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
-  conversationPath, indexEntry, sha256,
+  conversationPath, indexEntry, sha256, archiveState,
 };
 `, context, { filename: 'extension/background.js' });
 
   return {
     sync: context.__testHooks.sync,
+    archiveState: context.__testHooks.archiveState,
     hooks: context.__testHooks,
     requests,
     metrics() {
@@ -1396,4 +1397,59 @@ test('escapes filenames in placeholders for attachments that could not be archiv
   const markdown = attachmentMarkdown(message, new Map(), []);
   assert.equal(markdown, '**Attachment: \\*notes\\* \\[link\\]\\(https://evil.example\\) ## Claude.txt**');
   assert.equal(markdown.includes('\n'), false, 'a filename cannot start a new Markdown block');
+});
+
+
+function archivedEntry(id, extra = {}) {
+  return {
+    id, provider: 'claude', account: 'personal', title: id, updated_at: `2026-10-0${id.length % 9 + 1}T00:00:00Z`,
+    path: `archive/conversations/claude/personal/${id}.md`, assets: [], message_count: 1, format_version: 4,
+    exporter_version: 1, ...extra,
+  };
+}
+
+test('incremental archive state lists only complete conversations written by the current exporter', async () => {
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [
+    archivedEntry('complete'),
+    archivedEntry('missing-asset', { assets: [{ path: 'archive/conversations/claude/personal/assets/x/gone.png' }] }),
+    archivedEntry('legacy-exporter', { exporter_version: undefined }),
+    archivedEntry('older-exporter', { exporter_version: 0 }),
+    archivedEntry('other-account', { account: 'work', path: 'archive/conversations/claude/work/other-account.md' }),
+  ] });
+  const harness = makeBackgroundSyncHarness({
+    indexText,
+    missingPaths: ['archive/conversations/claude/personal/assets/x/gone.png'],
+  });
+  const state = JSON.parse(JSON.stringify(await harness.archiveState()));
+  assert.deepEqual(state, [{ id: 'complete', updated_at: archivedEntry('complete').updated_at }]);
+});
+
+test('a sync with unchanged conversations reports them and does not count them as unlisted', async () => {
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [archivedEntry('kept-unchanged')] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const progress = [];
+  await harness.sync(sampleConversation(), (event) => progress.push(event), [], { fullList: true, unchangedIds: ['kept-unchanged'] });
+  const message = progress.find((event) => event.stage === 'done').message;
+  assert.match(message, / 1 unchanged conversation was not downloaded again\./);
+  assert.doesNotMatch(message, /not returned by Claude/);
+});
+
+test('records the exporter version for a previously archived conversation even when its Markdown is unchanged', async () => {
+  // First sync writes the conversation; capture its index entry without the exporter version.
+  const first = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
+  await first.sync(sampleConversation(), () => {});
+  const writtenIndex = first.requests
+    .filter((request) => request.method === 'POST' && request.pathname.endsWith('/git/blobs'))
+    .map((request) => request.body?.content)
+    .filter((content) => typeof content === 'string' && content.includes('"conversations"'))
+    .map((content) => JSON.parse(content))
+    .pop();
+  assert.equal(writtenIndex.conversations[0].exporter_version, 1, 'new index entries carry the exporter version');
+
+  const legacy = JSON.parse(JSON.stringify(writtenIndex));
+  delete legacy.conversations[0].exporter_version;
+  const second = makeBackgroundSyncHarness({ indexText: JSON.stringify(legacy) });
+  const result = await second.sync(sampleConversation(), () => {});
+  assert.equal(result.changed, 0, 'the Markdown itself did not change');
+  assert.equal(result.commit, 'new-commit', 'an index-only commit records the exporter version');
 });

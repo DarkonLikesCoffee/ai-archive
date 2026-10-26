@@ -33,6 +33,7 @@ function createHarness(conversation, {
   assetDownloadConcurrency = 3,
   cancelOnFirstDigest = false,
   storage = null,
+  archiveState = null,
 } = {}) {
   const listeners = [];
   const requests = [];
@@ -74,6 +75,10 @@ function createHarness(conversation, {
           progressMessages.push(message);
           if (message.stage === 'error') resolveErrorProgress(message);
           if (message.stage === 'cancelled') resolveCancelledProgress(message);
+        }
+        if (message.type === 'getArchiveState') {
+          callback?.(archiveState ? { ok: true, conversations: archiveState } : { ok: false, error: 'not configured in test' });
+          return Promise.resolve();
         }
         if (message.type === 'syncNormalized') {
           handoffs.push(message);
@@ -2234,5 +2239,88 @@ test('skips a conversation that cannot be exported and still syncs the others', 
   assert.equal(handoff.skipped[0].id, 'conversation-broken');
   assert.equal(handoff.skipped[0].title, 'Broken one');
   assert.match(handoff.skipped[0].error, /without a valid messages array/);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('incremental sync downloads only conversations that changed since they were archived', async () => {
+  const conv = (id) => ({
+    uuid: id, name: id, current_leaf_message_uuid: `${id}-m`,
+    chat_messages: [{ uuid: `${id}-m`, parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: id }] }],
+  });
+  const harness = createHarness(conv('changed'), {
+    conversationListResponse: [
+      { uuid: 'changed', name: 'Changed', updated_at: '2026-10-26T12:00:00Z' },
+      { uuid: 'unchanged', name: 'Unchanged', updated_at: '2026-10-20T08:00:00Z' },
+      { uuid: 'new-one', name: 'New', updated_at: '2026-10-19T08:00:00Z' },
+    ],
+    fullConversationResponse: (id) => conv(id),
+    archiveState: [
+      { id: 'changed', updated_at: '2026-10-25T09:00:00Z' },
+      { id: 'unchanged', updated_at: '2026-10-20T08:00:00Z' },
+    ],
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.deepEqual(JSON.parse(JSON.stringify(handoff.conversations.map((c) => c.external_id))), ['changed', 'new-one']);
+  assert.deepEqual(JSON.parse(JSON.stringify(handoff.unchangedIds)), ['unchanged']);
+  assert.equal(harness.requests.some((url) => String(url).includes('/chat_conversations/unchanged')), false,
+    'an unchanged conversation is not downloaded');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('falls back to a full fetch when the archive state is unavailable', async () => {
+  const conv = { uuid: 'only', name: 'Only', current_leaf_message_uuid: 'm', chat_messages: [{ uuid: 'm', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'x' }] }] };
+  const harness = createHarness(conv, {
+    conversationListResponse: [{ uuid: 'only', name: 'Only', updated_at: '2026-10-20T08:00:00Z' }],
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations.length, 1);
+  assert.equal(handoff.unchangedIds.length, 0);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('automatic sync checks every conversation incrementally once an archive exists', async () => {
+  const list = Array.from({ length: 25 }, (_, index) => ({
+    uuid: `conversation-${index}`,
+    updated_at: `2026-10-${String(26 - index).padStart(2, '0')}T00:00:00Z`,
+  }));
+  const conv = (id) => ({
+    uuid: id, name: id, current_leaf_message_uuid: `${id}-m`,
+    chat_messages: [{ uuid: `${id}-m`, parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: id }] }],
+  });
+  // Every conversation except the oldest is archived and unchanged; the oldest got a new reply.
+  const archiveState = list.map((entry, index) => ({
+    id: entry.uuid,
+    updated_at: index === 24 ? '2026-09-01T00:00:00Z' : entry.updated_at,
+  }));
+  const harness = createHarness(conv('conversation-0'), {
+    storage: { ...autoSyncSettings },
+    conversationListResponse: list,
+    fullConversationResponse: (id) => conv(id),
+    archiveState,
+  });
+
+  const handoff = await harness.firstHandoff;
+  assert.deepEqual(JSON.parse(JSON.stringify(handoff.conversations.map((c) => c.external_id))), ['conversation-24'],
+    'an older conversation beyond the latest 20 is synced when it changed');
+  assert.equal(handoff.unchangedIds.length, 24);
+  assert.equal(handoff.fullList, true);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a Latest N sync always re-downloads those conversations, even if unchanged', async () => {
+  const conv = { uuid: 'recent', name: 'Recent', current_leaf_message_uuid: 'm', chat_messages: [{ uuid: 'm', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'x' }] }] };
+  const harness = createHarness(conv, {
+    conversationListResponse: [{ uuid: 'recent', name: 'Recent', updated_at: '2026-10-20T08:00:00Z' }],
+    archiveState: [{ id: 'recent', updated_at: '2026-10-20T08:00:00Z' }],
+  });
+  harness.onMessage({ type: 'startSync', limit: '10' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations.length, 1, 'an explicit Latest N sync refreshes its conversations');
+  assert.equal(handoff.unchangedIds.length, 0);
   harness.finishFirstHandoff({ ok: true });
 });

@@ -141,6 +141,11 @@ Current repository values are:
 
 Do not bump either value for cosmetic dashboard changes.
 
+Each conversation entry also records `exporter_version`, the version of the extension's exporter that wrote it.
+Incremental sync skips a conversation only when its entry has the current `exporter_version`, its `updated_at`
+matches Claude's, and every referenced file exists; raising the exporter version therefore re-exports every
+conversation once. Entries without the field (older archives) are simply re-exported on their next sync.
+
 ## Compatibility principle
 
 Readers should be more tolerant than writers:
