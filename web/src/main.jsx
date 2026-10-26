@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { readConversation, readIndex, readAsset, githubRequest } from './github';
+import { readConversation, readIndex, readAsset, githubRequest, mapWithConcurrency } from './github';
 import { renderMarkdownWithMarked } from './markdownRenderer.js';
 import { assetPlaceholderPaths } from './assetPlaceholders.js';
 import { terminatedToolSectionEnd } from './toolSections.js';
@@ -503,7 +503,8 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
       if(baseDir){ const base=normalizePath(baseDir); if(!clean.startsWith(base+'/')) out.push(`${base}/${clean}`); }
       return [...new Set(out)];
     };
-    Promise.all(unique.map(async raw=>{
+    // At most four assets in flight: each image costs two GitHub API calls.
+    mapWithConcurrency(unique, 4, async raw=>{
       for(const candidate of candidates(raw)){
         try{
           const metadata=(selected.assets||[]).find(item=>item?.path===candidate) || null;
@@ -512,7 +513,7 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
         }catch{}
       }
       return {raw, candidate:null, asset:null};
-    }))
+    })
       .then(xs=>{
         if(dead)return;
         const map={};
