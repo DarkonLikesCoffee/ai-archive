@@ -22,6 +22,64 @@ function assertNotCancelled() {
   if (cancelRequested) throw new Error('__SYNC_CANCELLED__');
 }
 
+const GITHUB_MAX_ATTEMPTS = 3;
+const GITHUB_RETRY_BASE_DELAY_MS = 1000;
+const GITHUB_MAX_RETRY_AFTER_MS = 60000;
+
+// Only requests whose repetition cannot change the archive are retried:
+// reads, and Git object creation (blobs and trees are content-addressed; a
+// duplicate commit object stays unreferenced). The branch ref update and the
+// empty-repository Contents PUT are never retried; the ref update has its own
+// outcome verification in sync().
+function isRetryableGitHubRequest(path, method) {
+  if (method === 'GET') return true;
+  return method === 'POST' && /^\/git\/(blobs|trees|commits)$/.test(path);
+}
+
+function waitForRetry(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted || cancelRequested) {
+      reject(new Error('__SYNC_CANCELLED__'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(new Error('__SYNC_CANCELLED__'));
+    }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+}
+
+function retryAfterMs(response) {
+  const value = Number(response?.headers?.get?.('retry-after'));
+  return Number.isFinite(value) && value >= 0 ? value * 1000 : null;
+}
+
+// Error messages keep the "GitHub <status>:" prefix that callers match on
+// (for example an expected 404 for a missing branch or file).
+function gitHubError(response, text, s) {
+  let message = '';
+  try { message = String(JSON.parse(text)?.message || ''); } catch { message = String(text || ''); }
+  const status = response.status;
+  const remaining = response.headers?.get?.('x-ratelimit-remaining');
+  const reset = Number(response.headers?.get?.('x-ratelimit-reset'));
+  if (status === 401) {
+    return new Error('GitHub 401: GitHub rejected the access token. Update the token in the extension popup. Nothing was published.');
+  }
+  if ((status === 403 || status === 429) && remaining === '0') {
+    const when = Number.isFinite(reset) && reset > 0 ? ` it resets at ${new Date(reset * 1000).toISOString()}.` : ' try again later.';
+    return new Error(`GitHub ${status}: GitHub API rate limit reached;${when} Nothing was published; sync again after that.`);
+  }
+  if (status === 403 && !/rate limit/i.test(message)) {
+    return new Error(`GitHub 403: GitHub denied access to ${s.github_owner}/${s.github_repo}. The token needs read and write access to repository contents. Nothing was published. (${message.slice(0, 200)})`);
+  }
+  return new Error(`GitHub ${status}: ${String(text || '').slice(0, 400)}`);
+}
+
 async function gh(path, opts = {}, allowAfterCancel = false) {
   if (!allowAfterCancel) assertNotCancelled();
   const s = activeGitHubSettings || await settings();
@@ -34,14 +92,38 @@ async function gh(path, opts = {}, allowAfterCancel = false) {
     ...(opts.headers || {}),
   };
   const controller = syncAbortController;
-  const r = await fetch(`${API}/repos/${encodeURIComponent(s.github_owner)}/${encodeURIComponent(s.github_repo)}${path}`, {
-    ...opts,
-    headers,
-    signal: allowAfterCancel ? undefined : controller?.signal,
-  });
-  const text = await r.text();
-  if (!r.ok) throw Error(`GitHub ${r.status}: ${text.slice(0, 400)}`);
-  return text ? JSON.parse(text) : null;
+  const signal = allowAfterCancel ? undefined : controller?.signal;
+  const method = String(opts.method || 'GET').toUpperCase();
+  const retryable = isRetryableGitHubRequest(path, method);
+
+  for (let attempt = 1; ; attempt++) {
+    let r;
+    try {
+      r = await fetch(`${API}/repos/${encodeURIComponent(s.github_owner)}/${encodeURIComponent(s.github_repo)}${path}`, {
+        ...opts,
+        headers,
+        signal,
+      });
+    } catch (error) {
+      // Network failures (not cancellation) are transient for safe requests.
+      if (error?.name === 'AbortError' || !retryable || attempt >= GITHUB_MAX_ATTEMPTS) throw error;
+      await waitForRetry(GITHUB_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), signal);
+      if (!allowAfterCancel) assertNotCancelled();
+      continue;
+    }
+    const text = await r.text();
+    if (r.ok) return text ? JSON.parse(text) : null;
+
+    const error = gitHubError(r, text, s);
+    const exhausted = r.headers?.get?.('x-ratelimit-remaining') === '0';
+    const secondaryLimit = (r.status === 403 || r.status === 429) && !exhausted
+      && (r.status === 429 || /secondary rate limit/i.test(text));
+    const transient = [500, 502, 503, 504].includes(r.status) || secondaryLimit;
+    const wait = retryAfterMs(r) ?? GITHUB_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+    if (!retryable || !transient || attempt >= GITHUB_MAX_ATTEMPTS || wait > GITHUB_MAX_RETRY_AFTER_MS) throw error;
+    await waitForRetry(wait, signal);
+    if (!allowAfterCancel) assertNotCancelled();
+  }
 }
 
 async function getRef() {
