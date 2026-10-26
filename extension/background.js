@@ -286,7 +286,9 @@ function attachmentMarkdown(message, assetMap, allAssets) {
   const addAsset = (asset) => {
     // Inline content-block images are rendered at their original position in
     // the message body, so do not repeat them in the trailing attachment list.
-    if (!asset || used.has(asset.path) || (Array.isArray(asset.inline_image_indices) && asset.inline_image_indices.length)) return;
+    if (!asset || used.has(asset.path)
+      || (Array.isArray(asset.inline_image_indices) && asset.inline_image_indices.length)
+      || (Array.isArray(asset.inline_media_indices) && asset.inline_media_indices.length)) return;
     used.add(asset.path);
     parts.push(assetMarkdown(asset, asset.path));
   };
@@ -347,7 +349,7 @@ function conversationMarkdown(c, provider, account, assetMap, allAssets) {
         ? provider[0].toUpperCase() + provider.slice(1)
         : m.role;
     const attachments = attachmentMarkdown(m, assetMap, allAssets);
-    const content = String(m.content || '').replace(/\[\[AI_ARCHIVE_INLINE_IMAGE:(\d+)\]\]/g, (marker, rawIndex) => {
+    let content = String(m.content || '').replace(/\[\[AI_ARCHIVE_INLINE_IMAGE:(\d+)\]\]/g, (marker, rawIndex) => {
       const imageIndex = Number(rawIndex);
       const image = allAssets.find((asset) =>
         Array.isArray(asset.inline_image_indices)
@@ -355,6 +357,15 @@ function conversationMarkdown(c, provider, account, assetMap, allAssets) {
         && assetMatchesMessage(asset, m, allAssets)
       );
       return image ? assetMarkdown(image, image.path) : marker;
+    });
+    content = content.replace(/\[\[AI_ARCHIVE_INLINE_MEDIA:(\d+)\]\]/g, (marker, rawIndex) => {
+      const mediaIndex = Number(rawIndex);
+      const media = allAssets.find((asset) =>
+        Array.isArray(asset.inline_media_indices)
+        && asset.inline_media_indices.includes(mediaIndex)
+        && assetMatchesMessage(asset, m, allAssets)
+      );
+      return media ? assetMarkdown(media, media.path) : marker;
     });
 
     // User attachments/reply excerpts are shown before the user's message, matching
