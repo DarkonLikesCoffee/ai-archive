@@ -953,3 +953,67 @@ test('renders inline image markers at their original message position without du
   assert.ok(markdown.indexOf('Before image.') < markdown.indexOf(link));
   assert.ok(markdown.indexOf(link) < markdown.indexOf('After image.'));
 });
+
+
+test('escapes untrusted attachment filenames in Markdown labels', () => {
+  const { conversationMarkdown } = loadBackgroundAssetHelpers();
+  const hostileName = 'plot](https://evil.example/collect).png';
+  const asset = {
+    name: hostileName,
+    mime: 'image/png',
+    path: 'archive/conversations/claude/personal/assets/conversation/plot.png',
+    sha256: 'a'.repeat(64),
+    size: 12,
+    message_external_id: 'assistant-message',
+  };
+  const message = {
+    external_id: 'assistant-message',
+    role: 'assistant',
+    content: 'Generated the image.',
+    files: [{ file_name: hostileName }],
+    attachments: [],
+    metadata: {},
+  };
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-hostile-filename',
+    title: 'Filename escaping',
+    messages: [message],
+    message_count: 1,
+  }, 'claude', 'personal', new Map(), [asset]);
+
+  assert.match(markdown, /!\[plot\\\]\\\(https:\/\/evil\.example\/collect\\\)\.png\]\(assets\/conversation\/plot\.png\)/);
+  assert.equal(markdown.includes('![plot](https://evil.example/collect)'), false,
+    'untrusted filename text must not create a link to an external destination');
+});
+
+test('escapes HTML and Markdown formatting characters in attachment labels', () => {
+  const { conversationMarkdown } = loadBackgroundAssetHelpers();
+  const hostileName = '<img src=x onerror=alert(1)> *unsafe* & notes.txt';
+  const asset = {
+    name: hostileName,
+    mime: 'text/plain',
+    path: 'archive/conversations/claude/personal/assets/conversation/notes.txt',
+    sha256: 'b'.repeat(64),
+    size: 8,
+    message_external_id: 'assistant-message',
+  };
+  const message = {
+    external_id: 'assistant-message',
+    role: 'assistant',
+    content: 'Generated notes.',
+    files: [{ file_name: hostileName }],
+    attachments: [],
+    metadata: {},
+  };
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-hostile-html-filename',
+    title: 'HTML filename escaping',
+    messages: [message],
+    message_count: 1,
+  }, 'claude', 'personal', new Map(), [asset]);
+
+  assert.equal(markdown.includes('<img src=x onerror=alert(1)>'), false);
+  assert.equal(markdown.includes('**unsafe**'), false);
+  assert.match(markdown, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.match(markdown, /&amp; notes\.txt/);
+});
