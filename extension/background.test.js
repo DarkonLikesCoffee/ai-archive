@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
 
 const backgroundPath = fileURLToPath(new URL('./background.js', import.meta.url));
 const backgroundSource = await readFile(backgroundPath, 'utf8');
