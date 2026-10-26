@@ -46,7 +46,8 @@ function renderMarkdown(text) {
       renderLink: ({ href, text: label }) => {
         const path = String(href ?? '').replace(/\\/g, '/');
         if (/^(?:assets\/|archive\/.*\/assets\/)/.test(path)) {
-          return `<span class="md-attachment-placeholder" data-md-attachment="${escapeHtml(path)}">${label}</span>`;
+          // The label is raw Markdown source; escape it so it cannot inject HTML.
+          return `<span class="md-attachment-placeholder" data-md-attachment="${escapeHtml(path)}">${escapeHtml(label)}</span>`;
         }
         return undefined;
       },
@@ -217,6 +218,9 @@ function inlineMarkdown(s) {
     if (/^(?:assets\/|archive\/.*\/assets\/)/.test(safeUrl)) {
       return protect(`<span class="md-attachment-placeholder" data-md-attachment="${safeUrl}">${label}</span>`);
     }
+    // Only well-known, non-executable schemes become links; a javascript: or
+    // data: URL here would run when the reader clicks the quoted link.
+    if (!/^(?:https?:|mailto:|#|\/|\.\.?\/)/i.test(safeUrl)) return protect(label);
     return protect(`<a href="${safeUrl}" target="_blank" rel="noreferrer">${label}</a>`);
   });
   x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/__([^_]+)__/g,'<strong>$1</strong>');
