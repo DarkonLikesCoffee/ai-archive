@@ -169,8 +169,22 @@ function isImageAsset(asset) {
   return /\.(png|jpe?g|gif|webp|bmp|svg|avif|ico)$/i.test(name);
 }
 
+function escapeMarkdownLabel(value) {
+  return String(value || 'file')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\\/g, '\\\\')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(/([*_\x60!])/g, '\\$1');
+}
+
 function assetMarkdown(asset, path) {
-  const label = asset.name || 'file';
+  const label = escapeMarkdownLabel(asset.name || 'file');
   const rel = `assets/${String(path).split('/assets/').pop()}`;
   if (isImageAsset(asset)) return `![${label}](${rel})`;
   return `[${label}](${rel})`;
