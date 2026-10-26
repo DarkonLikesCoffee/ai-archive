@@ -1057,3 +1057,93 @@ test('requires an explicit path when multiple sandbox files share a basename', a
 
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+test('does not associate a same-named sandbox file with a direct attachment unless its path is explicit', async () => {
+  const url = 'https://assets.example/photo.png';
+  const conversation = {
+    uuid: 'conversation-direct-sandbox-collision',
+    name: 'Direct and sandbox same-name collision',
+    current_leaf_message_uuid: 'assistant-answer',
+    chat_messages: [
+      {
+        uuid: 'user-question',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Please review photo.png.' }],
+        files: [{
+          file_uuid: 'direct-photo-id',
+          file_name: 'photo.png',
+          preview_url: url,
+          mime_type: 'image/png',
+        }],
+      },
+      {
+        uuid: 'assistant-answer',
+        parent_message_uuid: 'user-question',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'I reviewed photo.png.' }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: { [url]: { content: 'direct attachment bytes', contentType: 'image/png' } },
+    sandboxFiles: [{ path: 'outputs/photo.png', content_type: 'image/png' }],
+    sandboxContents: { 'outputs/photo.png': 'different sandbox file bytes' },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+
+  assert.equal(assets.length, 1, 'the ambiguous sandbox copy should not be archived by basename alone');
+  assert.equal(assets[0].source, 'message');
+  assert.equal(Buffer.from(assets[0].base64, 'base64').toString('utf8'), 'direct attachment bytes');
+  assert.equal(harness.requests.some((request) => request.includes('outputs/photo.png')), false,
+    'the unrelated same-named sandbox file should not be downloaded');
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('includes a same-named sandbox file when the exact path is explicitly referenced', async () => {
+  const conversation = {
+    uuid: 'conversation-explicit-sandbox-path',
+    name: 'Explicit sandbox file reference',
+    current_leaf_message_uuid: 'assistant-answer',
+    chat_messages: [
+      {
+        uuid: 'user-question',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Please inspect photo.png.' }],
+        files: [{
+          file_uuid: 'direct-photo-id',
+          file_name: 'photo.png',
+          preview_url: 'https://assets.example/explicit-photo.png',
+          mime_type: 'image/png',
+        }],
+      },
+      {
+        uuid: 'assistant-answer',
+        parent_message_uuid: 'user-question',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'The generated output is at outputs/photo.png.' }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: { 'https://assets.example/explicit-photo.png': { content: 'direct attachment bytes' } },
+    sandboxFiles: [{ path: 'outputs/photo.png', content_type: 'image/png' }],
+    sandboxContents: { 'outputs/photo.png': 'different sandbox file bytes' },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.equal(handoff.conversations[0].assets.length, 2);
+  assert.deepEqual(
+    Array.from(handoff.conversations[0].assets, (asset) => asset.source),
+    ['message', 'sandbox'],
+  );
+  harness.finishFirstHandoff({ ok: true });
+});
