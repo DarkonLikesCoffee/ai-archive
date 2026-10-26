@@ -1303,3 +1303,61 @@ test('names conversations that could not be exported in the completion message',
   const done = progress.find((event) => event.stage === 'done');
   assert.match(done.message, /^Sync complete: 1 conversation changed in 1 GitHub commit\. 1 conversation could not be exported and was left unchanged in the archive: "Broken one" \(Claude returned an invalid payload\)\. Sync again later to retry it\.$/);
 });
+
+function loadBackgroundForSyncState() {
+  const listeners = [];
+  let now = Date.UTC(2026, 9, 26, 12, 0, 0);
+  class FakeDate extends Date {
+    static now() { return now; }
+  }
+  const tabMessages = [];
+  const chrome = {
+    storage: { local: { get: async () => ({}) } },
+    runtime: { onMessage: { addListener(listener) { listeners.push(listener); } }, sendMessage() { return Promise.resolve(); } },
+    tabs: { sendMessage(tabId, message) { tabMessages.push({ tabId, message }); return Promise.resolve(); } },
+  };
+  vm.runInNewContext(backgroundSource, { chrome, AbortController, fetch: () => new Promise(() => {}), Date: FakeDate });
+  const send = (message, sender = {}) => {
+    let response;
+    listeners[0](message, sender, (value) => { response = value; });
+    return response;
+  };
+  return { send, tabMessages, advance(ms) { now += ms; } };
+}
+
+test('reports the content script fetching phase to a reopened popup', () => {
+  const background = loadBackgroundForSyncState();
+  const tab = { tab: { id: 7 } };
+
+  assert.equal(background.send({ type: 'getSyncState' }).running, false);
+  background.send({ type: 'syncProgress', stage: 'fetching', current: 3, total: 40 }, tab);
+  const state = background.send({ type: 'getSyncState' });
+  assert.equal(state.running, true, 'a fetch in a Claude tab counts as a running sync');
+  assert.equal(state.stage, 'fetching');
+  assert.equal(state.current, 3);
+  assert.equal(state.total, 40);
+
+  background.send({ type: 'syncProgress', stage: 'error', error: 'Claude conversations: 500' }, tab);
+  assert.equal(background.send({ type: 'getSyncState' }).running, false);
+});
+
+test('does not report a fetch as running forever after its Claude tab went away', () => {
+  const background = loadBackgroundForSyncState();
+  background.send({ type: 'syncProgress', stage: 'fetching', current: 1, total: 5 }, { tab: { id: 7 } });
+  background.advance(4 * 60 * 1000);
+  assert.equal(background.send({ type: 'getSyncState' }).running, true);
+  background.advance(2 * 60 * 1000);
+  assert.equal(background.send({ type: 'getSyncState' }).running, false, 'stale content progress is not a running sync');
+});
+
+test('forwards a cancel to the Claude tab that is fetching, even from another tab', () => {
+  const background = loadBackgroundForSyncState();
+  background.send({ type: 'syncProgress', stage: 'fetching', current: 2, total: 9 }, { tab: { id: 42 } });
+  background.send({ type: 'cancelSync' });
+  assert.deepEqual(JSON.parse(JSON.stringify(background.tabMessages)), [{ tabId: 42, message: { type: 'cancelSync' } }]);
+
+  // Nothing is fetching: no tab message is sent.
+  const idle = loadBackgroundForSyncState();
+  idle.send({ type: 'cancelSync' });
+  assert.equal(idle.tabMessages.length, 0);
+});
