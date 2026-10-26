@@ -1884,7 +1884,7 @@ test('materializes non-image inline base64 blocks as linked assets in marker ord
   harness.finishFirstHandoff({ ok: true });
 });
 
-test('does not materialize inline audio nested inside a fenced tool result', async () => {
+test('archives tool result media as a message attachment without an inline marker', async () => {
   const audioBase64 = btoa('tool result sound');
   const conversation = {
     uuid: 'conversation-tool-result-audio',
@@ -1904,7 +1904,11 @@ test('does not materialize inline audio nested inside a fenced tool result', asy
         content: [{
           type: 'tool_result',
           name: 'generate_audio',
-          content: [{ type: 'audio', source: { type: 'base64', media_type: 'audio/mpeg', data: audioBase64 } }],
+          content: [
+            { type: 'audio', source: { type: 'base64', media_type: 'audio/mpeg', data: audioBase64 } },
+            // Malformed base64 stays redacted and must not stop the sync.
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: '!!not base64!!' } },
+          ],
         }],
       },
     ],
@@ -1914,11 +1918,18 @@ test('does not materialize inline audio nested inside a fenced tool result', asy
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   const handoff = await harness.firstHandoff;
   const normalized = handoff.conversations[0];
+  const content = normalized.messages[1].content;
 
-  assert.equal(normalized.assets.length, 0, 'tool result media must not create an orphaned asset');
-  assert.equal(normalized.messages[1].content.includes('AI_ARCHIVE_INLINE_ASSET'), false);
-  assert.equal(normalized.messages[1].content.includes(audioBase64), false);
-  assert.match(normalized.messages[1].content, /"media_type": "audio\/mpeg"/);
+  assert.equal(normalized.assets.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(normalized.assets.map((asset) => [
+    asset.source, asset.mime, asset.message_external_id, 'inline_positions' in asset,
+    Buffer.from(asset.base64, 'base64').toString('utf8'),
+  ]))), [['tool-result', 'audio/mpeg', 'assistant-message', false, 'tool result sound']]);
+  assert.equal(content.includes('AI_ARCHIVE_INLINE_ASSET'), false, 'tool media gets no inline marker');
+  assert.equal(content.includes(audioBase64), false);
+  assert.match(content, /omitted inline payload: \d+ characters; archived as a message attachment/);
+  assert.match(content, /"data": "\[omitted inline payload: 14 characters\]"/, 'the malformed payload keeps the plain note');
+
   harness.finishFirstHandoff({ ok: true });
 });
 
