@@ -1287,7 +1287,7 @@ test('preserves unknown content block metadata instead of silently dropping it',
   assert.match(rendered, /audio\/wav/);
   assert.match(rendered, /omitted inline payload: 4096 characters/);
   assert.equal(rendered.includes(largePayload), false, 'large binary payload must not be dumped into Markdown');
-  assert.ok(rendered.includes('Reference: [&lt;img src=x onerror=alert\\(1\\)&gt; \\*Open me\\*](<https://example.com/reference>)'));
+  assert.match(rendered, /Reference: \[Primary source\]\(<https:\/\/example\.com\/source>\)/);
   assert.match(rendered, /> The source supports the result\./);
   assert.match(rendered, /"type": "citation_reference"/);
   assert.match(rendered, /"url": "https:\/\/example\.com\/source"/);
@@ -1541,7 +1541,7 @@ test('escapes hostile citation titles and block types in Markdown', async () => 
   assert.equal(visibleReference.includes('<img src=x onerror=alert(1)>'), false);
   assert.equal(visibleReference.includes('**Open me**'), false);
   assert.ok(rendered.includes('Reference: [&lt;img src=x onerror=alert\\(1\\)&gt; \\*Open me\\*](<https://example.com/reference>)'));
-  assert.match(rendered, /"title": "<img src=x onerror=alert\(1\)> \\*Open me\\*"/);
+  assert.ok(rendered.includes('"title": "<img src=x onerror=alert(1)> *Open me*"'));
   harness.finishFirstHandoff({ ok: true });
 });
 
