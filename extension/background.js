@@ -3,6 +3,11 @@
 const API = 'https://api.github.com';
 const BLOB_UPLOAD_CONCURRENCY = 4;
 const SEARCH_TEXT_ENCODING = 'gzip-base64';
+// Bump whenever the exported Markdown or assets for an unchanged Claude
+// conversation would differ (content.js rendering or background.js output).
+// Incremental sync only skips conversations archived by the current version,
+// so a bump re-exports every conversation once on its next sync.
+const EXPORTER_VERSION = 1;
 let activeGitHubSettings = null;
 let syncAbortController = null;
 let cancelRequested = false;
@@ -532,6 +537,7 @@ function indexEntry(c, path, provider, account, assets) {
     message_count: c.message_count || c.messages.length,
     assets: assets.map((a) => ({ path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name })),
     format_version: 4,
+    exporter_version: EXPORTER_VERSION,
     preview: String(contents.find(Boolean) || '').slice(0, 300),
     search_text: [c.title, ...contents].join('\n').slice(0, 250000),
   };
@@ -592,6 +598,55 @@ function skippedSummary(skipped) {
   return ` ${skipped.length} conversation${skipped.length === 1 ? '' : 's'} could not be exported and ${skipped.length === 1 ? 'was' : 'were'} left unchanged in the archive: ${listed.join('; ')}${more}. Sync again later to retry ${skipped.length === 1 ? 'it' : 'them'}.`;
 }
 
+// Read the branch head, its full tree, and archive/index.json exactly as a
+// sync sees them. Shared by sync() and the incremental-sync archive state.
+async function loadArchiveSnapshot() {
+  let ref = await getRef();
+  assertNotCancelled();
+  let branch = ref ? ref.ref.split('/').pop() : 'main';
+  let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
+  let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
+  if (baseTree?.truncated) {
+    throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
+  }
+  let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
+
+  let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
+  const indexFile = ref ? await getFile('archive/index.json', branch) : null;
+  if (indexFile) {
+    let indexContent = indexFile.content;
+    // The GitHub Contents API omits file content for larger files and reports
+    // encoding "none". Never interpret that response as a missing index: a
+    // limited sync would then publish an index containing only selected chats.
+    if (typeof indexContent !== 'string' || (!indexContent && indexFile.sha)) {
+      if (!indexFile.sha) {
+        throw new Error('GitHub returned no readable content or blob SHA for archive/index.json. No archive changes were published.');
+      }
+      const blob = await gh(`/git/blobs/${encodeURIComponent(indexFile.sha)}`);
+      if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
+        throw new Error('GitHub could not return the full archive/index.json blob. No archive changes were published.');
+      }
+      indexContent = blob.content;
+    }
+
+    let parsedIndex;
+    try {
+      parsedIndex = JSON.parse(base64DecodeContent(indexContent));
+    } catch {
+      // Never silently replace a corrupt index with a partial one. The index is
+      // the web app's navigation/search catalogue; rebuilding it from a limited
+      // sync could make every unselected conversation disappear from the UI.
+      throw new Error('archive/index.json is invalid JSON. Restore or repair it before syncing; no archive changes were published.');
+    }
+    if (!parsedIndex || !Array.isArray(parsedIndex.conversations)) {
+      throw new Error('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
+    }
+    index = parsedIndex;
+  }
+
+  return { ref, branch, baseCommit, baseTree, existingPaths, index };
+}
+
 // After a full sync, archived conversations that Claude.ai did not list at
 // all were either deleted there or missing from an incomplete list. Their
 // archived copies are kept either way; say so instead of staying silent.
@@ -600,8 +655,31 @@ function unlistedSummary(count) {
   return ` ${count} archived conversation${count === 1 ? ' was' : 's were'} not returned by Claude.ai in this full sync (deleted there, or Claude's list was incomplete); ${count === 1 ? 'its archived copy was' : 'their archived copies were'} kept.`;
 }
 
-async function sync(conversations, onProgress, skipped = [], { fullList = false } = {}) {
-  let skippedNote = skippedSummary(skipped);
+// For incremental sync: the conversations of this account whose archived copy
+// is complete (every referenced file exists on the branch) and was written by
+// the current exporter. Only these may be skipped as unchanged.
+async function archiveState() {
+  if (!syncRunning) cancelRequested = false;
+  const s = await settings();
+  if (!s.github_owner || !s.github_repo || !s.github_token) throw Error('Configure GitHub settings in the extension popup first.');
+  const account = s.archive_account?.trim() || 'personal';
+  const { index, existingPaths } = await loadArchiveSnapshot();
+  return index.conversations
+    .filter((entry) => entry?.provider === 'claude' && entry.account === account
+      && entry.exporter_version === EXPORTER_VERSION && entry.updated_at
+      && [entry.path, ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : [])]
+        .every((path) => path && existingPaths.has(path)))
+    .map((entry) => ({ id: entry.id, updated_at: entry.updated_at }));
+}
+
+function unchangedSummary(count) {
+  if (!count) return '';
+  return ` ${count} unchanged conversation${count === 1 ? ' was' : 's were'} not downloaded again.`;
+}
+
+async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [] } = {}) {
+  const unchanged = Array.isArray(unchangedIds) ? unchangedIds.map(String) : [];
+  let skippedNote = skippedSummary(skipped) + unchangedSummary(unchanged.length);
   syncRunning = true;
   cancelRequested = false;
   syncAbortController = new AbortController();
@@ -614,54 +692,14 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false 
     const account = s.archive_account?.trim() || 'personal';
     const accountSlug = slugify(account);
     const provider = 'claude';
-    let ref = await getRef();
-    assertNotCancelled();
-    let branch = ref ? ref.ref.split('/').pop() : 'main';
-    let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
-    let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
-    if (baseTree?.truncated) {
-      throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
-    }
-    let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
-
-    let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
-    const indexFile = ref ? await getFile('archive/index.json', branch) : null;
-    if (indexFile) {
-      let indexContent = indexFile.content;
-      // The GitHub Contents API omits file content for larger files and reports
-      // encoding "none". Never interpret that response as a missing index: a
-      // limited sync would then publish an index containing only selected chats.
-      if (typeof indexContent !== 'string' || (!indexContent && indexFile.sha)) {
-        if (!indexFile.sha) {
-          throw new Error('GitHub returned no readable content or blob SHA for archive/index.json. No archive changes were published.');
-        }
-        const blob = await gh(`/git/blobs/${encodeURIComponent(indexFile.sha)}`);
-        if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
-          throw new Error('GitHub could not return the full archive/index.json blob. No archive changes were published.');
-        }
-        indexContent = blob.content;
-      }
-
-      let parsedIndex;
-      try {
-        parsedIndex = JSON.parse(base64DecodeContent(indexContent));
-      } catch {
-        // Never silently replace a corrupt index with a partial one. The index is
-        // the web app's navigation/search catalogue; rebuilding it from a limited
-        // sync could make every unselected conversation disappear from the UI.
-        throw new Error('archive/index.json is invalid JSON. Restore or repair it before syncing; no archive changes were published.');
-      }
-      if (!parsedIndex || !Array.isArray(parsedIndex.conversations)) {
-        throw new Error('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
-      }
-      index = parsedIndex;
-    }
+    let { ref, branch, baseCommit, baseTree, existingPaths, index } = await loadArchiveSnapshot();
 
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
     if (fullList) {
       const listed = new Set([
         ...conversations.map((c) => String(c.external_id)),
         ...(Array.isArray(skipped) ? skipped.map((item) => String(item.id)) : []),
+        ...unchanged,
       ]);
       const unlisted = index.conversations.filter((x) => x.provider === provider && x.account === account && !listed.has(String(x.id)));
       skippedNote += unlistedSummary(unlisted.length);
@@ -698,6 +736,9 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false 
         || previous?.search_text_sha256 !== entry.search_text_sha256
         || (entry.search_text_encoding === SEARCH_TEXT_ENCODING && typeof previous?.search_text_gzip !== 'string');
       if (searchCacheChanged) indexNeedsUpdate = true;
+      // Record the exporter version even when the Markdown is unchanged, so
+      // the next sync can skip this conversation incrementally.
+      if (previous?.exporter_version !== EXPORTER_VERSION) indexNeedsUpdate = true;
       const changed = !previous
         || previous.updated_at !== entry.updated_at
         || previous.message_count !== entry.message_count
@@ -959,6 +1000,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     contentSyncState = { ...progress, tabId: sender.tab.id, at: Date.now() };
     return false;
   }
+  if (msg.type === 'getArchiveState') {
+    archiveState()
+      .then((conversations) => sendResponse({ ok: true, conversations }))
+      .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }));
+    return true;
+  }
   if (msg.type === 'getSyncState') {
     if (!syncRunning && contentSyncRunning()) {
       const { at, tabId, ...progress } = contentSyncState;
@@ -990,7 +1037,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
 
-    sync(msg.conversations, broadcast, Array.isArray(msg.skipped) ? msg.skipped : [], { fullList: msg.fullList === true })
+    sync(msg.conversations, broadcast, Array.isArray(msg.skipped) ? msg.skipped : [], {
+      fullList: msg.fullList === true,
+      unchangedIds: Array.isArray(msg.unchangedIds) ? msg.unchangedIds : [],
+    })
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((e) => {
         if (e.name === 'AbortError' || e.message === '__SYNC_CANCELLED__') {
