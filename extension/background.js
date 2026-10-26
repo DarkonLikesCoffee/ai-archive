@@ -442,7 +442,7 @@ function attachmentMarkdown(message, assetMap, allAssets) {
       // the content-side collector materializes it as a text asset before rendering.
       // If multiple same-named assets are legitimately associated with this message,
       // let the loop below render each one rather than showing a misleading placeholder.
-      parts.push(`**Attachment: ${name}**`);
+      parts.push(`**Attachment: ${escapeMarkdownLabel(name)}**`);
     }
   }
 

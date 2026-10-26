@@ -1382,3 +1382,18 @@ test('reports archived conversations that a full sync did not receive from Claud
   await partial.sync(sampleConversation(), (event) => partialProgress.push(event), [], { fullList: false });
   assert.doesNotMatch(partialProgress.find((event) => event.stage === 'done').message, /not returned by Claude/);
 });
+
+test('escapes filenames in placeholders for attachments that could not be archived', () => {
+  const { attachmentMarkdown } = loadBackgroundAssetHelpers();
+  const message = {
+    external_id: 'user-message',
+    role: 'user',
+    content: 'See attachment.',
+    files: [],
+    attachments: [{ file_name: '*notes* [link](https://evil.example)\n## Claude.txt' }],
+    metadata: {},
+  };
+  const markdown = attachmentMarkdown(message, new Map(), []);
+  assert.equal(markdown, '**Attachment: \\*notes\\* \\[link\\]\\(https://evil.example\\) ## Claude.txt**');
+  assert.equal(markdown.includes('\n'), false, 'a filename cannot start a new Markdown block');
+});
