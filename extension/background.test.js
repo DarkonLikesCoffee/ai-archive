@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
+const MARKER_NONCE = '0123456789abcdef0123456789abcdef';
+const marker = (index) => `[[AI_ARCHIVE_INLINE_IMAGE:${MARKER_NONCE}:${index}]]`;
+
 const backgroundPath = fileURLToPath(new URL('./background.js', import.meta.url));
 const backgroundSource = await readFile(backgroundPath, 'utf8');
 
@@ -931,7 +934,7 @@ test('renders inline image markers at their original message position without du
   const assistantMessage = {
     external_id: 'assistant-message',
     role: 'assistant',
-    content: 'Before image. [[AI_ARCHIVE_INLINE_IMAGE:0]] After image.',
+    content: `Before image. ${marker(0)} After image.`,
     files: [],
     attachments: [],
     metadata: {},
@@ -943,12 +946,13 @@ test('renders inline image markers at their original message position without du
   const markdown = conversationMarkdown({
     external_id: 'conversation-inline-image',
     title: 'Inline image render',
+    inline_marker_nonce: MARKER_NONCE,
     messages: [assistantMessage],
     message_count: 1,
   }, 'claude', 'personal', assetMap, allAssets);
   const link = '![inline-image-123456789abc.png](assets/conversation/image.png)';
 
-  assert.equal(markdown.includes('[[AI_ARCHIVE_INLINE_IMAGE:0]]'), false, 'the image marker must be resolved');
+  assert.equal(markdown.includes(marker(0)), false, 'the image marker must be resolved');
   assert.equal(markdown.split(link).length - 1, 1, 'the image should be linked exactly once');
   assert.ok(markdown.indexOf('Before image.') < markdown.indexOf(link));
   assert.ok(markdown.indexOf(link) < markdown.indexOf('After image.'));
@@ -1050,7 +1054,7 @@ test('keeps inline image positions of a shared asset scoped to their own message
     {
       external_id: 'first-user-message',
       role: 'user',
-      content: 'First upload. [[AI_ARCHIVE_INLINE_IMAGE:0]]',
+      content: `First upload. ${marker(0)}`,
       files: [sharedFile],
       attachments: [],
       metadata: {},
@@ -1058,7 +1062,7 @@ test('keeps inline image positions of a shared asset scoped to their own message
     {
       external_id: 'second-user-message',
       role: 'user',
-      content: 'Same image again. [[AI_ARCHIVE_INLINE_IMAGE:0]]',
+      content: `Same image again. ${marker(0)}`,
       files: [sharedFile],
       attachments: [],
       metadata: {},
@@ -1069,6 +1073,7 @@ test('keeps inline image positions of a shared asset scoped to their own message
   const markdown = conversationMarkdown({
     external_id: 'conversation-shared-inline',
     title: 'Shared inline image',
+    inline_marker_nonce: MARKER_NONCE,
     messages,
     message_count: 2,
   }, 'claude', 'personal', assetMap, allAssets);
@@ -1085,4 +1090,79 @@ test('keeps inline image positions of a shared asset scoped to their own message
   assert.equal(second.split(sharedLink).length - 1, 1,
     'the second message shows the shared image inline once, not again as an attachment');
   assert.ok(second.indexOf('Same image again.') < second.indexOf(sharedLink));
+});
+
+test('never replaces marker-shaped text that does not carry the conversation nonce', () => {
+  const { conversationMarkdown } = loadBackgroundAssetHelpers();
+  const imageAsset = {
+    name: 'inline-image-123456789abc.png',
+    mime: 'image/png',
+    source: 'message-content',
+    message_external_id: 'user-message',
+    inline_image_positions: [{ message_external_id: 'user-message', index: 0 }],
+    path: 'archive/conversations/claude/personal/assets/conversation/image.png',
+    sha256: 'a'.repeat(64),
+    size: 12,
+  };
+  const legacyLiteral = '[[AI_ARCHIVE_INLINE_IMAGE:0]]';
+  const foreignNonceLiteral = `[[AI_ARCHIVE_INLINE_IMAGE:${'f'.repeat(32)}:0]]`;
+  const message = {
+    external_id: 'user-message',
+    role: 'user',
+    content: `The docs mention ${legacyLiteral} and ${foreignNonceLiteral}.\n\n${marker(0)}`,
+    files: [],
+    attachments: [],
+    metadata: {},
+  };
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-marker-collision',
+    title: 'Marker collision',
+    inline_marker_nonce: MARKER_NONCE,
+    messages: [message],
+    message_count: 1,
+  }, 'claude', 'personal', new Map(), [imageAsset]);
+  const link = '![inline-image-123456789abc.png](assets/conversation/image.png)';
+
+  assert.ok(markdown.includes(`The docs mention ${legacyLiteral} and ${foreignNonceLiteral}.`),
+    'user text must survive verbatim');
+  assert.equal(markdown.split(link).length - 1, 1, 'only the real marker becomes an image');
+  assert.equal(markdown.includes(MARKER_NONCE), false);
+});
+
+test('fails instead of publishing an inline image marker without an archived asset', () => {
+  const { conversationMarkdown } = loadBackgroundAssetHelpers();
+  const message = {
+    external_id: 'assistant-message',
+    role: 'assistant',
+    content: `Lost image: ${marker(0)}`,
+    files: [],
+    attachments: [],
+    metadata: {},
+  };
+  assert.throws(() => conversationMarkdown({
+    external_id: 'conversation-missing-inline-asset',
+    title: 'Missing inline asset',
+    inline_marker_nonce: MARKER_NONCE,
+    messages: [message],
+    message_count: 1,
+  }, 'claude', 'personal', new Map(), []), /inline image 0 in message "assistant-message" has no archived asset/);
+});
+
+test('keeps internal inline image markers out of the index preview and search text', () => {
+  const { indexEntry } = loadBackgroundAssetHelpers();
+  const entry = indexEntry({
+    external_id: 'conversation-index-markers',
+    title: 'Index markers',
+    inline_marker_nonce: MARKER_NONCE,
+    message_count: 2,
+    messages: [
+      { external_id: 'image-only', role: 'user', content: marker(0) },
+      { external_id: 'text', role: 'assistant', content: `See ${marker(1)} and [[AI_ARCHIVE_INLINE_IMAGE:0]].` },
+    ],
+  }, 'archive/conversations/claude/personal/x.md', 'claude', 'personal', []);
+
+  assert.equal(entry.preview, 'See  and [[AI_ARCHIVE_INLINE_IMAGE:0]].',
+    'an image-only message is skipped for the preview; literal user text is kept');
+  assert.equal(entry.search_text.includes(MARKER_NONCE), false);
+  assert.ok(entry.search_text.includes('[[AI_ARCHIVE_INLINE_IMAGE:0]]'));
 });
