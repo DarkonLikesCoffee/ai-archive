@@ -2,6 +2,7 @@
 // Sync state lives here so the popup can open/close without losing progress.
 const API = 'https://api.github.com';
 const BLOB_UPLOAD_CONCURRENCY = 4;
+const SEARCH_TEXT_ENCODING = 'gzip-base64';
 let activeGitHubSettings = null;
 let syncAbortController = null;
 let cancelRequested = false;
@@ -380,6 +381,20 @@ function indexEntry(c, path, provider, account, assets) {
   };
 }
 
+async function compressSearchText(text) {
+  if (typeof CompressionStream !== 'function' || typeof Blob !== 'function' || typeof Response !== 'function') {
+    return null;
+  }
+  const stream = new Blob([String(text ?? '')]).stream().pipeThrough(new CompressionStream('gzip'));
+  const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 async function sha256(text) {
   const data = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest('SHA-256', data);
@@ -471,6 +486,7 @@ async function sync(conversations, onProgress) {
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
     let changes = [];
     let changedConversations = 0;
+    let indexNeedsUpdate = false;
     const total = conversations.length;
 
     for (let i = 0; i < total; i++) {
@@ -480,12 +496,26 @@ async function sync(conversations, onProgress) {
       const normalizedAssets = normalizeAssetList(c, provider, accountSlug);
       const markdown = conversationMarkdown(c, provider, account, normalizedAssets.byKey, normalizedAssets.assets);
       const entry = indexEntry(c, path, provider, account, normalizedAssets.assets);
+      const rawSearchText = entry.search_text;
+      entry.search_text_sha256 = await sha256(rawSearchText);
+      const compressedSearchText = await compressSearchText(rawSearchText);
+      if (compressedSearchText !== null) {
+        entry.search_text_encoding = SEARCH_TEXT_ENCODING;
+        entry.search_text_gzip = compressedSearchText;
+        delete entry.search_text;
+      } else {
+        entry.search_text_encoding = 'plain';
+      }
       entry.content_sha256 = await sha256(markdown);
       const key = `${provider}:${account}:${c.external_id}`;
       const previous = map.get(key);
       const previousAssets = Array.isArray(previous?.assets) ? previous.assets : [];
       const currentAssetSignature = JSON.stringify(entry.assets);
       const previousAssetSignature = JSON.stringify(previousAssets);
+      const searchCacheChanged = previous?.search_text_encoding !== entry.search_text_encoding
+        || previous?.search_text_sha256 !== entry.search_text_sha256
+        || (entry.search_text_encoding === SEARCH_TEXT_ENCODING && typeof previous?.search_text_gzip !== 'string');
+      if (searchCacheChanged) indexNeedsUpdate = true;
       const changed = !previous
         || previous.updated_at !== entry.updated_at
         || previous.message_count !== entry.message_count
@@ -520,6 +550,35 @@ async function sync(conversations, onProgress) {
         }
       }
       onProgress?.({ stage: 'checking', current: i + 1, total, changed: changedConversations });
+    }
+
+    // Migrate older entries too, so a limited sync compacts the complete cache
+    // instead of leaving large uncompressed search strings in untouched entries.
+    for (const [key, archived] of map) {
+      if (typeof archived.search_text !== 'string') continue;
+
+      const searchTextSha256 = archived.search_text_sha256 || await sha256(archived.search_text);
+      const compressedSearchText = await compressSearchText(archived.search_text);
+      if (compressedSearchText !== null) {
+        const compacted = {
+          ...archived,
+          search_text_sha256: searchTextSha256,
+          search_text_encoding: SEARCH_TEXT_ENCODING,
+          search_text_gzip: compressedSearchText,
+        };
+        delete compacted.search_text;
+        map.set(key, compacted);
+        indexNeedsUpdate = true;
+      } else {
+        const metadataChanged = archived.search_text_sha256 !== searchTextSha256
+          || archived.search_text_encoding !== 'plain';
+        map.set(key, {
+          ...archived,
+          search_text_sha256: searchTextSha256,
+          search_text_encoding: 'plain',
+        });
+        if (metadataChanged) indexNeedsUpdate = true;
+      }
     }
 
     const nextIndex = {
@@ -579,10 +638,14 @@ async function sync(conversations, onProgress) {
       existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
     }
 
-    if (changedConversations === 0 && ref) {
+    if (changedConversations === 0 && !indexNeedsUpdate && ref) {
       onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: 'Everything is already up to date. No GitHub commit was needed.' });
       return { total, changed: 0, commit: null };
     }
+
+    const completionMessage = changedConversations === 0
+      ? 'Sync complete: the search cache was compacted; no conversation Markdown changed in 1 GitHub commit.'
+      : `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`;
 
     const treeEntries = new Array(changes.length);
     const uploadTotal = changes.filter((x) => !x.delete).length + 1;
@@ -680,7 +743,7 @@ async function sync(conversations, onProgress) {
           total: 1,
           changed: changedConversations,
           commit: commit.sha,
-          message: `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit. The response to the final update was interrupted, but GitHub confirms the commit is published.`,
+          message: `${completionMessage} The response to the final update was interrupted, but GitHub confirms the commit is published.`,
         });
         return { total, changed: changedConversations, commit: commit.sha };
       }
@@ -698,7 +761,7 @@ async function sync(conversations, onProgress) {
       throw error;
     }
 
-    onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.` });
+    onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: completionMessage });
     return { total, changed: changedConversations, commit: commit.sha };
   } finally {
     syncRunning = false;

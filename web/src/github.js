@@ -45,8 +45,59 @@ export async function readText(settings, path) {
   return decodeBase64(f.content);
 }
 
+async function decompressSearchText(encoded) {
+  if (typeof DecompressionStream !== 'function' || typeof Blob !== 'function' || typeof Response !== 'function') {
+    throw new Error('This browser does not support decompression required by the archive search index.');
+  }
+  const binary = atob(String(encoded || '').replace(/\\n/g, ''));
+  const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).text();
+}
+
 export async function readIndex(settings) {
-  return JSON.parse(await readText(settings, 'archive/index.json'));
+  const index = JSON.parse(await readText(settings, 'archive/index.json'));
+  if (!Array.isArray(index?.conversations)) return index;
+
+  // Keep memory bounded while inflating per-conversation search caches. Older
+  // archives with plain search_text remain supported during gradual migration.
+  const conversations = new Array(index.conversations.length);
+  let nextIndex = 0;
+  let firstError = null;
+
+  async function worker() {
+    while (!firstError) {
+      const position = nextIndex++;
+      if (position >= index.conversations.length) return;
+      const entry = index.conversations[position];
+      try {
+        if (entry?.search_text_encoding === 'gzip-base64') {
+          if (typeof entry.search_text_gzip !== 'string') {
+            throw new Error('compressed search text is missing its payload');
+          }
+          const searchText = await decompressSearchText(entry.search_text_gzip);
+          const { search_text_gzip, search_text_encoding, ...metadata } = entry;
+          conversations[position] = { ...metadata, search_text: searchText };
+        } else {
+          conversations[position] = entry;
+        }
+      } catch (error) {
+        if (!firstError) {
+          firstError = new Error(
+            `Could not read the search cache for "${entry?.title || entry?.id || 'unknown conversation'}": ${error?.message || 'invalid compressed data'}`,
+          );
+        }
+        return;
+      }
+    }
+  }
+
+  await Promise.all(Array.from(
+    { length: Math.min(4, Math.max(1, index.conversations.length)) },
+    () => worker(),
+  ));
+  if (firstError) throw firstError;
+  return { ...index, conversations };
 }
 
 export async function readAsset(settings, path, metadata = null) {
