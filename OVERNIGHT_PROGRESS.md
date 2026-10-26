@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-26 21:15 UTC — product-completion cycle (#46–#54).
+Last updated: 2026-10-26 21:20 UTC — milestone reached in code/tests (#46–#56).
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -17,7 +17,7 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | GitHub | One atomic commit per sync, stale-branch guard, interrupted-publish check | ✅ | earlier |
 | GitHub | Retry transient failures; explain 401/403/rate limits | ✅ | #50 |
 | GitHub | Automatic sync on Claude open (latest 20, ≤ every 10 min) | ✅ | #48 |
-| GitHub | "Sync all" completeness (no pagination) | 🟡 relies on Claude returning the full list | — |
+| GitHub | "Sync all" completeness | 🟡 one-request list (unverified for huge accounts); any archived conversation Claude did not list is now **reported**, never dropped | #55 |
 | Popup | Progress + Cancel survive reopening the popup mid-fetch | ✅ | #54 |
 | Viewer | Load index/conversations/assets, large files, bounded asset loading, retries | ✅ | #43, #52 |
 | Viewer | Markdown, code, images, citations, tool groups, artifacts, safe rendering | ✅ | #36, #43, #46, #47 |
@@ -58,12 +58,25 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 - PR #46 (`feat/readable-tool-bodies`): extension 85/85, web 33/33, build OK, CI green.
 - PR #47 (`fix/reader-message-split-on-headings`): extension 84/84, web 32/32, build OK, CI green.
 
+## Milestone status (2026-10-26 21:20 UTC)
+Main development phase: **complete in code and automated tests**. Every roadmap feature is implemented end to end
+and covered by tests; master passes all extension/web tests and the production build. What is NOT done, and cannot be
+done in this environment: an end-to-end run with a real claude.ai account in real Chrome against a real GitHub repo.
+That is the single most important remaining step (owner).
+
+Secondary items left (none blocks the product):
+- Explicit message separator in the export format (removes the last `---` + `## You` ambiguity, but rewrites every
+  archived conversation once) — deferred.
+- `decompressSearchText` strips a literal `\n` instead of newlines — harmless (btoa output has none).
+
 ## Merged in the product-completion cycle
 - #46 readable tool bodies · #47 role-heading message split · #48 automatic sync · #49 README changes
 - #50 GitHub retries + clear auth/permission/rate-limit errors + settings validation
 - #51 installation and setup docs · #52 viewer retries + bounded asset loading
 - #53 skip unexportable conversations instead of failing the whole sync
-- #54 popup progress/Cancel during the fetching phase (open, CI pending at time of writing)
+- #54 popup progress/Cancel during the fetching phase
+- #55 report archived conversations a full sync did not receive
+- #56 escape filenames in unarchived-attachment placeholders (minor finding; CI pending at time of writing)
 
 ## Process note
 - A merge-conflict resolution on #54 briefly pushed an unparsable test file because a `grep`-based check did not
