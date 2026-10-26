@@ -1579,3 +1579,91 @@ test('does not let newline-bearing unknown block types create new Markdown headi
   assert.match(rendered, /Preserve me/);
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+test('materializes inline audio and video blocks as linked assets', async () => {
+  const audioBytes = 'inline audio payload';
+  const videoBytes = 'inline video payload';
+  const conversation = {
+    uuid: 'conversation-inline-audio-video',
+    name: 'Inline audio and video blocks',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Analyze these media clips.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [
+          { type: 'text', text: 'Audio first:' },
+          { type: 'audio', source: { type: 'base64', media_type: 'audio/mpeg', data: btoa(audioBytes) } },
+          { type: 'text', text: 'Video next:' },
+          { type: 'video', source: { type: 'base64', media_type: 'video/mp4', data: btoa(videoBytes) } },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const normalized = handoff.conversations[0];
+  const mediaAssets = normalized.assets.filter((asset) => Array.isArray(asset.inline_media_indices));
+
+  assert.equal(mediaAssets.length, 2);
+  assert.deepEqual(
+    Array.from(mediaAssets, (asset) => [asset.mime, asset.message_external_id, Buffer.from(asset.base64, 'base64').toString('utf8')]),
+    [
+      ['audio/mpeg', 'assistant-message', audioBytes],
+      ['video/mp4', 'assistant-message', videoBytes],
+    ],
+  );
+  assert.match(normalized.messages[1].content, /\[\[AI_ARCHIVE_INLINE_MEDIA:0\]\]/);
+  assert.match(normalized.messages[1].content, /\[\[AI_ARCHIVE_INLINE_MEDIA:1\]\]/);
+  assert.equal(normalized.messages[1].content.includes(btoa(audioBytes)), false);
+  assert.equal(normalized.messages[1].content.includes(btoa(videoBytes)), false);
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('does not materialize inline audio nested inside a fenced tool result', async () => {
+  const conversation = {
+    uuid: 'conversation-tool-result-audio',
+    name: 'Tool result audio block',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Generate a sound.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{
+          type: 'tool_result',
+          name: 'generate_audio',
+          content: [{ type: 'audio', source: { type: 'base64', media_type: 'audio/mpeg', data: btoa('tool result sound') } }],
+        }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(
+    handoff.conversations[0].assets.some((asset) => Array.isArray(asset.inline_media_indices)),
+    false,
+    'audio inside a fenced tool result must not create an orphaned media asset',
+  );
+  assert.equal(handoff.conversations[0].messages[1].content.includes('AI_ARCHIVE_INLINE_MEDIA'), false);
+  harness.finishFirstHandoff({ ok: true });
+});
