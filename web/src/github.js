@@ -2,19 +2,83 @@ const API = 'https://api.github.com';
 
 export function encodePath(path) { return path.split('/').map(encodeURIComponent).join('/'); }
 
+// The viewer only reads, so every request can be retried safely. Tests lower
+// the base delay; the attempt budget and Retry-After cap stay the same.
+export const retryPolicy = { attempts: 3, baseDelayMs: 1000, maxRetryAfterMs: 60000 };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Messages keep the "GitHub <status>:" prefix that callers match on.
+function gitHubError(response, text, settings) {
+  let message = '';
+  try { message = String(JSON.parse(text)?.message || ''); } catch { message = String(text || ''); }
+  const status = response.status;
+  const remaining = response.headers?.get?.('x-ratelimit-remaining');
+  const reset = Number(response.headers?.get?.('x-ratelimit-reset'));
+  if (status === 401) {
+    return new Error('GitHub 401: GitHub rejected the access token. Disconnect and connect again with a valid token.');
+  }
+  if ((status === 403 || status === 429) && remaining === '0') {
+    const when = Number.isFinite(reset) && reset > 0 ? ` it resets at ${new Date(reset * 1000).toISOString()}.` : ' try again later.';
+    return new Error(`GitHub ${status}: GitHub API rate limit reached;${when}`);
+  }
+  if (status === 403 && !/rate limit/i.test(message)) {
+    return new Error(`GitHub 403: GitHub denied access to ${settings.owner}/${settings.repo}. The token needs read access to repository contents.`);
+  }
+  return new Error(`GitHub ${status}: ${String(text || '').slice(0, 300)}`);
+}
+
 export async function githubRequest(settings, path, opts = {}) {
-  const r = await fetch(`${API}/repos/${encodeURIComponent(settings.owner)}/${encodeURIComponent(settings.repo)}${path}`, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${settings.token}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(opts.headers || {}),
-    },
-  });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`GitHub ${r.status}: ${text.slice(0, 300)}`);
-  return text ? JSON.parse(text) : null;
+  for (let attempt = 1; ; attempt++) {
+    let r;
+    try {
+      r = await fetch(`${API}/repos/${encodeURIComponent(settings.owner)}/${encodeURIComponent(settings.repo)}${path}`, {
+        ...opts,
+        headers: {
+          Authorization: `Bearer ${settings.token}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          ...(opts.headers || {}),
+        },
+      });
+    } catch (error) {
+      if (error?.name === 'AbortError' || attempt >= retryPolicy.attempts) throw error;
+      await sleep(retryPolicy.baseDelayMs * 2 ** (attempt - 1));
+      continue;
+    }
+    const text = await r.text();
+    if (r.ok) return text ? JSON.parse(text) : null;
+
+    const exhausted = r.headers?.get?.('x-ratelimit-remaining') === '0';
+    const secondaryLimit = !exhausted && (r.status === 429 || (r.status === 403 && /secondary rate limit/i.test(text)));
+    const transient = [500, 502, 503, 504].includes(r.status) || secondaryLimit;
+    const retryAfter = Number(r.headers?.get?.('retry-after'));
+    const wait = Number.isFinite(retryAfter) && retryAfter >= 0
+      ? retryAfter * 1000
+      : retryPolicy.baseDelayMs * 2 ** (attempt - 1);
+    if (!transient || attempt >= retryPolicy.attempts || wait > retryPolicy.maxRetryAfterMs) {
+      throw gitHubError(r, text, settings);
+    }
+    await sleep(wait);
+  }
+}
+
+/**
+ * Map items with at most `limit` tasks in flight, preserving input order.
+ * Used to load a conversation's assets without firing every request at once,
+ * which trips GitHub's secondary rate limit on large conversations.
+ */
+export async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, () => worker()));
+  return results;
 }
 
 function decodeBase64(b64) {
