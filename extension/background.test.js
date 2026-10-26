@@ -286,7 +286,10 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
     throw new Error(`Unexpected test request: ${method} ${pathname}`);
   };
 
-  const context = { chrome, fetch, AbortController, TextEncoder, TextDecoder, Uint8Array, crypto: webcrypto, btoa, atob };
+  const context = {
+    chrome, fetch, AbortController, TextEncoder, TextDecoder, Uint8Array,
+    Blob, Response, CompressionStream, crypto: webcrypto, btoa, atob,
+  };
   vm.runInNewContext(`${backgroundSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
@@ -813,4 +816,43 @@ test('preserves unselected conversations when GitHub omits a large index file fr
     nextIndex.conversations.some((entry) => entry.id === 'conversation-123456'),
     'the selected conversation should also be included in the next index',
   );
+});
+
+
+
+test('compacts legacy search text to gzip without rewriting unchanged conversation Markdown', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const conversation = sampleConversation()[0];
+  const largeMessageText = 'Searchable repeated conversation phrase. '.repeat(4000);
+  conversation.messages[0].content = largeMessageText;
+
+  const { entry } = await buildIndexEntry(hooks, conversation);
+  entry.search_text = [conversation.title, ...conversation.messages.map((message) => message.content)].join('\\n');
+  delete entry.search_text_encoding;
+  delete entry.search_text_gzip;
+  delete entry.search_text_sha256;
+
+  const originalSearchLength = entry.search_text.length;
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [entry] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+
+  const result = await harness.sync([conversation], () => {});
+  assert.equal(result.changed, 0, 'only the search-cache representation should change');
+  assert.ok(result.commit, 'the index-only migration should be committed');
+
+  const blobWrites = harness.requests.filter(
+    (request) => request.pathname.endsWith('/git/blobs') && request.method === 'POST',
+  );
+  assert.equal(blobWrites.length, 1, 'the index should be the only new blob; Markdown must not be rewritten');
+  const compactIndex = JSON.parse(blobWrites[0].body.content);
+  const compactedEntry = compactIndex.conversations[0];
+
+  assert.equal(compactedEntry.search_text, undefined, 'plain duplicated search text should be removed from the index');
+  assert.equal(compactedEntry.search_text_encoding, 'gzip-base64');
+  assert.equal(typeof compactedEntry.search_text_gzip, 'string');
+  assert.ok(
+    compactedEntry.search_text_gzip.length < originalSearchLength,
+    'gzip/base64 should be smaller than the original repetitive search text',
+  );
+  assert.equal(compactedEntry.search_text_sha256.length, 64, 'the uncompressed search text should retain a stable integrity hash');
 });
