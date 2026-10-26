@@ -526,7 +526,12 @@
       chain.push(current);
 
       const parent = current.parent_message_uuid;
-      if (!parent || parent === root) break;
+      if (parent === root) break;
+      if (typeof parent !== 'string' || !parent.trim()) {
+        throw new Error(
+          `Cannot safely export Claude conversation "${conversationLabel}": message "${current.uuid}" has no parent_message_uuid, so the active lineage cannot be verified back to the root. No archive changes were submitted to GitHub.`,
+        );
+      }
 
       const parentMessage = byId.get(parent);
       if (!parentMessage) {
