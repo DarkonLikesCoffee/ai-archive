@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseConversationMarkdown, readAsset, readText } from './github.js';
+import { parseConversationMarkdown, readAsset, readText, readIndex } from './github.js';
 
 test('parses canonical metadata, title, and messages', () => {
   const markdown = `<!-- AI_ARCHIVE_METADATA
@@ -270,4 +270,53 @@ test('reads large GitHub text files through the blob API when Contents omits con
   assert.equal(result, expectedText);
   assert.equal(calls.length, 2, 'the reader should fetch Contents metadata then the exact Git blob');
   assert.ok(calls[1].endsWith('/git/blobs/large-index-sha'));
+});
+
+
+
+test('readIndex inflates compressed search entries and preserves legacy plain entries', async (t) => {
+  const searchText = 'Find this exact phrase in a compact search index. '.repeat(100);
+  const compressedStream = new Blob([searchText]).stream().pipeThrough(new CompressionStream('gzip'));
+  const compressedBytes = new Uint8Array(await new Response(compressedStream).arrayBuffer());
+  const compressedBase64 = Buffer.from(compressedBytes).toString('base64');
+  const indexPayload = {
+    version: 2,
+    conversations: [
+      {
+        id: 'compressed-entry',
+        title: 'Compressed conversation',
+        search_text_encoding: 'gzip-base64',
+        search_text_gzip: compressedBase64,
+        search_text_sha256: 'a'.repeat(64),
+      },
+      {
+        id: 'legacy-entry',
+        title: 'Legacy conversation',
+        search_text: 'legacy searchable content',
+      },
+    ],
+  };
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    const value = String(url);
+    calls.push(value);
+    if (!value.endsWith('/contents/archive/index.json')) {
+      throw new Error(`Unexpected test request: ${value}`);
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        encoding: 'base64',
+        content: Buffer.from(JSON.stringify(indexPayload), 'utf8').toString('base64'),
+      }),
+    };
+  });
+
+  const result = await readIndex({ owner: 'example', repo: 'archive', token: 'test-token' });
+  assert.equal(result.conversations[0].search_text, searchText);
+  assert.equal(result.conversations[1].search_text, 'legacy searchable content');
+  assert.equal(result.conversations[0].search_text_gzip, undefined, 'compressed payload should not remain in the UI search model');
+  assert.equal(result.conversations[0].search_text_encoding, undefined);
+  assert.equal(calls.length, 1, 'search data should be decoded from the single index request');
 });
