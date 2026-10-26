@@ -197,7 +197,23 @@ function parseMetadata(markdown) {
   }
 }
 
-function splitMessageBlocks(content) {
+// Messages are exported as "## <Role>" sections joined by "---". Message
+// bodies are not escaped, and Claude answers often contain a horizontal rule
+// followed by an ordinary "## Section" heading, so only a heading naming a
+// role the exporter writes starts a new message: "You", the provider (e.g.
+// "Claude"), or a raw lowercase role identifier such as "system" (written for
+// any other sender). Without provider metadata, keep the old rule.
+function roleHeadingMatcher(provider) {
+  const providerName = String(provider || '').trim().toLowerCase();
+  if (!providerName) return () => true;
+  return (line) => {
+    const heading = line.replace(/^## /, '').trim();
+    const name = heading.toLowerCase();
+    return name === 'you' || name === providerName || /^[a-z][a-z0-9_-]*$/.test(heading);
+  };
+}
+
+function splitMessageBlocks(content, isRoleHeading = () => true) {
   const lines = String(content).split('\n');
   const parts = [];
   let current = [];
@@ -227,7 +243,7 @@ function splitMessageBlocks(content) {
     if (line.trim() === '---') {
       let next = i + 1;
       while (next < lines.length && !lines[next].trim()) next += 1;
-      if (next < lines.length && /^## /.test(lines[next])) {
+      if (next < lines.length && /^## /.test(lines[next]) && isRoleHeading(lines[next])) {
         parts.push(current.join('\n'));
         current = [];
         i = next - 1;
@@ -245,7 +261,7 @@ export function parseConversationMarkdown(markdown) {
   const titleMatch = body.match(/^# ([^\n]+)(?:\n\n|\n)/);
   const title = metadata.title || (titleMatch ? titleMatch[1].trim() : 'Untitled conversation');
   const content = titleMatch ? body.slice(titleMatch[0].length) : body;
-  const parts = splitMessageBlocks(content);
+  const parts = splitMessageBlocks(content, roleHeadingMatcher(metadata.provider));
   const messages = [];
   for (const part of parts) {
     const m = part.match(/^## ([^\n]+)\n(?:\n)?([\s\S]*?)(?:\n)?$/);

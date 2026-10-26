@@ -149,3 +149,71 @@ test('round-trips a generated archive conversation through the web reader parser
     assert.equal(readerResolvedPath, asset.path, 'relative Markdown links must resolve to the exact asset path in index.json');
   }
 });
+
+test('keeps a Claude answer whole when it contains a horizontal rule followed by a heading', () => {
+  const exporter = loadExporter();
+  const answer = [
+    'Here is the overview.',
+    '',
+    '---',
+    '',
+    '## Details',
+    '',
+    'The details belong to the same answer.',
+    '',
+    '---',
+    '',
+    '## Summary',
+    '',
+    'So does the summary.',
+  ].join('\n');
+  const conversation = {
+    external_id: 'conversation-rule-heading',
+    title: 'Rules and headings',
+    source_created_at: '2026-10-26T08:00:00.000Z',
+    source_updated_at: '2026-10-26T09:00:00.000Z',
+    message_count: 3,
+    messages: [
+      { external_id: 'u1', role: 'user', content: 'Explain it.', files: [], attachments: [] },
+      { external_id: 'a1', role: 'assistant', content: answer, files: [], attachments: [] },
+      { external_id: 'u2', role: 'user', content: 'Thanks!\n\n---\n\n## My notes\n\nMine too.', files: [], attachments: [] },
+    ],
+    assets: [],
+  };
+  const normalized = exporter.normalizeAssetList(conversation, 'claude', 'personal');
+  const markdown = exporter.conversationMarkdown(conversation, 'claude', 'personal', normalized.byKey, normalized.assets);
+
+  const parsed = parseConversationMarkdown(markdown);
+  assert.deepEqual(parsed.messages.map((message) => [message.role, message.roleName]), [
+    ['user', 'You'],
+    ['assistant', 'Claude'],
+    ['user', 'You'],
+  ]);
+  assert.equal(parsed.messages[1].content, answer);
+  assert.equal(parsed.messages[2].content, 'Thanks!\n\n---\n\n## My notes\n\nMine too.');
+});
+
+test('still separates messages with raw exporter roles when provider metadata is present', () => {
+  const exporter = loadExporter();
+  const conversation = {
+    external_id: 'conversation-raw-role',
+    title: 'Raw role',
+    message_count: 3,
+    messages: [
+      { external_id: 'u1', role: 'user', content: 'Hi', files: [], attachments: [] },
+      // A sender other than human/assistant is exported under its raw role name.
+      { external_id: 's1', role: 'system', content: 'System note', files: [], attachments: [] },
+      { external_id: 'a1', role: 'assistant', content: 'Hello', files: [], attachments: [] },
+    ],
+    assets: [],
+  };
+  const normalized = exporter.normalizeAssetList(conversation, 'claude', 'personal');
+  const markdown = exporter.conversationMarkdown(conversation, 'claude', 'personal', normalized.byKey, normalized.assets);
+
+  const parsed = parseConversationMarkdown(markdown);
+  assert.deepEqual(parsed.messages.map((message) => [message.role, message.content]), [
+    ['user', 'Hi'],
+    ['system', 'System note'],
+    ['assistant', 'Hello'],
+  ]);
+});

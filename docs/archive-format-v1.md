@@ -72,7 +72,13 @@ Rules:
 
 1. The metadata block is machine-readable JSON.
 2. The first H1 is the human-readable title fallback.
-3. Messages are separated by `---` and start with an H2 role heading.
+3. Messages are separated by `---` and start with an H2 role heading. Message
+   bodies are not escaped, so readers only treat `---` followed by an H2 as a
+   message boundary when the H2 names a role the exporter writes: `You`, the
+   provider's display name (e.g. `Claude`), or a raw lowercase role identifier
+   (e.g. `system`). A `---` followed by an ordinary heading such as
+   `## Details` belongs to the message body. Files without provider metadata
+   fall back to treating every H2 after `---` as a role heading.
 4. `You` maps to the normalized `user` role.
 5. The provider's own role name maps to normalized `assistant`.
 6. Unknown role headings must be preserved rather than discarded.
