@@ -1361,3 +1361,24 @@ test('forwards a cancel to the Claude tab that is fetching, even from another ta
   idle.send({ type: 'cancelSync' });
   assert.equal(idle.tabMessages.length, 0);
 });
+
+test('reports archived conversations that a full sync did not receive from Claude', async () => {
+  const archived = (id, account = 'personal') => ({
+    id, provider: 'claude', account, path: `archive/conversations/claude/${account}/${id}.md`, assets: [],
+    title: id, updated_at: '2026-10-01T00:00:00Z', message_count: 1, format_version: 4,
+  });
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [
+    archived('conversation-123456'), archived('deleted-or-unlisted'), archived('other-account', 'work'),
+  ] });
+
+  const full = makeBackgroundSyncHarness({ indexText });
+  const fullProgress = [];
+  await full.sync(sampleConversation(), (event) => fullProgress.push(event), [], { fullList: true });
+  assert.match(fullProgress.find((event) => event.stage === 'done').message,
+    / 1 archived conversation was not returned by Claude\.ai in this full sync \(deleted there, or Claude's list was incomplete\); its archived copy was kept\.$/);
+
+  const partial = makeBackgroundSyncHarness({ indexText });
+  const partialProgress = [];
+  await partial.sync(sampleConversation(), (event) => partialProgress.push(event), [], { fullList: false });
+  assert.doesNotMatch(partialProgress.find((event) => event.stage === 'done').message, /not returned by Claude/);
+});

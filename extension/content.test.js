@@ -2188,6 +2188,7 @@ test('automatically syncs the latest conversations when Claude opens and auto sy
 
   const handoff = await harness.firstHandoff;
   assert.equal(handoff.conversations.length, 20, 'auto sync is limited to the latest 20 conversations');
+  assert.equal(handoff.fullList, false, 'a limited sync is not a full list');
   assert.equal(handoff.conversations[0].external_id, 'conversation-0');
   assert.equal(typeof harness.storageState.auto_sync_last_started_at, 'number');
   harness.finishFirstHandoff({ ok: true });
@@ -2228,6 +2229,7 @@ test('skips a conversation that cannot be exported and still syncs the others', 
   const handoff = await harness.firstHandoff;
 
   assert.deepEqual(JSON.parse(JSON.stringify(handoff.conversations.map((c) => c.external_id))), ['conversation-a', 'conversation-c']);
+  assert.equal(handoff.fullList, true, 'an "all" sync tells the background the list was complete');
   assert.equal(handoff.skipped.length, 1);
   assert.equal(handoff.skipped[0].id, 'conversation-broken');
   assert.equal(handoff.skipped[0].title, 'Broken one');
