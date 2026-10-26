@@ -28,6 +28,7 @@ function createHarness(conversation, {
   assetResponses = {},
   downloadDelayMs = 0,
   sandboxDownloadDelayMs = 0,
+  assetDownloadConcurrency = 3,
 } = {}) {
   const listeners = [];
   const requests = [];
@@ -137,7 +138,11 @@ function createHarness(conversation, {
     throw new Error(`Unexpected request in test: ${url}`);
   };
 
-  vm.runInNewContext(contentSource, {
+  const harnessSource = contentSource.replace(
+    'const ASSET_DOWNLOAD_CONCURRENCY = 3;',
+    `const ASSET_DOWNLOAD_CONCURRENCY = ${assetDownloadConcurrency};`,
+  );
+  vm.runInNewContext(harnessSource, {
     chrome,
     fetch,
     AbortController,
@@ -605,4 +610,73 @@ test('stops scheduling sandbox downloads after a failure and never hands off a p
   const downloadRequests = harness.requests.filter((url) => url.includes('/wiggle/download-file?path='));
   assert.equal(downloadRequests.length, 3, 'no further downloads should be scheduled after the first failure');
   assert.ok(harness.metrics().maxActiveDownloads <= 3, 'failed downloads must respect the concurrency limit');
+});
+
+
+
+test('benchmark: bounded asset downloads against sequential baseline at multiple archive sizes', async (t) => {
+  const delayMs = 12;
+  const sizes = [6, 24, 48];
+  const measurements = [];
+
+  async function measureDownloadRun(fileCount, concurrency) {
+    const sandboxFiles = Array.from({ length: fileCount }, (_, index) => ({
+      path: `benchmark/file-${index + 1}.txt`,
+      content_type: 'text/plain',
+    }));
+    const sandboxContents = Object.fromEntries(sandboxFiles.map((file, index) => [
+      file.path,
+      `synthetic benchmark payload ${index + 1}`,
+    ]));
+    const conversation = {
+      uuid: 'conversation-1',
+      name: 'Synthetic download benchmark',
+      current_leaf_message_uuid: 'user-message',
+      chat_messages: [{
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Synthetic performance test only.' }],
+      }],
+    };
+    const harness = createHarness(conversation, {
+      sandboxFiles,
+      sandboxContents,
+      sandboxDownloadDelayMs: delayMs,
+      assetDownloadConcurrency: concurrency,
+    });
+
+    const start = performance.now();
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const handoff = await harness.firstHandoff;
+    const elapsedMs = performance.now() - start;
+
+    assert.equal(handoff.conversations[0].assets.length, fileCount);
+    harness.finishFirstHandoff({ ok: true });
+    return elapsedMs;
+  }
+
+  for (const fileCount of sizes) {
+    // Both runs execute the same content script and simulated per-file latency;
+    // only the configured concurrency differs between the two measurements.
+    const sequentialMs = await measureDownloadRun(fileCount, 1);
+    const concurrentMs = await measureDownloadRun(fileCount, 3);
+    const speedup = sequentialMs / concurrentMs;
+    measurements.push({
+      files: fileCount,
+      sequentialMs: Number(sequentialMs.toFixed(1)),
+      concurrentMs: Number(concurrentMs.toFixed(1)),
+      speedup: Number(speedup.toFixed(2)),
+    });
+
+    if (fileCount >= 24) {
+      assert.ok(
+        speedup >= 1.5,
+        `expected at least 1.5x speedup for ${fileCount} files; got ${speedup.toFixed(2)}x (sequential ${sequentialMs.toFixed(1)}ms, concurrent ${concurrentMs.toFixed(1)}ms)`,
+      );
+    }
+  }
+
+  t.diagnostic('Synthetic asset download benchmark (lower time is better; simulated network latency only):');
+  t.diagnostic(JSON.stringify(measurements));
 });
