@@ -101,7 +101,9 @@
     return `### Claude tool: ${name}\n\n${fence(serialized, 'json')}`;
   }
 
-  function stringifyContentBlock(value) {
+  // `archivedSources` holds base64 source objects whose bytes are archived
+  // separately as message attachments, so the note can say where they went.
+  function stringifyContentBlock(value, archivedSources = null) {
     try {
       return JSON.stringify(value, function (key, item) {
         // Avoid embedding base64 media data or other large inline payloads into
@@ -109,7 +111,9 @@
         const base64Data = key === 'data' && this?.type === 'base64';
         if (typeof item === 'string' && /^(data|base64|bytes)$/i.test(key)
           && (item.length > 256 || base64Data)) {
-          return `[omitted inline payload: ${item.length} characters]`;
+          return archivedSources?.has(this)
+            ? `[omitted inline payload: ${item.length} characters; archived as a message attachment]`
+            : `[omitted inline payload: ${item.length} characters]`;
         }
         return item;
       }, 2);
@@ -118,13 +122,38 @@
     }
   }
 
-  function renderToolResult(block) {
+  // Base64 media inside a tool result (screenshots, generated charts) stays
+  // redacted in the fenced result but is archived as an attachment of the
+  // message. Payloads that do not decode keep the plain redaction note.
+  function collectToolResultMedia(value, inline, archivedSources) {
+    if (Array.isArray(value)) {
+      for (const item of value) collectToolResultMedia(item, inline, archivedSources);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (value.source?.type === 'base64' && typeof value.source.data === 'string') {
+      try {
+        base64ToBytes(value.source.data);
+        inline.attachments.push(value);
+        archivedSources.add(value.source);
+      } catch {
+        // Leave it redacted; a malformed tool payload must not stop the sync.
+      }
+    }
+    if (Array.isArray(value.content)) collectToolResultMedia(value.content, inline, archivedSources);
+  }
+
+  function renderToolResult(block, inline) {
     const parts = Array.isArray(block.content) ? block.content : [block.content];
+    const archivedSources = new Set();
     const text = parts.map((x) => {
       if (typeof x === 'string') return x;
       if (x?.type === 'text' && typeof x.text === 'string') return x.text;
       if (typeof x?.text === 'string') return x.text;
-      if (x && typeof x === 'object') return stringifyContentBlock(x);
+      if (x && typeof x === 'object') {
+        collectToolResultMedia(x, inline, archivedSources);
+        return stringifyContentBlock(x, archivedSources);
+      }
       return '';
     }).filter(Boolean).join('\n');
     if (!text) return '';
@@ -222,7 +251,20 @@
     return `Sources:\n${lines.join('\n')}`;
   }
 
-  function renderContentBlocks(blocks, inlineImageState = { index: 0 }) {
+  // A random per-conversation nonce generated after the Claude payload was
+  // fetched, so no message text, tool output, or citation can contain a
+  // marker that the Markdown renderer would mistake for an inline image.
+  function createInlineMarkerNonce() {
+    return [...crypto.getRandomValues(new Uint8Array(16))]
+      .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  // `inline.blocks` receives each inline base64 block (images, audio, video,
+  // documents) in the order its marker is emitted, so a marker's index is by
+  // construction its position in the list that collectMessageAssets
+  // materializes. A separate traversal would drift whenever the two disagree
+  // about which nested content is rendered.
+  function renderContentBlocks(blocks, inline = { nonce: createInlineMarkerNonce(), blocks: [], attachments: [] }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -233,15 +275,23 @@
         return [block.text || '', renderTextBlockCitations(block.citations)].filter(Boolean).join('\n\n');
       }
       if (block.type === 'tool_use') return renderToolUse(block);
-      if (block.type === 'tool_result') return renderToolResult(block);
-      if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
-        const index = inlineImageState.index++;
-        return `[[AI_ARCHIVE_INLINE_IMAGE:${index}]]`;
+      if (block.type === 'tool_result') return renderToolResult(block, inline);
+      // Any block carrying its bytes as a base64 source is archived as a file
+      // and replaced by a marker, so payloads never enter the Markdown.
+      if (block.source?.type === 'base64' && typeof block.source.data === 'string') {
+        inline.blocks.push(block);
+        return `[[AI_ARCHIVE_INLINE_ASSET:${inline.nonce}:${inline.blocks.length - 1}]]`;
       }
-      // Preserve common plain-text shapes directly for readability.
-      if (typeof block.text === 'string') return block.text;
+      // Preserve common plain-text shapes directly for readability. A block
+      // may carry both a text field and nested content (for example a
+      // document with embedded images); render both rather than dropping
+      // the nested blocks.
+      if (typeof block.text === 'string') {
+        const nested = Array.isArray(block.content) ? renderContentBlocks(block.content, inline) : '';
+        return [block.text, nested].filter(Boolean).join('\n\n');
+      }
       if (typeof block.content === 'string') return block.content;
-      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inlineImageState);
+      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inline);
       // Unknown/non-text blocks used to disappear silently. Preserve their type
       // and metadata so citations, media markers, and future block types remain
       // visible to the reader rather than making the transcript look complete.
@@ -277,28 +327,10 @@
     try {
       binary = atob(normalized);
     } catch {
-      throw new Error('Claude returned an invalid base64 image content block.');
+      throw new Error('Claude returned an invalid base64 inline content block. Sync stopped before anything was sent to GitHub.');
     }
-    if (!binary.length) throw new Error('Claude returned an empty base64 image content block.');
+    if (!binary.length) throw new Error('Claude returned an empty base64 inline content block. Sync stopped before anything was sent to GitHub.');
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  }
-
-  function collectInlineImageBlocks(value, result = []) {
-    if (Array.isArray(value)) {
-      for (const item of value) collectInlineImageBlocks(item, result);
-      return result;
-    }
-    if (!value || typeof value !== 'object') return result;
-    // These block types are rendered as fenced tool input/results, not as
-    // inline message content, so their nested images must not receive markers
-    // that the Markdown renderer cannot resolve in their original position.
-    if (value.type === 'tool_result' || value.type === 'tool_use') return result;
-    if (value.type === 'image' && value.source?.type === 'base64'
-      && typeof value.source.data === 'string') {
-      result.push(value);
-    }
-    if (Array.isArray(value.content)) collectInlineImageBlocks(value.content, result);
-    return result;
   }
 
   async function sha256Bytes(buffer) {
@@ -449,7 +481,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map()) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -601,10 +633,10 @@
       }
     }
 
-    // Inline base64 image blocks are sometimes present in Claude's message
-    // content without a corresponding message.files entry. Materialize those
-    // bytes as normal assets so the Markdown renderer can link/embed them.
-    const imageExtensions = {
+    // Inline base64 blocks are sometimes present in Claude's message content
+    // without a corresponding message.files entry. Materialize those bytes as
+    // normal assets so the Markdown renderer can embed images and link the rest.
+    const inlineExtensions = {
       'image/avif': 'avif',
       'image/bmp': 'bmp',
       'image/gif': 'gif',
@@ -612,12 +644,31 @@
       'image/png': 'png',
       'image/svg+xml': 'svg',
       'image/webp': 'webp',
+      'audio/aac': 'aac',
+      'audio/flac': 'flac',
+      'audio/mp4': 'm4a',
+      'audio/mpeg': 'mp3',
+      'audio/ogg': 'ogg',
+      'audio/wav': 'wav',
+      'audio/webm': 'webm',
+      'video/mp4': 'mp4',
+      'video/ogg': 'ogv',
+      'video/quicktime': 'mov',
+      'video/webm': 'webm',
+      'application/pdf': 'pdf',
     };
     for (const message of messages) {
-      const imageBlocks = collectInlineImageBlocks(message.content);
-      for (let index = 0; index < imageBlocks.length; index++) {
+      // Exactly the blocks renderContentBlocks emitted markers for, in marker
+      // order, followed by tool-result media archived as plain attachments
+      // (index null: no marker, no inline position). Media inside tool input
+      // or thinking blocks is redacted or omitted and is not collected.
+      const inline = inlineByMessage.get(message) || { blocks: [], attachments: [] };
+      const entries = [
+        ...inline.blocks.map((block, index) => ({ block, index })),
+        ...inline.attachments.map((block) => ({ block, index: null })),
+      ];
+      for (const { block, index } of entries) {
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const block = imageBlocks[index];
         const source = block.source;
         const bytes = base64ToBytes(source.data);
         const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -632,27 +683,61 @@
             : (asset.message_external_id ? [asset.message_external_id] : []);
           return messageId && associatedIds.includes(messageId);
         });
-        if (hashes.has(hash)) {
-          if (existingAsset) {
-            const indices = Array.isArray(existingAsset.inline_image_indices) ? existingAsset.inline_image_indices : [];
-            if (!indices.includes(index)) existingAsset.inline_image_indices = [...indices, index];
+        // Marker indices restart in every message, and an asset can be shared
+        // by several messages, so record which message each position belongs to.
+        const addPosition = (asset) => {
+          if (index === null) return;
+          const positions = Array.isArray(asset.inline_positions) ? asset.inline_positions : [];
+          if (!positions.some((position) => position.message_external_id === messageId && position.index === index)) {
+            asset.inline_positions = [...positions, { message_external_id: messageId, index }];
           }
+        };
+        if (hashes.has(hash)) {
+          if (existingAsset) addPosition(existingAsset);
           continue;
         }
 
-        const mime = typeof source.media_type === 'string' && source.media_type.startsWith('image/')
-          ? source.media_type
-          : 'image/png';
-        const extension = imageExtensions[mime] || 'img';
+        // The same inline bytes already archived for another message: link this
+        // message to that file instead of storing a second copy.
+        const sharedInline = messageId && assets.find((asset) =>
+          (asset.source === 'message-content' || asset.source === 'tool-result') && asset.sha256 === hash);
+        if (sharedInline) {
+          const linkedIds = Array.isArray(sharedInline.message_external_ids) && sharedInline.message_external_ids.length
+            ? sharedInline.message_external_ids
+            : [sharedInline.message_external_id];
+          sharedInline.message_external_ids = [...linkedIds, messageId];
+          addPosition(sharedInline);
+          hashes.add(hash);
+          continue;
+        }
+
+        const sourceMime = typeof source.media_type === 'string'
+          ? source.media_type.toLowerCase().split(';')[0].trim()
+          : '';
+        // Image blocks keep their historical PNG fallback and names, so
+        // already-archived inline images keep the same asset paths.
+        const mime = block.type === 'image'
+          ? (sourceMime.startsWith('image/') ? sourceMime : 'image/png')
+          : (sourceMime || 'application/octet-stream');
+        const kind = ['image', 'audio', 'video'].find((prefix) => mime.startsWith(`${prefix}/`)) || 'file';
+        const extension = inlineExtensions[mime] || (kind === 'image' ? 'img' : 'bin');
+        // Non-image blocks such as documents can carry a title; keep it as
+        // the filename rather than losing it with the replaced block.
+        const titled = block.type !== 'image' && typeof block.title === 'string' && block.title.trim()
+          ? safeAssetName(block.title)
+          : null;
+        const name = titled
+          ? (titled.toLowerCase().endsWith(`.${extension}`) ? titled : `${titled}.${extension}`)
+          : `inline-${kind}-${hash.slice(0, 12)}.${extension}`;
         assets.push({
-          name: `inline-image-${hash.slice(0, 12)}.${extension}`,
+          name,
           mime,
           base64: bytesToBase64(buffer),
           size: bytes.byteLength,
           sha256: hash,
-          source: 'message-content',
+          source: index === null ? 'tool-result' : 'message-content',
           message_external_id: messageId,
-          inline_image_indices: [index],
+          ...(index === null ? {} : { inline_positions: [{ message_external_id: messageId, index }] }),
         });
         hashes.add(hash);
       }
@@ -771,10 +856,14 @@
 
   async function normalize(c, org, signal) {
     const raw = selectActiveLineage(c);
+    const inlineMarkerNonce = createInlineMarkerNonce();
+    const inlineByMessage = new Map();
     const messages = raw.map((m, i) => {
+      const inline = { nonce: inlineMarkerNonce, blocks: [], attachments: [] };
       const content = Array.isArray(m.content)
-        ? renderContentBlocks(m.content)
+        ? renderContentBlocks(m.content, inline)
         : (typeof m.text === 'string' ? m.text : '');
+      inlineByMessage.set(m, inline);
       return {
         external_id: m.uuid || m.id || `${i}`,
         role: m.sender === 'human' ? 'user' : m.sender || 'assistant',
@@ -786,7 +875,7 @@
       };
     });
 
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal);
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',
@@ -795,6 +884,7 @@
       source_updated_at: c.updated_at || c.created_at || null,
       message_count: messages.length,
       metadata: { source: 'claude', current_leaf_message_uuid: c.current_leaf_message_uuid || null },
+      inline_marker_nonce: inlineMarkerNonce,
       messages,
       assets,
     };
