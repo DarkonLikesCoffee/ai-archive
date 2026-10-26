@@ -108,20 +108,44 @@
     return `### Tool result: ${name}${block.is_error ? ' (error)' : ''}\n\n${fence(text, 'text')}`;
   }
 
+  function renderUnknownContentBlock(block) {
+    const type = typeof block.type === 'string' && block.type.trim() ? block.type : 'unknown';
+    let serialized;
+    try {
+      serialized = JSON.stringify(block, (key, value) => {
+        // Avoid embedding large inline media payloads into Markdown. The actual
+        // attachment collector handles downloadable files separately; preserve
+        // the block metadata and make any omitted binary payload explicit.
+        if (typeof value === 'string' && value.length > 256 && /^(data|base64|bytes)$/i.test(key)) {
+          return `[omitted inline payload: ${value.length} characters]`;
+        }
+        return value;
+      }, 2);
+    } catch {
+      serialized = String(block);
+    }
+    return `### Claude content block: ${type}\\n\\n${fence(serialized || '{}', 'json')}`;
+  }
+
   function renderContentBlocks(blocks) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
+      // Do not leak private reasoning even if a variant happens to expose a
+      // generic text/content property as well as the usual thinking field.
+      if (block.type === 'thinking') return '';
       if (block.type === 'text') return block.text || '';
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
-      // Preserve quote/reference/citation-like blocks instead of silently dropping them.
+      // Preserve common plain-text shapes directly for readability.
       if (typeof block.text === 'string') return block.text;
       if (typeof block.content === 'string') return block.content;
       if (Array.isArray(block.content)) return renderContentBlocks(block.content);
-      if (block.type === 'thinking' && typeof block.thinking === 'string') return '';
-      return '';
-    }).filter(Boolean).join('\n\n');
+      // Unknown/non-text blocks used to disappear silently. Preserve their type
+      // and metadata so citations, media markers, and future block types remain
+      // visible to the reader rather than making the transcript look complete.
+      return renderUnknownContentBlock(block);
+    }).filter(Boolean).join('\\n\\n');
   }
 
   function safeAssetName(name, fallback = 'file') {
