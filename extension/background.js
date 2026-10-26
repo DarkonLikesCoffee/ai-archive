@@ -570,7 +570,17 @@ function onProgressSafe(payload) {
   activeProgressCallback?.(payload);
 }
 
-async function sync(conversations, onProgress) {
+// Conversations the content script could not export are left out of the
+// sync (their archived copies are untouched); say so in every completion.
+function skippedSummary(skipped) {
+  if (!Array.isArray(skipped) || !skipped.length) return '';
+  const listed = skipped.slice(0, 3).map((item) => `"${item.title || item.id}" (${String(item.error || 'unknown error').slice(0, 160)})`);
+  const more = skipped.length > 3 ? `; and ${skipped.length - 3} more` : '';
+  return ` ${skipped.length} conversation${skipped.length === 1 ? '' : 's'} could not be exported and ${skipped.length === 1 ? 'was' : 'were'} left unchanged in the archive: ${listed.join('; ')}${more}. Sync again later to retry ${skipped.length === 1 ? 'it' : 'them'}.`;
+}
+
+async function sync(conversations, onProgress, skipped = []) {
+  const skippedNote = skippedSummary(skipped);
   syncRunning = true;
   cancelRequested = false;
   syncAbortController = new AbortController();
@@ -782,13 +792,13 @@ async function sync(conversations, onProgress) {
     }
 
     if (changedConversations === 0 && !indexNeedsUpdate && ref) {
-      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: 'Everything is already up to date. No GitHub commit was needed.' });
-      return { total, changed: 0, commit: null };
+      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: `Everything is already up to date. No GitHub commit was needed.${skippedNote}` });
+      return { total, changed: 0, commit: null, skipped: skipped.length };
     }
 
-    const completionMessage = changedConversations === 0
+    const completionMessage = (changedConversations === 0
       ? 'Sync complete: the search cache was compacted; no conversation Markdown changed in 1 GitHub commit.'
-      : `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`;
+      : `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`) + skippedNote;
 
     const treeEntries = new Array(changes.length);
     const uploadTotal = changes.filter((x) => !x.delete).length + 1;
@@ -888,7 +898,7 @@ async function sync(conversations, onProgress) {
           commit: commit.sha,
           message: `${completionMessage} The response to the final update was interrupted, but GitHub confirms the commit is published.`,
         });
-        return { total, changed: changedConversations, commit: commit.sha };
+        return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length };
       }
 
       if (baseCommit && observedRef?.object?.sha === baseCommit.sha) {
@@ -905,7 +915,7 @@ async function sync(conversations, onProgress) {
     }
 
     onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: completionMessage });
-    return { total, changed: changedConversations, commit: commit.sha };
+    return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length };
   } finally {
     syncRunning = false;
     syncAbortController = null;
@@ -935,7 +945,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
 
-    sync(msg.conversations, broadcast)
+    sync(msg.conversations, broadcast, Array.isArray(msg.skipped) ? msg.skipped : [])
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((e) => {
         if (e.name === 'AbortError' || e.message === '__SYNC_CANCELLED__') {

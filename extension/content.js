@@ -937,13 +937,31 @@
       sendProgress({ stage: 'fetching', current: 0, total, selected: limit });
 
       const conversations = [];
+      // One conversation that cannot be exported safely (a malformed payload, an
+      // attachment that will not download) must not block every other
+      // conversation. It is left out of this sync, so its archived copy stays
+      // exactly as it was, and the completion message names it. Cancellation
+      // still stops everything, and if nothing could be exported the sync fails.
+      const skipped = [];
+      let firstExportError = null;
       for (let i = 0; i < selected.length; i++) {
         if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const conversation = await normalize(await full(org, selected[i].uuid, signal), org, signal);
-        if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        conversations.push(conversation);
+        try {
+          const conversation = await normalize(await full(org, selected[i].uuid, signal), org, signal);
+          if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+          conversations.push(conversation);
+        } catch (e) {
+          if (e?.name === 'AbortError' || signal.aborted) throw e;
+          firstExportError ??= e;
+          skipped.push({
+            id: selected[i].uuid,
+            title: selected[i].name || selected[i].uuid,
+            error: String(e?.message || e),
+          });
+        }
         sendProgress({ stage: 'fetching', current: i + 1, total, selected: limit });
       }
+      if (!conversations.length && firstExportError) throw firstExportError;
 
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
       sendProgress({ stage: 'preparing', current: 0, total, selected: limit });
@@ -954,7 +972,7 @@
       // finished; otherwise another startSync message can trigger a second fetch
       // while the first batch is still being committed to GitHub.
       const result = await new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations }, (response) => {
+        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations, skipped }, (response) => {
           if (chrome.runtime.lastError) {
             reject(Error(chrome.runtime.lastError.message));
             return;
