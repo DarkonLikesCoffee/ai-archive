@@ -278,6 +278,17 @@ function attachmentAssetForMessage(message, descriptor, name, assetMap, matchedA
   return null;
 }
 
+// Inline image marker indices restart in every message, and one asset can be
+// shared by several messages, so positions are only meaningful together with
+// the message they were recorded for.
+function inlineImageIndicesForMessage(asset, message) {
+  const messageId = message?.external_id || message?.uuid || message?.id || null;
+  if (!messageId || !Array.isArray(asset?.inline_image_positions)) return [];
+  return asset.inline_image_positions
+    .filter((position) => position?.message_external_id === messageId)
+    .map((position) => position.index);
+}
+
 function attachmentMarkdown(message, assetMap, allAssets) {
   const parts = [];
   const assets = findMessageAssets(message, allAssets);
@@ -285,8 +296,9 @@ function attachmentMarkdown(message, assetMap, allAssets) {
 
   const addAsset = (asset) => {
     // Inline content-block images are rendered at their original position in
-    // the message body, so do not repeat them in the trailing attachment list.
-    if (!asset || used.has(asset.path) || (Array.isArray(asset.inline_image_indices) && asset.inline_image_indices.length)) return;
+    // this message body, so do not repeat them in its trailing attachment list.
+    // Other messages sharing the asset still list it as a normal attachment.
+    if (!asset || used.has(asset.path) || inlineImageIndicesForMessage(asset, message).length) return;
     used.add(asset.path);
     parts.push(assetMarkdown(asset, asset.path));
   };
@@ -350,8 +362,7 @@ function conversationMarkdown(c, provider, account, assetMap, allAssets) {
     const content = String(m.content || '').replace(/\[\[AI_ARCHIVE_INLINE_IMAGE:(\d+)\]\]/g, (marker, rawIndex) => {
       const imageIndex = Number(rawIndex);
       const image = allAssets.find((asset) =>
-        Array.isArray(asset.inline_image_indices)
-        && asset.inline_image_indices.includes(imageIndex)
+        inlineImageIndicesForMessage(asset, m).includes(imageIndex)
         && assetMatchesMessage(asset, m, allAssets)
       );
       return image ? assetMarkdown(image, image.path) : marker;

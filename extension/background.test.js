@@ -923,7 +923,7 @@ test('renders inline image markers at their original message position without du
     mime: 'image/png',
     source: 'message-content',
     message_external_id: 'assistant-message',
-    inline_image_indices: [0],
+    inline_image_positions: [{ message_external_id: 'assistant-message', index: 0 }],
     path: 'archive/conversations/claude/personal/assets/conversation/image.png',
     sha256: 'a'.repeat(64),
     size: 12,
@@ -1016,4 +1016,73 @@ test('escapes HTML and Markdown formatting characters in attachment labels', () 
   assert.equal(markdown.includes('**unsafe**'), false);
   assert.ok(markdown.includes('&lt;img src=x onerror=alert\\(1\\)&gt;'));
   assert.match(markdown, /&amp; notes\.txt/);
+});
+
+
+test('keeps inline image positions of a shared asset scoped to their own message', () => {
+  const { conversationMarkdown } = loadBackgroundAssetHelpers();
+  // A file attached to two messages and inlined only in the second one,
+  // plus a different inline image in the first message at the same index.
+  const sharedAsset = {
+    name: 'shared.png',
+    mime: 'image/png',
+    source: 'message',
+    file_uuid: 'shared-file-id',
+    message_external_id: 'first-user-message',
+    message_external_ids: ['first-user-message', 'second-user-message'],
+    inline_image_positions: [{ message_external_id: 'second-user-message', index: 0 }],
+    path: 'archive/conversations/claude/personal/assets/conversation/aaaaaaaa-shared.png',
+    sha256: 'a'.repeat(64),
+    size: 6,
+  };
+  const ownInlineAsset = {
+    name: 'inline-image-bbbbbbbbbbbb.png',
+    mime: 'image/png',
+    source: 'message-content',
+    message_external_id: 'first-user-message',
+    inline_image_positions: [{ message_external_id: 'first-user-message', index: 0 }],
+    path: 'archive/conversations/claude/personal/assets/conversation/bbbbbbbb-inline-image-bbbbbbbbbbbb.png',
+    sha256: 'b'.repeat(64),
+    size: 3,
+  };
+  const sharedFile = { file_uuid: 'shared-file-id', file_name: 'shared.png' };
+  const messages = [
+    {
+      external_id: 'first-user-message',
+      role: 'user',
+      content: 'First upload. [[AI_ARCHIVE_INLINE_IMAGE:0]]',
+      files: [sharedFile],
+      attachments: [],
+      metadata: {},
+    },
+    {
+      external_id: 'second-user-message',
+      role: 'user',
+      content: 'Same image again. [[AI_ARCHIVE_INLINE_IMAGE:0]]',
+      files: [sharedFile],
+      attachments: [],
+      metadata: {},
+    },
+  ];
+  const allAssets = [sharedAsset, ownInlineAsset];
+  const assetMap = new Map([['id:shared-file-id', sharedAsset]]);
+  const markdown = conversationMarkdown({
+    external_id: 'conversation-shared-inline',
+    title: 'Shared inline image',
+    messages,
+    message_count: 2,
+  }, 'claude', 'personal', assetMap, allAssets);
+  const [first, second] = markdown.split('\n---\n');
+  const sharedLink = '![shared.png](assets/conversation/aaaaaaaa-shared.png)';
+  const ownLink = '![inline-image-bbbbbbbbbbbb.png](assets/conversation/bbbbbbbb-inline-image-bbbbbbbbbbbb.png)';
+
+  assert.equal(markdown.includes('AI_ARCHIVE_INLINE_IMAGE'), false, 'every marker must be resolved');
+  assert.ok(first.includes(ownLink), 'the first message marker must resolve to its own inline image');
+  assert.equal(first.split(sharedLink).length - 1, 1,
+    'the first message must still list the shared file it was sent with');
+  assert.ok(first.indexOf(sharedLink) < first.indexOf('First upload.'), 'user attachments precede the text');
+  assert.equal(second.includes(ownLink), false);
+  assert.equal(second.split(sharedLink).length - 1, 1,
+    'the second message shows the shared image inline once, not again as an attachment');
+  assert.ok(second.indexOf('Same image again.') < second.indexOf(sharedLink));
 });

@@ -627,8 +627,13 @@
         });
         if (hashes.has(hash)) {
           if (existingAsset) {
-            const indices = Array.isArray(existingAsset.inline_image_indices) ? existingAsset.inline_image_indices : [];
-            if (!indices.includes(index)) existingAsset.inline_image_indices = [...indices, index];
+            // Marker indices restart in every message, and a downloaded file can
+            // be shared by several messages, so record which message each
+            // position belongs to rather than a bare index.
+            const positions = Array.isArray(existingAsset.inline_image_positions) ? existingAsset.inline_image_positions : [];
+            if (!positions.some((position) => position.message_external_id === messageId && position.index === index)) {
+              existingAsset.inline_image_positions = [...positions, { message_external_id: messageId, index }];
+            }
           }
           continue;
         }
@@ -645,7 +650,7 @@
           sha256: hash,
           source: 'message-content',
           message_external_id: messageId,
-          inline_image_indices: [index],
+          inline_image_positions: [{ message_external_id: messageId, index }],
         });
         hashes.add(hash);
       }

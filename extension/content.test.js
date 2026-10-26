@@ -1692,3 +1692,62 @@ test('renders plain text blocks without citations unchanged', async () => {
   assert.equal(handoff.conversations[0].messages[1].content, 'Hello.\n\nAgain.');
   harness.finishFirstHandoff({ ok: true });
 });
+
+test('scopes inline image positions to the message that contains them', async () => {
+  const sharedBytes = 'shared image bytes';
+  const assetUrl = 'https://assets.example/shared.png';
+  const sharedFile = {
+    file_uuid: 'shared-file-id',
+    file_name: 'shared.png',
+    preview_url: assetUrl,
+    mime_type: 'image/png',
+  };
+  const conversation = {
+    uuid: 'conversation-shared-inline-image',
+    name: 'Shared file inlined later',
+    current_leaf_message_uuid: 'second-user-message',
+    chat_messages: [
+      {
+        uuid: 'first-user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'First upload.' }],
+        files: [sharedFile],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'first-user-message',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'Received.' }],
+      },
+      {
+        uuid: 'second-user-message',
+        parent_message_uuid: 'assistant-message',
+        sender: 'human',
+        content: [
+          { type: 'text', text: 'Same image again.' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: btoa(sharedBytes) } },
+        ],
+        files: [sharedFile],
+      },
+    ],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: { [assetUrl]: { content: sharedBytes, contentType: 'image/png' } },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+
+  assert.equal(assets.length, 1, 'the inline copy should reuse the shared file asset');
+  assert.deepEqual(JSON.parse(JSON.stringify(assets[0].message_external_ids)), ['first-user-message', 'second-user-message']);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(assets[0].inline_image_positions)),
+    [{ message_external_id: 'second-user-message', index: 0 }],
+    'the inline position belongs only to the message whose content contains the image',
+  );
+  assert.equal('inline_image_indices' in assets[0], false);
+
+  harness.finishFirstHandoff({ ok: true });
+});
