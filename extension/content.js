@@ -271,23 +271,52 @@
     const raw = Array.isArray(data?.chat_messages) ? data.chat_messages : (Array.isArray(data?.messages) ? data.messages : []);
     const leaf = data?.current_leaf_message_uuid;
     if (!leaf) return raw;
-    const byId = new Map(raw.filter((m) => m?.uuid).map((m) => [m.uuid, m]));
+
+    const conversationLabel = String(data?.name || data?.uuid || 'Untitled conversation');
+    const byId = new Map();
+    for (const message of raw) {
+      if (!message?.uuid) continue;
+      if (byId.has(message.uuid)) {
+        throw new Error(
+          `Cannot safely export Claude conversation "${conversationLabel}": message UUID "${message.uuid}" appears more than once. No archive changes were submitted to GitHub.`,
+        );
+      }
+      byId.set(message.uuid, message);
+    }
+
     let current = byId.get(leaf);
-    if (!current) return raw;
+    if (!current) {
+      throw new Error(
+        `Cannot safely export Claude conversation "${conversationLabel}": current_leaf_message_uuid "${leaf}" was not found in the retrieved messages. No archive changes were submitted to GitHub.`,
+      );
+    }
 
     const root = '00000000-0000-4000-8000-000000000000';
     const chain = [];
     const seen = new Set();
-    while (current?.uuid && !seen.has(current.uuid)) {
+    while (current) {
+      if (!current.uuid || seen.has(current.uuid)) {
+        throw new Error(
+          `Cannot safely export Claude conversation "${conversationLabel}": the active message lineage contains a cycle or an invalid message ID. No archive changes were submitted to GitHub.`,
+        );
+      }
       seen.add(current.uuid);
       chain.push(current);
+
       const parent = current.parent_message_uuid;
       if (!parent || parent === root) break;
-      current = byId.get(parent);
-      if (!current) break;
+
+      const parentMessage = byId.get(parent);
+      if (!parentMessage) {
+        throw new Error(
+          `Cannot safely export Claude conversation "${conversationLabel}": parent message "${parent}" for message "${current.uuid}" was not found in the retrieved messages. No archive changes were submitted to GitHub.`,
+        );
+      }
+      current = parentMessage;
     }
+
     chain.reverse();
-    return chain.length ? chain : raw;
+    return chain;
   }
 
   async function normalize(c, org, signal) {
