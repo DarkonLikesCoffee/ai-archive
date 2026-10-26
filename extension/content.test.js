@@ -1147,3 +1147,31 @@ test('includes a same-named sandbox file when the exact path is explicitly refer
   );
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+test('refuses detailed Claude payloads without a valid conversation UUID', async () => {
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Payload identity check',
+    current_leaf_message_uuid: 'message-1',
+    chat_messages: [{
+      uuid: 'message-1',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'hello' }],
+    }],
+  };
+
+  for (const [label, response, expected] of [
+    ['missing UUID', { name: 'Payload identity check', chat_messages: conversation.chat_messages }, /without a valid UUID/],
+    ['blank UUID', { ...conversation, uuid: '   ' }, /without a valid UUID/],
+    ['non-string UUID', { ...conversation, uuid: 123 }, /without a valid UUID/],
+  ]) {
+    const harness = createHarness(conversation, { fullConversationResponse: response });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const error = await harness.errorProgress;
+
+    assert.match(error.error, expected, label);
+    assert.equal(harness.handoffs.length, 0, `payload with ${label} must not reach GitHub`);
+  }
+});
