@@ -485,7 +485,8 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
     Promise.all(unique.map(async raw=>{
       for(const candidate of candidates(raw)){
         try{
-          const asset=await readAsset(settings,candidate);
+          const metadata=(selected.assets||[]).find(item=>item?.path===candidate) || null;
+          const asset=await readAsset(settings,candidate,metadata);
           return {raw, candidate, asset};
         }catch{}
       }
