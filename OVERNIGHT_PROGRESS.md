@@ -20,13 +20,15 @@ Last updated: 2026-10-26 (session start of overnight run).
 - [x] Merge #40 (audio/video/documents via shared pipeline) → `2eff073`
 - [x] Merge #44 (cross-message inline dedupe) → `9e9b113`
 - [x] Merge #45 (tool-result media archived as attachments) → `e9dc6ae`
-- [ ] Merge #41 (keep every tool input field) — head `af2204f`, waiting on CI
-- [ ] Merge #42 (redact tool input payloads)
-- [ ] Readable artifact/tool bodies (approved by owner): exporter + reader, backward compatible
+- [x] Merge #41 (keep every tool input field) → `e654726`
+- [x] Merge #42 (redact tool input payloads) → `53ac164`
+- [x] Final master `53ac164` verified: syntax OK, extension 84/84, web 30/30, build OK, e2e probe as expected
+- [x] Readable artifact/tool bodies (approved): PR #46 (`feat/readable-tool-bodies`), extension 85/85, web 33/33, build OK — **open for review, not merged**
 - [ ] Continue fidelity audit; fix concrete bugs with tests
 
 ## Test results (latest)
-- After #45 merge + #41 merge-in: extension 83/83, web 30/30.
+- master `53ac164`: extension 84/84, web 30/30, build OK.
+- PR #46 head: extension 85/85, web 33/33, build OK.
 
 ## Blockers / notes
 - `fix/materialize-inline-audio-video` (no PR) is superseded by #40 and contains a `'\\n\\n'`
