@@ -1537,9 +1537,11 @@ test('escapes hostile citation titles and block types in Markdown', async () => 
   const handoff = await harness.firstHandoff;
   const rendered = handoff.conversations[0].messages[1].content;
 
-  assert.equal(rendered.includes('<img src=x onerror=alert(1)>'), false);
-  assert.equal(rendered.includes('**Open me**'), false);
+  const visibleReference = rendered.split('```json')[0];
+  assert.equal(visibleReference.includes('<img src=x onerror=alert(1)>'), false);
+  assert.equal(visibleReference.includes('**Open me**'), false);
   assert.match(rendered, /Reference: \[&lt;img src=x onerror=alert\(1\)&gt; \\*Open me\\*\]\(<https:\/\/example\.com\/reference>\)/);
+  assert.match(rendered, /"title": "<img src=x onerror=alert\(1\)> \\*Open me\\*"/);
   harness.finishFirstHandoff({ ok: true });
 });
 
@@ -1573,7 +1575,7 @@ test('does not let newline-bearing unknown block types create new Markdown headi
   const rendered = handoff.conversations[0].messages[1].content;
 
   assert.equal(rendered.includes('\n## Injected heading'), false);
-  assert.match(rendered, /Claude content block: future_block \\# Injected heading/);
+  assert.match(rendered, /Claude content block: future_block \\#\\# Injected heading/);
   assert.match(rendered, /Preserve me/);
   harness.finishFirstHandoff({ ok: true });
 });
