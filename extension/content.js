@@ -131,7 +131,7 @@
     return `### Claude content block: ${type}\n\n${fence(serialized || '{}', 'json')}`;
   }
 
-  function renderContentBlocks(blocks) {
+  function renderContentBlocks(blocks, inlineImageState = { index: 0 }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -141,15 +141,19 @@
       if (block.type === 'text') return block.text || '';
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
+      if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
+        const index = inlineImageState.index++;
+        return `[[AI_ARCHIVE_INLINE_IMAGE:${index}]]`;
+      }
       // Preserve common plain-text shapes directly for readability.
       if (typeof block.text === 'string') return block.text;
       if (typeof block.content === 'string') return block.content;
-      if (Array.isArray(block.content)) return renderContentBlocks(block.content);
+      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inlineImageState);
       // Unknown/non-text blocks used to disappear silently. Preserve their type
       // and metadata so citations, media markers, and future block types remain
       // visible to the reader rather than making the transcript look complete.
       return renderUnknownContentBlock(block);
-    }).filter(Boolean).join('\\n\\n');
+    }).filter(Boolean).join('\n\n');
   }
 
   function safeAssetName(name, fallback = 'file') {
@@ -523,7 +527,21 @@
         const hash = await sha256Bytes(buffer);
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
         const hashes = hashesForMessage(message);
-        if (hashes.has(hash)) continue;
+        const messageId = message.uuid || message.id || null;
+        const existingAsset = assets.find((asset) => {
+          if (asset.sha256 !== hash) return false;
+          const associatedIds = Array.isArray(asset.message_external_ids) && asset.message_external_ids.length
+            ? asset.message_external_ids
+            : (asset.message_external_id ? [asset.message_external_id] : []);
+          return messageId && associatedIds.includes(messageId);
+        });
+        if (hashes.has(hash)) {
+          if (existingAsset) {
+            const indices = Array.isArray(existingAsset.inline_image_indices) ? existingAsset.inline_image_indices : [];
+            if (!indices.includes(index)) existingAsset.inline_image_indices = [...indices, index];
+          }
+          continue;
+        }
 
         const mime = typeof source.media_type === 'string' && source.media_type.startsWith('image/')
           ? source.media_type
@@ -536,7 +554,8 @@
           size: bytes.byteLength,
           sha256: hash,
           source: 'message-content',
-          message_external_id: message.uuid || message.id || null,
+          message_external_id: messageId,
+          inline_image_indices: [index],
         });
         hashes.add(hash);
       }
