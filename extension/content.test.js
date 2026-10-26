@@ -243,3 +243,54 @@ test('preserves different sandbox files that share a basename and uses response 
 
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+test('deduplicates extracted attachments by message and content, not filename alone', async () => {
+  const conversation = {
+    uuid: 'conversation-1',
+    name: 'Repeated attachment names test',
+    current_leaf_message_uuid: 'follow-up',
+    chat_messages: [
+      {
+        uuid: 'first-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'First file.' }],
+        attachments: [
+          { file_name: 'notes.txt', extracted_content: 'First version' },
+          { file_name: 'notes.txt', extracted_content: 'First version' },
+          { file_name: 'notes.txt', extracted_content: 'Different version with same name' },
+        ],
+      },
+      {
+        uuid: 'follow-up',
+        parent_message_uuid: 'first-message',
+        sender: 'human',
+        content: [{ type: 'text', text: 'Here is another attachment.' }],
+        attachments: [
+          { file_name: 'notes.txt', extracted_content: 'First version' },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+
+  assert.equal(assets.length, 3, 'only an exact duplicate within the same message should be removed');
+  assert.deepEqual(
+    Array.from(assets, (asset) => [
+      asset.message_external_id,
+      Buffer.from(asset.base64, 'base64').toString('utf8'),
+    ]),
+    [
+      ['first-message', 'First version'],
+      ['first-message', 'Different version with same name'],
+      ['follow-up', 'First version'],
+    ],
+  );
+
+  harness.finishFirstHandoff({ ok: true });
+});
