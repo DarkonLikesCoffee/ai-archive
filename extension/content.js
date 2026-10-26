@@ -974,6 +974,29 @@
     }
   }
 
+  // "Automatically sync when Claude opens": when the user enabled it in the
+  // popup and GitHub is configured, start one sync of the most recently
+  // updated conversations as this page loads. Several Claude tabs or reloads
+  // share one throttle so they do not start a sync each.
+  const AUTO_SYNC_LIMIT = 20;
+  const AUTO_SYNC_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+  async function maybeAutoSync() {
+    let stored;
+    try {
+      stored = await chrome.storage.local.get([
+        'auto_sync', 'auto_sync_last_started_at', 'github_owner', 'github_repo', 'github_token',
+      ]);
+    } catch {
+      return;
+    }
+    if (stored.auto_sync !== true || !stored.github_owner || !stored.github_repo || !stored.github_token) return;
+    const now = Date.now();
+    if (now - Number(stored.auto_sync_last_started_at || 0) < AUTO_SYNC_MIN_INTERVAL_MS) return;
+    await chrome.storage.local.set({ auto_sync_last_started_at: now });
+    runSync(String(AUTO_SYNC_LIMIT));
+  }
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'startSync') {
       runSync(msg.limit || 'all');
@@ -986,4 +1009,5 @@
       return false;
     }
   });
+  maybeAutoSync().catch(() => {});
 })();
