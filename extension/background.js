@@ -387,10 +387,22 @@ async function sync(conversations, onProgress) {
     let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
     const indexFile = ref ? await getFile('archive/index.json', branch) : null;
     if (indexFile?.content) {
-      try { index = JSON.parse(base64DecodeContent(indexFile.content)); } catch { /* rebuild below */ }
+      let parsedIndex;
+      try {
+        parsedIndex = JSON.parse(base64DecodeContent(indexFile.content));
+      } catch {
+        // Never silently replace a corrupt index with a partial one. The index is
+        // the web app's navigation/search catalogue; rebuilding it from a limited
+        // sync could make every unselected conversation disappear from the UI.
+        throw new Error('archive/index.json is invalid JSON. Restore or repair it before syncing; no archive changes were published.');
+      }
+      if (!parsedIndex || !Array.isArray(parsedIndex.conversations)) {
+        throw new Error('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
+      }
+      index = parsedIndex;
     }
 
-    const map = new Map((index.conversations || []).map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
+    const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
     const changes = [];
     let changedConversations = 0;
     const total = conversations.length;
@@ -504,6 +516,15 @@ async function sync(conversations, onProgress) {
     onProgress?.({ stage: 'creating-commit', current: 1, total: 1, changed: changedConversations });
 
     onProgress?.({ stage: 'finalizing', current: 0, total: 1, changed: changedConversations });
+
+    // The tree and commit were built against baseCommit. If someone else pushed
+    // during this sync, do not try to publish a sibling commit over their update.
+    // The non-force PATCH below remains the final race guard between this check
+    // and the ref update itself.
+    const latestRef = await gh(`/git/ref/heads/${branch}`);
+    if (baseCommit && latestRef?.object?.sha !== baseCommit.sha) {
+      throw new Error('The GitHub branch changed during this sync. Nothing was published; run sync again to include the latest archive.');
+    }
     await gh(`/git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: commit.sha, force: false }) });
     onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.` });
     return { total, changed: changedConversations, commit: commit.sha };
