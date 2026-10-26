@@ -78,9 +78,23 @@ function loadBackgroundAssetHelpers() {
     },
   };
   const sourceWithTestHooks = `${backgroundSource}
-globalThis.__testHooks = { assetMatchesMessage, findMessageAssets };
+globalThis.__testHooks = {
+  assetMatchesMessage,
+  findMessageAssets,
+  assetPath,
+  normalizeAssetList,
+  attachmentMarkdown,
+  conversationMarkdown,
+  conversationPath,
+  indexEntry,
+  sha256,
+};
 `;
-  const context = { chrome, AbortController, fetch: () => new Promise(() => {}) };
+  const context = {
+    chrome, AbortController,
+    fetch: () => new Promise(() => {}),
+    TextEncoder, TextDecoder, Uint8Array, crypto: webcrypto, btoa, atob,
+  };
   vm.runInNewContext(sourceWithTestHooks, context, { filename: 'extension/background.js' });
   assert.equal(listeners.length, 1);
   return context.__testHooks;
@@ -169,7 +183,7 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false }
     const parsed = new URL(url);
     const pathname = parsed.pathname;
     const method = options.method || 'GET';
-    requests.push({ pathname, method });
+    requests.push({ pathname, method, body: options.body ? JSON.parse(options.body) : null });
 
     if (pathname.endsWith('/git/ref/heads/main')) {
       return response({ message: 'Not Found' }, 404);
@@ -208,11 +222,15 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false }
 
   const context = { chrome, fetch, AbortController, TextEncoder, TextDecoder, Uint8Array, crypto: webcrypto, btoa, atob };
   vm.runInNewContext(`${backgroundSource}
-globalThis.__testHooks = { sync };
+globalThis.__testHooks = {
+  sync, assetPath, normalizeAssetList, conversationMarkdown,
+  conversationPath, indexEntry, sha256,
+};
 `, context, { filename: 'extension/background.js' });
 
   return {
     sync: context.__testHooks.sync,
+    hooks: context.__testHooks,
     requests,
   };
 }
@@ -270,4 +288,168 @@ test('does not publish a sync built from a stale branch head', async () => {
     false,
     'a concurrent commit must not be overwritten by this sync',
   );
+});
+
+
+test('same-named message-scoped attachments render against their own messages', () => {
+  const { normalizeAssetList, conversationMarkdown } = loadBackgroundAssetHelpers();
+  const conversation = {
+    external_id: 'conversation-attachment-links',
+    title: 'Same filename links',
+    model: 'test',
+    message_count: 2,
+    messages: [
+      {
+        external_id: 'user-message',
+        role: 'user',
+        content: 'First report',
+        files: [{ file_name: 'report.txt' }],
+        attachments: [],
+      },
+      {
+        external_id: 'assistant-message',
+        role: 'assistant',
+        content: 'Second report',
+        files: [{ file_name: 'report.txt' }],
+        attachments: [],
+      },
+    ],
+    assets: [
+      {
+        name: 'report.txt',
+        mime: 'text/plain',
+        base64: btoa('First report content'),
+        size: 19,
+        sha256: '11111111' + 'a'.repeat(56),
+        source: 'message',
+        message_external_id: 'user-message',
+      },
+      {
+        name: 'report.txt',
+        mime: 'text/plain',
+        base64: btoa('Second report content'),
+        size: 20,
+        sha256: '22222222' + 'b'.repeat(56),
+        source: 'message',
+        message_external_id: 'assistant-message',
+      },
+    ],
+  };
+  const normalized = normalizeAssetList(conversation, 'claude', 'personal');
+  const markdown = conversationMarkdown(conversation, 'claude', 'personal', normalized.byKey, normalized.assets);
+  const firstAsset = normalized.assets.find((asset) => asset.message_external_id === 'user-message');
+  const secondAsset = normalized.assets.find((asset) => asset.message_external_id === 'assistant-message');
+  const firstLink = `[report.txt](assets/${firstAsset.path.split('/assets/').pop()})`;
+  const secondLink = `[report.txt](assets/${secondAsset.path.split('/assets/').pop()})`;
+  const firstSection = markdown.slice(markdown.indexOf('## You'), markdown.indexOf('\n---\n'));
+  const secondSection = markdown.slice(markdown.indexOf('## Claude'));
+
+  assert.ok(firstSection.includes(firstLink), 'the user message should link to its own report');
+  assert.ok(!firstSection.includes(secondLink), 'the user message must not link to another message’s same-named report');
+  assert.ok(secondSection.includes(secondLink), 'the assistant message should link to its own report');
+  assert.ok(!secondSection.includes(firstLink), 'the assistant message must not pick the first global filename match');
+});
+
+test('asset paths distinguish conversation IDs that share the same first eight characters', () => {
+  const { assetPath } = loadBackgroundAssetHelpers();
+  const asset = { name: 'shared.txt', sha256: 'abcd1234' + 'c'.repeat(56) };
+  const first = assetPath({ external_id: 'conversation-alpha' }, asset, 'claude', 'personal', new Set());
+  const second = assetPath({ external_id: 'conversation-beta' }, asset, 'claude', 'personal', new Set());
+
+  assert.notEqual(first, second, 'same-prefixed conversation IDs must not share an asset directory');
+});
+
+async function buildIndexEntry(hooks, conversation) {
+  const provider = 'claude';
+  const account = 'personal';
+  const accountSlug = 'personal';
+  const normalized = hooks.normalizeAssetList(conversation, provider, accountSlug);
+  const path = hooks.conversationPath(conversation, provider, accountSlug);
+  const markdown = hooks.conversationMarkdown(conversation, provider, account, normalized.byKey, normalized.assets);
+  const entry = hooks.indexEntry(conversation, path, provider, account, normalized.assets);
+  entry.content_sha256 = await hooks.sha256(markdown);
+  return { entry, normalized, markdown };
+}
+
+test('removing an attachment deletes its old asset path in the same commit', async () => {
+  const conversation = sampleConversation()[0];
+  const hooks = loadBackgroundAssetHelpers();
+  const previousAsset = {
+    path: 'archive/conversations/claude/personal/assets/conversation-123456/abcd1234-old.txt',
+    sha256: 'abcd1234' + 'd'.repeat(56),
+    size: 10,
+    mime: 'text/plain',
+    name: 'old.txt',
+  };
+  const previous = {
+    id: conversation.external_id,
+    provider: 'claude',
+    account: 'personal',
+    path: hooks.conversationPath(conversation, 'claude', 'personal'),
+    title: conversation.title,
+    model: conversation.model,
+    created_at: conversation.source_created_at,
+    updated_at: conversation.source_updated_at,
+    message_count: conversation.message_count,
+    assets: [previousAsset],
+    format_version: 4,
+    content_sha256: 'previous-content-hash',
+  };
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previous] }),
+  });
+
+  await harness.sync([conversation], () => {});
+  const treeRequest = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST');
+  assert.ok(treeRequest, 'the changed conversation should create a new tree');
+  assert.ok(
+    treeRequest.body.tree.some((entry) => entry.path === previousAsset.path && entry.sha === null),
+    'the removed asset must be deleted in the same commit as the updated Markdown/index',
+  );
+});
+
+test('renaming a conversation updates its Markdown path without deleting a still-referenced asset', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const oldConversation = sampleConversation()[0];
+  oldConversation.title = 'Old conversation title';
+  oldConversation.assets = [{
+    name: 'diagram.png',
+    mime: 'image/png',
+    base64: btoa('image bytes'),
+    size: 11,
+    sha256: 'abcd5678' + 'e'.repeat(56),
+    source: 'message',
+    message_external_id: 'message-1',
+  }];
+  const { entry: previous } = await buildIndexEntry(hooks, oldConversation);
+  const currentConversation = { ...oldConversation, title: 'Renamed conversation' };
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previous] }),
+  });
+
+  await harness.sync([currentConversation], () => {});
+  const treeRequest = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST');
+  assert.ok(treeRequest);
+  const entries = treeRequest.body.tree;
+  const assetPath = previous.assets[0].path;
+  assert.ok(entries.some((entry) => entry.path === previous.path && entry.sha === null), 'old Markdown path must be deleted');
+  assert.ok(entries.some((entry) => entry.path.includes('Renamed-conversation--') && entry.sha), 'new Markdown path must be written');
+  assert.equal(entries.some((entry) => entry.path === assetPath && entry.sha === null), false, 'still-referenced asset must not be deleted');
+  assert.equal(entries.some((entry) => entry.path === assetPath && entry.sha), false, 'unchanged asset should not need another blob upload');
+});
+
+test('re-syncing identical conversation data creates no commit', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const conversation = sampleConversation()[0];
+  const { entry } = await buildIndexEntry(hooks, conversation);
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [entry] }),
+  });
+
+  const result = await harness.sync([conversation], () => {});
+  assert.equal(result.changed, 0);
+  assert.equal(result.commit, null);
+  assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/blobs') && request.method === 'POST'), false);
+  assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST'), false);
+  assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false);
 });
