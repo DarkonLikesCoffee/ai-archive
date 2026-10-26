@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseConversationMarkdown } from './github.js';
+import { parseConversationMarkdown, readAsset } from './github.js';
 
 test('parses canonical metadata, title, and messages', () => {
   const markdown = `<!-- AI_ARCHIVE_METADATA
@@ -187,4 +187,43 @@ Hi
   assert.equal(result.messages.length, 2);
   assert.equal(result.messages[0].content, 'Hello');
   assert.equal(result.messages[1].content, 'Hi');
+});
+
+
+test('uses archived MIME metadata to preview an image whose filename has no recognized extension', async (t) => {
+  const imageBytes = Buffer.from('fake-png-bytes', 'utf8');
+  const imageBase64 = imageBytes.toString('base64');
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    const value = String(url);
+    calls.push(value);
+    const payload = value.endsWith('/contents/archive/conversations/claude/personal/assets/conversation/ab12-diagram')
+      ? {
+          type: 'file',
+          content: '',
+          encoding: 'none',
+          sha: 'image-blob-sha',
+          size: imageBytes.length,
+          content_type: 'application/octet-stream',
+          html_url: 'https://github.com/example/archive/blob/main/image',
+          download_url: null,
+        }
+      : value.endsWith('/git/blobs/image-blob-sha')
+        ? { encoding: 'base64', content: imageBase64 }
+        : null;
+    if (!payload) throw new Error(`Unexpected test request: ${value}`);
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify(payload),
+    };
+  });
+
+  const settings = { owner: 'example', repo: 'archive', token: 'test-token' };
+  const path = 'archive/conversations/claude/personal/assets/conversation/ab12-diagram';
+  const asset = await readAsset(settings, path, { path, name: 'diagram', mime: 'image/png' });
+
+  assert.equal(asset.mime, 'image/png');
+  assert.equal(asset.dataUrl, `data:image/png;base64,${imageBase64}`);
+  assert.equal(calls.length, 2, 'the reader should fetch metadata and the binary blob');
 });
