@@ -70,17 +70,21 @@ export function renderMarkdownWithMarked(markdown, options = {}) {
     return `\n<div class="code-block"><pre><code class="hljs${languageClass}">${html}</code></pre></div>\n`;
   };
 
-  renderer.link = ({ href, title, text }) => {
+  // A regular function so Marked can bind `this.parser`. The raw `text` is
+  // unescaped Markdown source, so it must never be emitted as HTML: render the
+  // label's inline tokens instead, which routes raw HTML through renderer.html.
+  renderer.link = function ({ href, title, text, tokens }) {
     const custom = options.renderLink?.({ href, title, text });
     if (typeof custom === 'string') return custom;
 
+    const label = this.parser.parseInline(tokens);
     const url = safeUrl(href);
-    if (!url) return text;
+    if (!url) return label;
 
     const titleAttribute = title ? ` title="${escapeHtml(title)}"` : '';
     const external = /^https?:\/\//i.test(url);
     const target = external ? ' target="_blank" rel="noopener noreferrer"' : '';
-    return `<a href="${escapeHtml(url)}"${titleAttribute}${target}>${text}</a>`;
+    return `<a href="${escapeHtml(url)}"${titleAttribute}${target}>${label}</a>`;
   };
 
   renderer.image = ({ href, title, text }) => {
