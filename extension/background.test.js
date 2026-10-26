@@ -166,12 +166,15 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
   const chrome = {
     storage: {
       local: {
-        get: async () => ({
-          github_owner: 'example-owner',
-          github_repo: 'example-archive',
-          github_token: 'test-token',
-          archive_account: 'personal',
-        }),
+        get: async () => {
+          settingsReadCount += 1;
+          return {
+            github_owner: 'example-owner',
+            github_repo: 'example-archive',
+            github_token: 'test-token',
+            archive_account: 'personal',
+          };
+        },
       },
     },
     runtime: {
