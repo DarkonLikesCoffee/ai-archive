@@ -276,11 +276,15 @@
     // them with a small concurrency limit while preserving message/file order.
     const directTasks = [];
     const directTasksByKey = new Map();
+    const filesWithoutDownloadUrl = [];
     for (const message of messages) {
       for (const file of (Array.isArray(message.files) ? message.files : [])) {
-        const url = file?.preview_asset?.url || file?.preview_url || file?.document_asset?.url;
-        if (!url) continue;
         const name = file.file_name || file.name || `file-${file.file_uuid || file.uuid || directTasks.length + 1}`;
+        const url = file?.preview_asset?.url || file?.preview_url || file?.document_asset?.url;
+        if (!url) {
+          filesWithoutDownloadUrl.push({ message, file, name });
+          continue;
+        }
         const fileId = file.file_uuid || file.uuid || null;
         const identity = fileId ? `id:${fileId}` : `name:${name}`;
         const key = `${identity}|${url}`;
@@ -392,6 +396,47 @@
           message_external_id: messageId,
         });
         scopedFingerprints.add(fingerprint);
+      }
+    }
+
+    // A listed message file with no URL is not necessarily lost: Claude may
+    // expose its extracted text or include it in the conversation sandbox.
+    // But if neither source yielded a matching asset, failing safely is better
+    // than claiming the conversation was archived completely.
+    for (const { message, file, name } of filesWithoutDownloadUrl) {
+      const messageId = message.uuid || message.id || null;
+      const fileId = file.file_uuid || file.uuid || null;
+      const nameKeys = new Set([
+        String(name || '').toLowerCase(),
+        safeAssetName(name).toLowerCase(),
+      ]);
+      const scopedAssets = assets.filter((asset) => {
+        const associatedIds = Array.isArray(asset.message_external_ids) && asset.message_external_ids.length
+          ? asset.message_external_ids
+          : (asset.message_external_id ? [asset.message_external_id] : []);
+        return messageId && associatedIds.includes(messageId);
+      });
+      const scopedMatch = scopedAssets.some((asset) => {
+        if (fileId && asset.file_uuid) return String(asset.file_uuid) === String(fileId);
+        return nameKeys.has(String(asset.name || '').toLowerCase());
+      });
+
+      const messageData = JSON.stringify(message).toLowerCase();
+      const sandboxCandidates = assets.filter((asset) => {
+        if (asset.source !== 'sandbox') return false;
+        const basename = String(asset.source_path || '').replace(/\\/g, '/').split('/').pop() || asset.name || '';
+        return nameKeys.has(String(asset.name || '').toLowerCase())
+          || nameKeys.has(String(basename).toLowerCase());
+      });
+      const sandboxMatch = sandboxCandidates.some((asset) => {
+        const sourcePath = String(asset.source_path || '').replace(/\\/g, '/').toLowerCase();
+        return (sourcePath && messageData.includes(sourcePath)) || sandboxCandidates.length === 1;
+      });
+
+      if (!scopedMatch && !sandboxMatch) {
+        throw new Error(
+          `Cannot safely export Claude conversation "${conversationId}": attachment "${name}" has no downloadable URL and no matching archiveable file was found. Sync stopped before anything was sent to GitHub; retry or inspect the attachment in Claude.`,
+        );
       }
     }
     return assets;

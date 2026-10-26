@@ -889,3 +889,77 @@ test('associates a single downloaded direct asset with every message that refere
 
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+test('refuses to silently skip a listed message file with no URL or matching archive asset', async () => {
+  const conversation = {
+    uuid: 'conversation-file-without-url',
+    name: 'Missing file URL',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Please archive this attachment.' }],
+      files: [{ file_uuid: 'file-without-url', file_name: 'lost-report.pdf' }],
+    }],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+
+  assert.match(error.error, /attachment "lost-report\.pdf" has no downloadable URL/);
+  assert.match(error.error, /no matching archiveable file was found/);
+  assert.equal(harness.handoffs.length, 0, 'an uncovered attachment must block the archive handoff');
+});
+
+test('accepts a listed message file without a URL when the sandbox contains a unique matching file', async () => {
+  const conversation = {
+    uuid: 'conversation-file-sandbox-fallback',
+    name: 'Sandbox attachment fallback',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Please keep the report.' }],
+      files: [{ file_uuid: 'file-without-url', file_name: 'report.txt' }],
+    }],
+  };
+  const harness = createHarness(conversation, {
+    sandboxFiles: [{ path: 'uploads/report.txt', content_type: 'text/plain' }],
+    sandboxContents: { 'uploads/report.txt': 'Report contents' },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.equal(handoff.conversations[0].assets.length, 1);
+  assert.equal(handoff.conversations[0].assets[0].source_path, 'uploads/report.txt');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('accepts a listed message file without a URL when extracted attachment text is preserved', async () => {
+  const conversation = {
+    uuid: 'conversation-file-extracted-fallback',
+    name: 'Extracted attachment fallback',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [{ type: 'text', text: 'Please keep the notes.' }],
+      files: [{ file_uuid: 'notes-file', file_name: 'notes.txt' }],
+      attachments: [{ file_name: 'notes.txt', extracted_content: 'Notes content' }],
+    }],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.equal(handoff.conversations[0].assets.length, 1);
+  assert.equal(Buffer.from(handoff.conversations[0].assets[0].base64, 'base64').toString('utf8'), 'Notes content');
+  harness.finishFirstHandoff({ ok: true });
+});
