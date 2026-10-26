@@ -76,11 +76,12 @@ function loadBackgroundAssetHelpers() {
       sendMessage() { return Promise.resolve(); },
     },
   };
-  const sourceWithTestHooks = backgroundSource.replace(
-    /\\}\\)\\(\\);\\s*$/,
-    'globalThis.__testHooks = { assetMatchesMessage, findMessageAssets }; })();',
-  );
-  assert.notEqual(sourceWithTestHooks, backgroundSource, 'test hooks must be injected inside the background service worker');
+  const closing = '\\n})();';
+  const closingIndex = backgroundSource.lastIndexOf(closing);
+  assert.notEqual(closingIndex, -1, 'background service worker closing marker must exist');
+  const sourceWithTestHooks = `${backgroundSource.slice(0, closingIndex)}
+  globalThis.__testHooks = { assetMatchesMessage, findMessageAssets };
+})();${backgroundSource.slice(closingIndex + closing.length)}`;
   const context = { chrome, AbortController, fetch: () => new Promise(() => {}) };
   vm.runInNewContext(sourceWithTestHooks, context, { filename: 'extension/background.js' });
   assert.equal(listeners.length, 1);
