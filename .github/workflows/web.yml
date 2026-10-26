@@ -29,7 +29,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
+      - name: Check extension JavaScript syntax
+        run: |
+          node --check ../extension/background.js
+          node --check ../extension/content.js
+          node --check ../extension/popup.js
+
+      - name: Run extension tests
+        run: node --test ../extension/*.test.js
+
+      - name: Run web tests
         run: npm test
 
       - name: Build
