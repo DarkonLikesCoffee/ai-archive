@@ -162,7 +162,15 @@
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
-    const messageScopedFingerprints = new Set();
+    const messageScopedFingerprints = new WeakMap();
+    const fingerprintsForMessage = (message) => {
+      let fingerprints = messageScopedFingerprints.get(message);
+      if (!fingerprints) {
+        fingerprints = new Set();
+        messageScopedFingerprints.set(message, fingerprints);
+      }
+      return fingerprints;
+    };
 
     // First collect the real binary/image assets exposed directly by messages.
     for (const message of messages) {
@@ -179,7 +187,7 @@
           assets.push({ ...asset, source: 'message', file_uuid: file.file_uuid || file.uuid || null, message_external_id: messageId });
           const nameKey = String(asset.name || '').toLowerCase();
           messageAssetFingerprints.add(`${nameKey}|${asset.sha256}`);
-          messageScopedFingerprints.add(`${messageId || ''}|${nameKey}|${asset.sha256}`);
+          fingerprintsForMessage(message).add(`${nameKey}|${asset.sha256}`);
         }
       }
     }
@@ -214,12 +222,13 @@
         const buffer = new TextEncoder().encode(text).buffer;
         const hash = await sha256Bytes(buffer);
         const messageId = message.uuid || message.id || null;
-        const fingerprint = `${messageId || ''}|${nameKey}|${hash}`;
+        const fingerprint = `${nameKey}|${hash}`;
+        const scopedFingerprints = fingerprintsForMessage(message);
 
         // The same extracted file can be exposed both as a real message asset
         // and as extracted text. Deduplicate only within the same message and
         // only when the bytes match; filenames alone are not unique identities.
-        if (messageScopedFingerprints.has(fingerprint)) continue;
+        if (scopedFingerprints.has(fingerprint)) continue;
 
         assets.push({
           name,
@@ -231,7 +240,7 @@
           attachment_name: name,
           message_external_id: messageId,
         });
-        messageScopedFingerprints.add(fingerprint);
+        scopedFingerprints.add(fingerprint);
       }
     }
     return assets;
