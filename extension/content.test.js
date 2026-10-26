@@ -1751,3 +1751,45 @@ test('scopes inline image positions to the message that contains them', async ()
 
   harness.finishFirstHandoff({ ok: true });
 });
+
+test('numbers inline images in the same order the Markdown markers are emitted', async () => {
+  const image = (bytes) => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: btoa(bytes) } });
+  const conversation = {
+    uuid: 'conversation-nested-inline-image',
+    name: 'Nested inline image order',
+    current_leaf_message_uuid: 'user-message',
+    chat_messages: [{
+      uuid: 'user-message',
+      parent_message_uuid: ROOT,
+      sender: 'human',
+      content: [
+        // A text-bearing container whose nested content holds an image.
+        { type: 'document', text: 'Document text.', content: [image('nested image')] },
+        // Private reasoning is never rendered, so its images get no marker.
+        { type: 'thinking', thinking: 'secret', content: [image('thinking image')] },
+        { type: 'text', text: 'Then the second image:' },
+        image('second image'),
+      ],
+    }],
+  };
+  const harness = createHarness(conversation);
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const normalized = handoff.conversations[0];
+  const content = normalized.messages[0].content;
+  const bytesAt = (index) => {
+    const asset = normalized.assets.find((candidate) =>
+      (candidate.inline_image_positions || []).some((position) => position.index === index));
+    return asset ? Buffer.from(asset.base64, 'base64').toString('utf8') : null;
+  };
+
+  assert.equal(content,
+    'Document text.\n\n[[AI_ARCHIVE_INLINE_IMAGE:0]]\n\nThen the second image:\n\n[[AI_ARCHIVE_INLINE_IMAGE:1]]');
+  assert.equal(bytesAt(0), 'nested image', 'marker 0 must resolve to the nested image');
+  assert.equal(bytesAt(1), 'second image', 'marker 1 must resolve to the image after the text');
+  assert.equal(normalized.assets.length, 2, 'images inside thinking blocks are not archived');
+  assert.equal(content.includes('secret'), false);
+
+  harness.finishFirstHandoff({ ok: true });
+});
