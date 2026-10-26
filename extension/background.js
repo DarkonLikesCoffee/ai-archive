@@ -185,10 +185,14 @@ function assetMatchesMessage(asset, message, allAssets = []) {
   if (!asset || !message) return false;
   const messageId = message.external_id || message.uuid || message.id || null;
 
-  // A message ID on a directly collected asset is authoritative. Do not let a
-  // matching basename attach that asset to a different message as well.
-  if (asset.message_external_id && messageId) {
-    return asset.message_external_id === messageId;
+  // Message IDs on a directly collected asset are authoritative. One file can
+  // be referenced from multiple messages; retain all of those associations
+  // without letting a matching basename attach it to unrelated messages.
+  const scopedMessageIds = Array.isArray(asset.message_external_ids) && asset.message_external_ids.length
+    ? asset.message_external_ids
+    : (asset.message_external_id ? [asset.message_external_id] : []);
+  if (scopedMessageIds.length && messageId) {
+    return scopedMessageIds.includes(messageId);
   }
 
   const fileIds = new Set();
