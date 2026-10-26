@@ -1291,3 +1291,15 @@ test('explains authentication, permission, and rate-limit failures without retry
     assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false);
   }
 });
+
+test('names conversations that could not be exported in the completion message', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
+  const progress = [];
+  const skipped = [{ id: 'conversation-broken', title: 'Broken one', error: 'Claude returned an invalid payload' }];
+  const result = await harness.sync(sampleConversation(), (event) => progress.push(event), skipped);
+
+  assert.equal(result.commit, 'new-commit');
+  assert.equal(result.skipped, 1);
+  const done = progress.find((event) => event.stage === 'done');
+  assert.match(done.message, /^Sync complete: 1 conversation changed in 1 GitHub commit\. 1 conversation could not be exported and was left unchanged in the archive: "Broken one" \(Claude returned an invalid payload\)\. Sync again later to retry it\.$/);
+});
