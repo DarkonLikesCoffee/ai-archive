@@ -175,7 +175,7 @@
   }
 
   function base64ToBytes(value) {
-    const normalized = String(value || '').replace(/\\s+/g, '');
+    const normalized = String(value || '').replace(/\s+/g, '');
     let binary;
     try {
       binary = atob(normalized);
