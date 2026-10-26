@@ -168,7 +168,7 @@
     return `${reference}${excerpt}\n\n${fence(serialized || '{}', 'json')}`;
   }
 
-  function renderContentBlocks(blocks, inlineImageState = { index: 0 }) {
+  function renderContentBlocks(blocks, inlineContentState = { imageIndex: 0, mediaIndex: 0 }) {
     if (!Array.isArray(blocks)) return '';
     return blocks.map((block) => {
       if (!block) return '';
@@ -179,18 +179,22 @@
       if (block.type === 'tool_use') return renderToolUse(block);
       if (block.type === 'tool_result') return renderToolResult(block);
       if (block.type === 'image' && block.source?.type === 'base64' && typeof block.source.data === 'string') {
-        const index = inlineImageState.index++;
+        const index = inlineContentState.imageIndex++;
         return `[[AI_ARCHIVE_INLINE_IMAGE:${index}]]`;
+      }
+      if (inlineMediaKind(block)) {
+        const index = inlineContentState.mediaIndex++;
+        return `[[AI_ARCHIVE_INLINE_MEDIA:${index}]]`;
       }
       // Preserve common plain-text shapes directly for readability.
       if (typeof block.text === 'string') return block.text;
       if (typeof block.content === 'string') return block.content;
-      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inlineImageState);
+      if (Array.isArray(block.content)) return renderContentBlocks(block.content, inlineContentState);
       // Unknown/non-text blocks used to disappear silently. Preserve their type
       // and metadata so citations, media markers, and future block types remain
       // visible to the reader rather than making the transcript look complete.
       return renderUnknownContentBlock(block);
-    }).filter(Boolean).join('\n\n');
+    }).filter(Boolean).join('\\n\\n');
   }
 
   function safeAssetName(name, fallback = 'file') {
@@ -225,6 +229,31 @@
     }
     if (!binary.length) throw new Error('Claude returned an empty base64 image content block.');
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  }
+
+  function inlineMediaKind(block) {
+    if (!block || !block.source || block.source.type !== 'base64' || typeof block.source.data !== 'string') return null;
+    if (block.type === 'image') return null;
+    const mediaType = String(block.source.media_type || '').toLowerCase().split(';')[0].trim();
+    if (mediaType.startsWith('audio/')) return 'audio';
+    if (mediaType.startsWith('video/')) return 'video';
+    const type = String(block.type || '').toLowerCase();
+    if (['audio', 'input_audio', 'output_audio'].includes(type)) return 'audio';
+    if (type === 'video') return 'video';
+    return null;
+  }
+
+  function collectInlineMediaBlocks(value, result = []) {
+    if (Array.isArray(value)) {
+      for (const item of value) collectInlineMediaBlocks(item, result);
+      return result;
+    }
+    if (!value || typeof value !== 'object') return result;
+    // Tool input/results are rendered as fenced text, not inline message media.
+    if (value.type === 'tool_result' || value.type === 'tool_use') return result;
+    if (inlineMediaKind(value)) result.push(value);
+    if (Array.isArray(value.content)) collectInlineMediaBlocks(value.content, result);
+    return result;
   }
 
   function collectInlineImageBlocks(value, result = []) {
@@ -545,9 +574,8 @@
       }
     }
 
-    // Inline base64 image blocks are sometimes present in Claude's message
-    // content without a corresponding message.files entry. Materialize those
-    // bytes as normal assets so the Markdown renderer can link/embed them.
+    // Inline base64 image blocks may appear without a corresponding message.files entry.
+    // Materialize them as normal assets so Markdown can embed them in place.
     const imageExtensions = {
       'image/avif': 'avif',
       'image/bmp': 'bmp',
@@ -599,6 +627,65 @@
           inline_image_indices: [index],
         });
         hashes.add(hash);
+      }
+    }
+
+    // Audio/video may also be returned as base64 content blocks rather than as
+    // downloadable message.files. Preserve their bytes as assets and place a
+    // Markdown link at the original position in the message text.
+    const mediaExtensions = {
+      'audio/aac': 'aac',
+      'audio/flac': 'flac',
+      'audio/mp4': 'm4a',
+      'audio/mpeg': 'mp3',
+      'audio/ogg': 'ogg',
+      'audio/wav': 'wav',
+      'audio/webm': 'webm',
+      'video/mp4': 'mp4',
+      'video/ogg': 'ogv',
+      'video/quicktime': 'mov',
+      'video/webm': 'webm',
+    };
+    for (const message of messages) {
+      const mediaBlocks = collectInlineMediaBlocks(message.content);
+      for (let index = 0; index < mediaBlocks.length; index++) {
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        const block = mediaBlocks[index];
+        const source = block.source;
+        const kind = inlineMediaKind(block);
+        const bytes = base64ToBytes(source.data);
+        const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        const hash = await sha256Bytes(buffer);
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        const sourceMime = String(source.media_type || '').toLowerCase().split(';')[0].trim();
+        const mime = sourceMime.startsWith(`${kind}/`) ? sourceMime : 'application/octet-stream';
+        const extension = mediaExtensions[mime] || kind;
+        const messageId = message.uuid || message.id || null;
+        const existingAsset = assets.find((asset) => {
+          if (asset.sha256 !== hash) return false;
+          const assetMime = String(asset.mime || '').toLowerCase().split(';')[0].trim();
+          if (!assetMime.startsWith(`${kind}/`)) return false;
+          const associatedIds = Array.isArray(asset.message_external_ids) && asset.message_external_ids.length
+            ? asset.message_external_ids
+            : (asset.message_external_id ? [asset.message_external_id] : []);
+          return messageId && associatedIds.includes(messageId);
+        });
+        if (existingAsset) {
+          const indices = Array.isArray(existingAsset.inline_media_indices) ? existingAsset.inline_media_indices : [];
+          if (!indices.includes(index)) existingAsset.inline_media_indices = [...indices, index];
+          continue;
+        }
+
+        assets.push({
+          name: `inline-${kind}-${hash.slice(0, 12)}.${extension}`,
+          mime,
+          base64: bytesToBase64(buffer),
+          size: bytes.byteLength,
+          sha256: hash,
+          source: 'message-content',
+          message_external_id: messageId,
+          inline_media_indices: [index],
+        });
       }
     }
 
