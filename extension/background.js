@@ -123,14 +123,18 @@ function assetPath(c, asset, provider, accountSlug, usedPaths) {
   const base = filenameSlug(asset.name || 'file');
   const hash = String(asset.sha256 || '').slice(0, 8) || 'asset';
   let name = `${hash}-${base}`;
-  let path = `archive/conversations/${provider}/${accountSlug}/assets/${String(c.external_id).slice(0, 8)}/${name}`;
+  // Use the full, path-safe conversation ID as the directory identity.
+  // An 8-character prefix can collide across conversations and let one sync
+  // overwrite or delete an asset still referenced by another conversation.
+  const conversationAssetId = filenameSlug(c.external_id || 'unknown').slice(0, 90);
+  let path = `archive/conversations/${provider}/${accountSlug}/assets/${conversationAssetId}/${name}`;
   let n = 2;
   while (usedPaths.has(path)) {
     const dot = base.lastIndexOf('.');
     const stem = dot > 0 ? base.slice(0, dot) : base;
     const ext = dot > 0 ? base.slice(dot) : '';
     name = `${hash}-${stem}-${n}${ext}`;
-    path = `archive/conversations/${provider}/${accountSlug}/assets/${String(c.external_id).slice(0, 8)}/${name}`;
+    path = `archive/conversations/${provider}/${accountSlug}/assets/${conversationAssetId}/${name}`;
     n += 1;
   }
   usedPaths.add(path);
@@ -213,6 +217,28 @@ function findMessageAssets(message, allAssets) {
   return allAssets.filter((asset) => assetMatchesMessage(asset, message, allAssets));
 }
 
+function attachmentAssetForMessage(message, descriptor, name, assetMap, matchedAssets, allAssets) {
+  const id = descriptor?.file_uuid || descriptor?.uuid || null;
+  if (id) {
+    const byId = assetMap.get(`id:${id}`);
+    if (byId && assetMatchesMessage(byId, message, allAssets)) return byId;
+    return matchedAssets.find((asset) => String(asset.file_uuid || '') === String(id)) || null;
+  }
+
+  const nameKey = String(name || '').toLowerCase();
+  const namedMatches = matchedAssets.filter((asset) => String(asset.name || '').toLowerCase() === nameKey);
+  if (namedMatches.length === 1) return namedMatches[0];
+
+  // A global filename lookup is only safe for legacy/unscoped assets. For
+  // message-scoped assets it can attach the first same-named file to later
+  // messages, even though findMessageAssets correctly identified another file.
+  const fallback = name ? assetMap.get(`name:${name}`) : null;
+  if (fallback && !fallback.message_external_id && !fallback.file_uuid && namedMatches.length === 0) {
+    return fallback;
+  }
+  return null;
+}
+
 function attachmentMarkdown(message, assetMap, allAssets) {
   const parts = [];
   const assets = findMessageAssets(message, allAssets);
@@ -225,17 +251,12 @@ function attachmentMarkdown(message, assetMap, allAssets) {
   };
 
   for (const file of (message.files || [])) {
-    const id = file?.file_uuid || file?.uuid || null;
     const name = file?.file_name || file?.name || null;
-    const asset = (id && assetMap.get(`id:${id}`)) ||
-      (name && assetMap.get(`name:${name}`)) ||
-      assets.find((x) => (id && x.file_uuid === id) || (name && String(x.name).toLowerCase() === String(name).toLowerCase()));
-    addAsset(asset);
+    addAsset(attachmentAssetForMessage(message, file, name, assetMap, assets, allAssets));
   }
 
   for (const attachment of (message.attachments || [])) {
     const name = attachment?.file_name || attachment?.name || 'attachment';
-    const nameKey = String(name).toLowerCase();
 
     // Claude uses this synthetic attachment when the user replies to selected text
     // from an earlier Claude message. Keep the excerpt inline, before the user's
@@ -250,7 +271,7 @@ function attachmentMarkdown(message, assetMap, allAssets) {
       continue;
     }
 
-    const asset = assetMap.get(`name:${name}`) || assets.find((x) => String(x.name).toLowerCase() === nameKey);
+    const asset = attachmentAssetForMessage(message, attachment, name, assetMap, assets, allAssets);
     if (asset) {
       addAsset(asset);
     } else {
