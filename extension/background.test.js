@@ -147,7 +147,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [], failOnce = null }) {
+function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null }) {
   const listeners = [];
   const requests = [];
   const baseSha = 'base-commit';
@@ -155,6 +155,8 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
   let masterRefReads = 0;
   let blobCount = 0;
   let injectedFailureUsed = false;
+  let cancelTriggered = false;
+  let currentHeadSha = baseSha;
   const chrome = {
     storage: {
       local: {
@@ -186,6 +188,11 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
     const method = options.method || 'GET';
     requests.push({ pathname, method, body: options.body ? JSON.parse(options.body) : null });
 
+    if (cancelAt && !cancelTriggered && method === cancelAt.method && pathname.endsWith(cancelAt.pathSuffix)) {
+      cancelTriggered = true;
+      listeners[0]({ type: 'cancelSync' }, {}, () => {});
+    }
+
     if (failOnce && !injectedFailureUsed && method === failOnce.method && pathname.endsWith(failOnce.pathSuffix)) {
       injectedFailureUsed = true;
       return response({ message: 'Temporary injected failure' }, failOnce.status || 503);
@@ -196,7 +203,7 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
     }
     if (pathname.endsWith('/git/ref/heads/master') && method === 'GET') {
       masterRefReads += 1;
-      const sha = advanceBranchOnRecheck && masterRefReads > 1 ? concurrentSha : baseSha;
+      const sha = advanceBranchOnRecheck && masterRefReads > 1 ? concurrentSha : currentHeadSha;
       return response({ ref: 'refs/heads/master', object: { sha } });
     }
     if (pathname.endsWith('/git/commits/base-commit') && method === 'GET') {
@@ -233,6 +240,18 @@ function makeBackgroundSyncHarness({ indexText, advanceBranchOnRecheck = false, 
       return response({ sha: 'new-commit' });
     }
     if (pathname.endsWith('/git/refs/heads/master') && method === 'PATCH') {
+      if (patchOutcome === 'apply-then-abort') {
+        currentHeadSha = 'new-commit';
+        const error = new Error('The response was interrupted after GitHub accepted the update');
+        error.name = 'AbortError';
+        throw error;
+      }
+      if (patchOutcome === 'abort-before-apply') {
+        const error = new Error('The request was aborted before GitHub applied the update');
+        error.name = 'AbortError';
+        throw error;
+      }
+      currentHeadSha = 'new-commit';
       return response({ ref: 'refs/heads/master', object: { sha: 'new-commit' } });
     }
     throw new Error(`Unexpected test request: ${method} ${pathname}`);
@@ -578,4 +597,66 @@ test('recovers after a transient GitHub upload failure without publishing a part
     true,
     'the successful retry should publish the completed commit',
   );
+});
+
+
+
+test('reports success when the final ref update was applied but its response was interrupted', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+    patchOutcome: 'apply-then-abort',
+  });
+
+  const progress = [];
+  const result = await harness.sync(sampleConversation(), (event) => progress.push(event));
+
+  assert.equal(result.commit, 'new-commit');
+  assert.equal(result.changed, 1);
+  assert.ok(
+    progress.some((event) => event.stage === 'done' && /GitHub confirms the commit is published/.test(event.message)),
+    'the UI should show verified publication rather than cancellation',
+  );
+  const patchIndex = harness.requests.findIndex((request) => request.method === 'PATCH');
+  assert.ok(
+    harness.requests.some((request, index) => index > patchIndex && request.pathname.endsWith('/git/ref/heads/master') && request.method === 'GET'),
+    'the code should re-read the ref after the interrupted update',
+  );
+});
+
+test('keeps cancellation semantics when a ref update was interrupted and the branch stayed unchanged', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+    patchOutcome: 'abort-before-apply',
+  });
+
+  await assert.rejects(
+    harness.sync(sampleConversation(), () => {}),
+    (error) => error.name === 'AbortError',
+  );
+  assert.equal(
+    harness.requests.some((request) => request.method === 'PATCH'),
+    true,
+    'the test must interrupt the final ref update',
+  );
+});
+
+test('cancelling during blob upload does not publish and a later retry can succeed', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+    cancelAt: { method: 'POST', pathSuffix: '/git/blobs' },
+  });
+
+  await assert.rejects(
+    harness.sync(sampleConversation(), () => {}),
+    /__SYNC_CANCELLED__/,
+  );
+  assert.equal(
+    harness.requests.some((request) => request.method === 'PATCH'),
+    false,
+    'cancellation during upload must not move the branch head',
+  );
+
+  const retry = await harness.sync(sampleConversation(), () => {});
+  assert.equal(retry.commit, 'new-commit');
+  assert.equal(retry.changed, 1);
 });
