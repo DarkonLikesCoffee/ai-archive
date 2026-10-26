@@ -505,6 +505,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.type === 'syncNormalized') {
+    // A content script can finish collecting data before the GitHub sync has
+    // completed. Ignore duplicate handoffs rather than creating competing
+    // commits against the same branch head.
+    if (syncRunning) {
+      sendResponse({ ok: true, alreadyRunning: true });
+      return false;
+    }
+
     sync(msg.conversations, broadcast)
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((e) => {
