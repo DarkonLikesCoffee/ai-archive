@@ -2206,3 +2206,31 @@ for (const [name, settings] of [
     assert.equal(harness.handoffs.length, 0);
   });
 }
+
+test('skips a conversation that cannot be exported and still syncs the others', async () => {
+  const good = (id) => ({
+    uuid: id,
+    name: `Conversation ${id}`,
+    current_leaf_message_uuid: `${id}-m`,
+    chat_messages: [{ uuid: `${id}-m`, parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: `Hello from ${id}` }] }],
+  });
+  const harness = createHarness(good('conversation-a'), {
+    conversationListResponse: [
+      { uuid: 'conversation-a', name: 'Conversation A', updated_at: '2026-10-26T10:00:00Z' },
+      { uuid: 'conversation-broken', name: 'Broken one', updated_at: '2026-10-26T09:00:00Z' },
+      { uuid: 'conversation-c', name: 'Conversation C', updated_at: '2026-10-26T08:00:00Z' },
+    ],
+    // The broken conversation's payload has no messages array.
+    fullConversationResponse: (id) => (id === 'conversation-broken' ? { uuid: id, name: 'Broken one' } : good(id)),
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.deepEqual(JSON.parse(JSON.stringify(handoff.conversations.map((c) => c.external_id))), ['conversation-a', 'conversation-c']);
+  assert.equal(handoff.skipped.length, 1);
+  assert.equal(handoff.skipped[0].id, 'conversation-broken');
+  assert.equal(handoff.skipped[0].title, 'Broken one');
+  assert.match(handoff.skipped[0].error, /without a valid messages array/);
+  harness.finishFirstHandoff({ ok: true });
+});
