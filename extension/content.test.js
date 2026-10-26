@@ -285,7 +285,7 @@ test('preserves different sandbox files that share a basename and uses response 
       uuid: 'user-message',
       parent_message_uuid: ROOT,
       sender: 'human',
-      content: [{ type: 'text', text: 'Please keep both generated reports.' }],
+      content: [{ type: 'text', text: 'Please keep both generated reports: outputs/first/report.txt and outputs/second/report.txt.' }],
     }],
   };
   const sandboxFiles = [
@@ -557,7 +557,7 @@ test('downloads message and sandbox assets concurrently with a bounded limit and
       uuid: 'user-message',
       parent_message_uuid: ROOT,
       sender: 'human',
-      content: [{ type: 'text', text: 'Keep these files in order.' }],
+      content: [{ type: 'text', text: `Keep these files in order: ${sandboxFiles.map((file) => file.path).join(', ')}.` }],
       files: directFiles,
     }],
   };
@@ -610,7 +610,7 @@ test('stops scheduling sandbox downloads after a failure and never hands off a p
       uuid: 'user-message',
       parent_message_uuid: ROOT,
       sender: 'human',
-      content: [{ type: 'text', text: 'Keep every file or fail safely.' }],
+      content: [{ type: 'text', text: `Keep every file or fail safely: ${sandboxFiles.map((file) => file.path).join(', ')}.` }],
     }],
   };
   const harness = createHarness(conversation, {
@@ -654,7 +654,7 @@ test('benchmark: bounded asset downloads against sequential baseline at multiple
         uuid: 'user-message',
         parent_message_uuid: ROOT,
         sender: 'human',
-        content: [{ type: 'text', text: 'Synthetic performance test only.' }],
+        content: [{ type: 'text', text: `Synthetic performance test only: ${sandboxFiles.map((file) => file.path).join(', ')}.` }],
       }],
     };
     const harness = createHarness(conversation, {
@@ -961,5 +961,99 @@ test('accepts a listed message file without a URL when extracted attachment text
 
   assert.equal(handoff.conversations[0].assets.length, 1);
   assert.equal(Buffer.from(handoff.conversations[0].assets[0].base64, 'base64').toString('utf8'), 'Notes content');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+test('does not download or archive sandbox files only referenced by an abandoned branch', async () => {
+  const conversation = {
+    uuid: 'conversation-branch-assets',
+    name: 'Active versus abandoned branch files',
+    current_leaf_message_uuid: 'active-answer',
+    chat_messages: [
+      {
+        uuid: 'root-user',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Generate a current result.' }],
+      },
+      {
+        uuid: 'active-answer',
+        parent_message_uuid: 'root-user',
+        sender: 'assistant',
+        content: [{ type: 'tool_result', content: 'Created outputs/current-result.txt' }],
+      },
+      {
+        uuid: 'abandoned-answer',
+        parent_message_uuid: 'root-user',
+        sender: 'assistant',
+        content: [{ type: 'tool_result', content: 'Created outputs/abandoned-result.txt' }],
+      },
+    ],
+  };
+  const sandboxFiles = [
+    { path: 'outputs/current-result.txt', content_type: 'text/plain' },
+    { path: 'outputs/abandoned-result.txt', content_type: 'text/plain' },
+  ];
+  const harness = createHarness(conversation, {
+    sandboxFiles,
+    sandboxContents: {
+      'outputs/current-result.txt': 'Current branch result',
+      'outputs/abandoned-result.txt': 'Abandoned branch result',
+    },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+  const sandboxDownloads = harness.requests.filter((url) => url.includes('/wiggle/download-file?path='));
+
+  assert.deepEqual(Array.from(assets, (asset) => asset.source_path), ['outputs/current-result.txt']);
+  assert.equal(sandboxDownloads.some((url) => url.includes('abandoned-result.txt')), false,
+    'an asset referenced only by the abandoned branch must not be downloaded');
+  assert.equal(Buffer.from(assets[0].base64, 'base64').toString('utf8'), 'Current branch result');
+
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('requires an explicit path when multiple sandbox files share a basename', async () => {
+  const conversation = {
+    uuid: 'conversation-ambiguous-paths',
+    name: 'Ambiguous sandbox basename',
+    current_leaf_message_uuid: 'active-answer',
+    chat_messages: [
+      {
+        uuid: 'root-user',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Prepare the reports.' }],
+      },
+      {
+        uuid: 'active-answer',
+        parent_message_uuid: 'root-user',
+        sender: 'assistant',
+        content: [{ type: 'text', text: 'The report.txt file is ready.' }],
+      },
+    ],
+  };
+  const sandboxFiles = [
+    { path: 'outputs/first/report.txt', content_type: 'text/plain' },
+    { path: 'outputs/second/report.txt', content_type: 'text/plain' },
+  ];
+  const harness = createHarness(conversation, {
+    sandboxFiles,
+    sandboxContents: {
+      'outputs/first/report.txt': 'First report',
+      'outputs/second/report.txt': 'Second report',
+    },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations[0].assets.length, 0,
+    'ambiguous sandbox assets must not be included based on basename-only mentions');
+  assert.equal(harness.requests.some((url) => url.includes('/wiggle/download-file?path=')), false,
+    'ambiguous, unreferenced sandbox files should not be downloaded');
+
   harness.finishFirstHandoff({ ok: true });
 });
