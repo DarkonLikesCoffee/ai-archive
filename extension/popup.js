@@ -70,13 +70,31 @@ async function sendToClaude(message) {
   }));
 }
 
+// Turn the repository check into an actionable message, or null when the
+// token can write. `permissions` describes the token owner's access; when it
+// already says "no push", the token certainly cannot publish a sync.
+function describeRepoCheck(status, data, owner, repo) {
+  const target = `${owner}/${repo}`;
+  if (status === 401) return 'GitHub rejected the token (401). Check that it was copied completely and has not expired.';
+  if (status === 404) return `Repository ${target} was not found, or the token cannot access it (404).`;
+  if (status === 403) return `GitHub denied access to ${target} (403). The token needs read and write access to repository contents.`;
+  if (status < 200 || status >= 300) return `GitHub could not check ${target} (${status}). Try again in a moment.`;
+  if (data?.permissions && data.permissions.push === false) {
+    return `The token can read ${target} but cannot write to it. Grant it write access to repository contents.`;
+  }
+  return null;
+}
+
 $('save').onclick = async () => {
   try {
     const owner = $('owner').value.trim(), repo = $('repo').value.trim(), token = $('token').value.trim(), account = $('accountSetup').value.trim() || 'personal';
     if (!owner || !repo || !token) throw Error('Owner, repository and token are required.');
     status.className = 'status'; status.textContent = 'Checking GitHub…';
     const r = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } });
-    if (!r.ok) throw Error(`GitHub rejected the settings (${r.status}).`);
+    let data = null;
+    try { data = await r.json(); } catch {}
+    const problem = describeRepoCheck(r.status, data, owner, repo);
+    if (problem) throw Error(problem);
     await chrome.storage.local.set({ github_owner: owner, github_repo: repo, github_token: token, archive_account: account, auto_sync: false, auto_sync_configured: true });
     status.className = 'status ok'; status.textContent = 'GitHub settings saved. Automatic sync is OFF.'; await refresh();
   } catch (e) { status.className = 'status err'; status.textContent = e.message; }

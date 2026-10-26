@@ -160,7 +160,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
   const concurrentSha = 'concurrent-commit';
   let masterRefReads = 0;
   let blobCount = 0;
-  let injectedFailureUsed = false;
+  let injectedFailures = 0;
   let cancelTriggered = false;
   let currentHeadSha = baseSha;
   let settingsReadCount = 0;
@@ -188,9 +188,10 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
     },
   };
 
-  const response = (body, status = 200) => ({
+  const response = (body, status = 200, headers = {}) => ({
     ok: status >= 200 && status < 300,
     status,
+    headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
     text: async () => JSON.stringify(body),
   });
 
@@ -205,9 +206,10 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       listeners[0]({ type: 'cancelSync' }, {}, () => {});
     }
 
-    if (failOnce && !injectedFailureUsed && method === failOnce.method && pathname.endsWith(failOnce.pathSuffix)) {
-      injectedFailureUsed = true;
-      return response({ message: 'Temporary injected failure' }, failOnce.status || 503);
+    if (failOnce && injectedFailures < (failOnce.times || 1) && method === failOnce.method && pathname.endsWith(failOnce.pathSuffix)) {
+      injectedFailures += 1;
+      if (failOnce.network) throw new TypeError('Failed to fetch');
+      return response({ message: failOnce.message || 'Temporary injected failure' }, failOnce.status || 503, failOnce.headers || {});
     }
 
     if (pathname.endsWith('/git/ref/heads/main')) {
@@ -291,9 +293,11 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
 
   const context = {
     chrome, fetch, AbortController, TextEncoder, TextDecoder, Uint8Array,
-    Blob, Response, CompressionStream, crypto: webcrypto, btoa, atob,
+    Blob, Response, CompressionStream, crypto: webcrypto, btoa, atob, setTimeout, clearTimeout,
   };
-  vm.runInNewContext(`${backgroundSource}
+  // Keep retry backoff instant in tests; the retry policy itself is unchanged.
+  const fastSource = backgroundSource.replace('const GITHUB_RETRY_BASE_DELAY_MS = 1000;', 'const GITHUB_RETRY_BASE_DELAY_MS = 1;');
+  vm.runInNewContext(`${fastSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
   conversationPath, indexEntry, sha256,
@@ -621,10 +625,11 @@ test('conversation Markdown paths distinguish IDs that normalize to the same slu
 });
 
 
-test('recovers after a transient GitHub upload failure without publishing a partial archive', async () => {
+test('recovers after a persistent GitHub upload failure without publishing a partial archive', async () => {
   const harness = makeBackgroundSyncHarness({
     indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
-    failOnce: { method: 'POST', pathSuffix: '/git/blobs', status: 503 },
+    // More consecutive failures than the retry budget: the sync must give up safely.
+    failOnce: { method: 'POST', pathSuffix: '/git/blobs', status: 503, times: 3 },
   });
 
   await assert.rejects(
@@ -1239,4 +1244,50 @@ test('lists tool result media once as an attachment after the Claude message', (
 
   assert.equal(markdown.split(link).length - 1, 1);
   assert.ok(markdown.indexOf('Here is the page.') < markdown.indexOf(link), 'Claude attachments follow the response');
+});
+
+
+test('retries transient GitHub failures on idempotent requests and completes the sync', async () => {
+  for (const failOnce of [
+    { method: 'POST', pathSuffix: '/git/blobs', status: 502 },
+    { method: 'GET', pathSuffix: '/contents/archive/index.json', network: true },
+    { method: 'POST', pathSuffix: '/git/trees', status: 429, headers: { 'retry-after': '0' } },
+    { method: 'POST', pathSuffix: '/git/commits', status: 403, message: 'You have exceeded a secondary rate limit', headers: { 'retry-after': '0' } },
+  ]) {
+    const harness = makeBackgroundSyncHarness({
+      indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+      failOnce: { ...failOnce, times: 2 },
+    });
+    const result = await harness.sync(sampleConversation(), () => {});
+    assert.equal(result.commit, 'new-commit', `${failOnce.method} ${failOnce.pathSuffix} should be retried`);
+  }
+});
+
+test('never retries the branch ref update itself', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+    failOnce: { method: 'PATCH', pathSuffix: '/git/refs/heads/master', status: 502 },
+  });
+  await assert.rejects(harness.sync(sampleConversation(), () => {}), /GitHub 502/);
+  assert.equal(harness.requests.filter((request) => request.method === 'PATCH').length, 1);
+});
+
+test('explains authentication, permission, and rate-limit failures without retrying them', async () => {
+  const cases = [
+    [{ status: 401, message: 'Bad credentials' }, /GitHub 401: GitHub rejected the access token\. Update the token in the extension popup\. Nothing was published\./],
+    [{ status: 403, message: 'Resource not accessible by personal access token' },
+      /GitHub 403: GitHub denied access to example-owner\/example-archive\. The token needs read and write access to repository contents\. Nothing was published\./],
+    [{ status: 403, message: 'API rate limit exceeded', headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1893456000' } },
+      /GitHub 403: GitHub API rate limit reached; it resets at 2030-01-01T00:00:00\.000Z\. Nothing was published; sync again after that\./],
+  ];
+  for (const [failure, expected] of cases) {
+    const harness = makeBackgroundSyncHarness({
+      indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
+      failOnce: { method: 'GET', pathSuffix: '/git/commits/base-commit', times: 5, ...failure },
+    });
+    await assert.rejects(harness.sync(sampleConversation(), () => {}), expected);
+    assert.equal(harness.requests.filter((request) => request.pathname.endsWith('/git/commits/base-commit')).length, 1,
+      `HTTP ${failure.status} must not be retried`);
+    assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false);
+  }
 });
