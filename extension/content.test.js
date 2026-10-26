@@ -862,6 +862,7 @@ test('associates a single downloaded direct asset with every message that refere
         sender: 'human',
         content: [{ type: 'text', text: 'Here is the report.' }],
         files: [{ ...sharedFile }],
+        attachments: [{ file_name: 'shared-report.png', extracted_content: 'shared image bytes' }],
       },
       {
         uuid: 'assistant-message',
@@ -869,6 +870,7 @@ test('associates a single downloaded direct asset with every message that refere
         sender: 'assistant',
         content: [{ type: 'text', text: 'I will refer to that same report.' }],
         files: [{ ...sharedFile }],
+        attachments: [{ file_name: 'shared-report.png', extracted_content: 'shared image bytes' }],
       },
     ],
   };
