@@ -1372,6 +1372,11 @@ test('redacts oversized media payloads nested inside tool results', async () => 
   assert.match(rendered, /Chart generated/);
   assert.match(rendered, /omitted inline payload: 8192 characters/);
   assert.equal(rendered.includes(binaryPayload), false, 'binary data should not inflate the Markdown transcript');
+  assert.equal(
+    handoff.conversations[0].assets.filter((asset) => asset.source === 'message-content').length,
+    0,
+    'images inside fenced tool results must not become unresolved inline-image assets',
+  );
 
   harness.finishFirstHandoff({ ok: true });
 });
