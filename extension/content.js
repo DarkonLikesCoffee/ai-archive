@@ -1,4 +1,5 @@
 (() => {
+  const ASSET_DOWNLOAD_CONCURRENCY = 3;
   let currentAbortController = null;
   let syncing = false;
 
@@ -109,6 +110,40 @@
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
+  // Run only a small number of network tasks at once. Results stay in input
+  // order, and after the first failure no new tasks are scheduled; workers
+  // already in flight are allowed to settle before the error is propagated.
+  async function mapWithConcurrency(items, concurrency, mapper, signal) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    let firstError = null;
+
+    async function worker() {
+      while (!firstError) {
+        if (signal?.aborted) {
+          firstError = new DOMException('Sync cancelled', 'AbortError');
+          return;
+        }
+
+        const index = nextIndex++;
+        if (index >= items.length) return;
+
+        try {
+          results[index] = await mapper(items[index], index);
+        } catch (error) {
+          if (!firstError) firstError = error;
+          return;
+        }
+      }
+    }
+
+    const workerCount = Math.min(Math.max(1, concurrency), items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    if (firstError) throw firstError;
+    if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+    return results;
+  }
+
   async function fetchAsset(url, name, mime, signal) {
     const label = safeAssetName(name);
     if (!url) {
@@ -156,22 +191,28 @@
       throw new Error(`Claude returned an invalid sandbox file list for conversation "${conversationId}". Sync stopped before anything was sent to GitHub; retry the sync.`);
     }
 
-    const out = [];
     for (const file of data.files_metadata) {
       if (!file?.path) {
         throw new Error(`Claude returned sandbox file metadata without a path for conversation "${conversationId}". Sync stopped before anything was sent to GitHub.`);
       }
-      const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(file.path)}`;
-      let asset;
-      try {
-        asset = await fetchAsset(url, file.path.split('/').pop() || file.path, file.content_type, signal);
-      } catch (e) {
-        if (e?.name === 'AbortError') throw e;
-        throw new Error(`Failed to download sandbox file "${file.path}": ${e?.message || 'download error'}`);
-      }
-      out.push({ ...asset, source_path: file.path, source: 'sandbox' });
     }
-    return out;
+
+    return mapWithConcurrency(
+      data.files_metadata,
+      ASSET_DOWNLOAD_CONCURRENCY,
+      async (file) => {
+        const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(file.path)}`;
+        let asset;
+        try {
+          asset = await fetchAsset(url, file.path.split('/').pop() || file.path, file.content_type, signal);
+        } catch (e) {
+          if (e?.name === 'AbortError') throw e;
+          throw new Error(`Failed to download sandbox file "${file.path}": ${e?.message || 'download error'}`);
+        }
+        return { ...asset, source_path: file.path, source: 'sandbox' };
+      },
+      signal,
+    );
   }
 
   function isReplyExcerptAttachment(file) {
@@ -193,24 +234,37 @@
       return fingerprints;
     };
 
-    // First collect the real binary/image assets exposed directly by messages.
+    // Collect and deduplicate tasks before starting downloads, then process
+    // them with a small concurrency limit while preserving message/file order.
+    const directTasks = [];
     for (const message of messages) {
       for (const file of (Array.isArray(message.files) ? message.files : [])) {
         const url = file?.preview_asset?.url || file?.preview_url || file?.document_asset?.url;
         if (!url) continue;
-        const name = file.file_name || file.name || `file-${file.file_uuid || file.uuid || assets.length + 1}`;
+        const name = file.file_name || file.name || `file-${file.file_uuid || file.uuid || directTasks.length + 1}`;
         const key = `${file.file_uuid || file.uuid || name}|${url}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
-        if (asset) {
-          const messageId = message.uuid || message.id || null;
-          assets.push({ ...asset, source: 'message', file_uuid: file.file_uuid || file.uuid || null, message_external_id: messageId });
-          const nameKey = String(asset.name || '').toLowerCase();
-          messageAssetFingerprints.add(`${nameKey}|${asset.sha256}`);
-          fingerprintsForMessage(message).add(`${nameKey}|${asset.sha256}`);
-        }
+        directTasks.push({ message, file, url, name });
       }
+    }
+
+    const directAssets = await mapWithConcurrency(
+      directTasks,
+      ASSET_DOWNLOAD_CONCURRENCY,
+      async ({ message, file, url, name }) => {
+        const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
+        return { asset, message, file };
+      },
+      signal,
+    );
+
+    for (const { asset, message, file } of directAssets) {
+      const messageId = message.uuid || message.id || null;
+      assets.push({ ...asset, source: 'message', file_uuid: file.file_uuid || file.uuid || null, message_external_id: messageId });
+      const nameKey = String(asset.name || '').toLowerCase();
+      messageAssetFingerprints.add(`${nameKey}|${asset.sha256}`);
+      fingerprintsForMessage(message).add(`${nameKey}|${asset.sha256}`);
     }
 
     // The sandbox contains the original uploads and files generated by Claude's tools.
