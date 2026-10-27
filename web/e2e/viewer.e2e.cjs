@@ -249,6 +249,22 @@ files['archive/index.json'] = JSON.stringify(index);
   check('an archive that was never synced shows next steps, not an error',
     (await fresh.locator('.empty-archive').textContent()).includes('This archive is empty') && !(await fresh.locator('.error').count()));
 
+  // Overview: totals from the index, conversations per month, models, accounts.
+  await page.addInitScript(() => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner: 'me', repo: 'archive', token: 't' })));
+  await page.goto(`${base}#/`);
+  await page.reload();
+  await page.waitForSelector('.conversation');
+  await page.locator('.sidebar button.nav', { hasText: 'Overview' }).click();
+  await page.waitForSelector('.stat-tile');
+  const tiles = await page.locator('.stat-tile').allTextContents();
+  check('overview shows totals from the index', page.url().endsWith('#/overview') && tiles[0] === '2conversations' && tiles[1] === '4messages' && tiles[2].startsWith('1attachments'), JSON.stringify(tiles));
+  const months = await page.locator('.overview-section').first().locator('.bar-row').allTextContents();
+  check('overview counts conversations per month', JSON.stringify(months) === JSON.stringify(['Oct 20262']), JSON.stringify(months));
+  if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.SCREENSHOT_DIR}/overview.png` });
+  await page.reload();
+  await page.waitForSelector('.stat-tile');
+  check('the overview has its own link', true);
+
   check('no uncaught page errors', errors.length === 0, errors.join(' | '));
   await browser.close();
 })().catch((e) => { console.error(e); process.exit(1); });
