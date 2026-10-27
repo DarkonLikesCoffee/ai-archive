@@ -7,6 +7,7 @@ import { terminatedToolSectionEnd } from './toolSections.js';
 import { searchConversations } from './archiveSearch.js';
 import { formatRoute, parseRoute } from './route.js';
 import { clearAssetCache, readAssetCached } from './assetCache.js';
+import { moveFocusIndex, shortcutFor } from './shortcuts.js';
 import { effectiveSort, groupByDate, sortConversations, sortDate, sortOptions } from './listOrder.js';
 import './styles.css';
 
@@ -439,6 +440,7 @@ function Message({ message, assets, assetBusy }) {
 }
 
 function Reader({ settings, selected, conversation, onBack, sidebar }) {
+  const onBackRef=useRef(onBack); onBackRef.current=onBack;
   const [assets,setAssets]=useState({});
   const [assetBusy,setAssetBusy]=useState(false);
   const [findQuery,setFindQuery]=useState('');
@@ -572,10 +574,13 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
 
   useEffect(()=>{
     const onKeyDown=(e)=>{
-      if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='f'){
+      const action=shortcutFor(e);
+      if(((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='f') || action==='focus-search'){
         e.preventDefault();
         findInputRef.current?.focus();
         findInputRef.current?.select();
+      } else if(action==='escape'){
+        onBackRef.current();
       }
     };
     window.addEventListener('keydown',onKeyDown);
@@ -590,7 +595,8 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
 
   function handleFindKeyDown(e) {
     if (e.key==='Enter') { e.preventDefault(); cycleFind(e.shiftKey ? -1 : 1); }
-    if (e.key==='Escape') { e.preventDefault(); setFindQuery(''); }
+    // Escape clears the find bar, then leaves it; a further Escape goes back.
+    if (e.key==='Escape') { e.preventDefault(); if (findQuery) setFindQuery(''); else e.currentTarget.blur(); }
   }
 
   const findCount=findTotal;
@@ -628,11 +634,19 @@ function App() {
   // Typing a search replaces the current list entry instead of adding one per keystroke.
   useEffect(()=>{if(selected||parseRoute(window.location.hash).view!=='list')return;const next=formatRoute({view:'list',provider,account,q:search,sort});if(window.location.hash!==next&&!(next==='#/'&&!window.location.hash))window.history.replaceState(null,'',next)},[search,provider,account,sort,selected]);
   const goList=(nextProvider=provider,nextAccount=account)=>navigate({view:'list',provider:nextProvider,account:nextAccount,q:search,sort});
+  // List shortcuts (see shortcuts.js): / focuses search, j/k move between
+  // conversations (Enter opens the focused one), Escape leaves the search box.
+  const searchRef=useRef(null);
+  useEffect(()=>{if(selected)return;const onKey=e=>{const action=shortcutFor(e);
+    if(action==='focus-search'){e.preventDefault();searchRef.current?.focus();searchRef.current?.select()}
+    else if(action==='next'||action==='previous'){const rows=[...document.querySelectorAll('.list .conversation')];const i=moveFocusIndex(rows.indexOf(document.activeElement),action==='next'?1:-1,rows.length);if(i>=0){e.preventDefault();rows[i].focus();rows[i].scrollIntoView({block:'nearest'})}}
+    else if(action==='leave-field'&&e.target===searchRef.current)searchRef.current.blur()};
+    window.addEventListener('keydown',onKey);return()=>window.removeEventListener('keydown',onKey)},[selected]);
   const sidebar=<aside className="sidebar"><div className="sidebar-top"><div className="brand"><span className="brand-mark">AI</span><div><strong>AI Archive</strong><small>{settings?.owner}/{settings?.repo}</small></div></div><button className={provider==='all'?'nav active':'nav'} onClick={()=>goList('all','all')}>All conversations <span>{index?.conversations?.length||0}</span></button>{providers.map(p=><button key={p} className={provider===p?'nav active':'nav'} onClick={()=>goList(p,'all')}>{p[0].toUpperCase()+p.slice(1)}</button>)}<div className="section-label">Accounts</div><div className="account-list"><button className={account==='all'?'nav active':'nav'} onClick={()=>goList(provider,'all')}>All accounts</button>{accounts.map(a=><button key={a} className={account===a?'nav active':'nav'} onClick={()=>goList(provider,a)}>{a}</button>)}</div></div><div className="sidebar-bottom"><button className="nav theme-nav" onClick={()=>setTheme(theme==='black'?'slate':theme==='slate'?'light':'black')}>◐ Theme <span>{theme==='black'?'Black':theme==='slate'?'Slate':'Light'}</span></button><button className="nav" onClick={load}>↻ Refresh</button><button className="nav" onClick={disconnect}>Disconnect</button></div></aside>;
   const renderRow=c=><button className="conversation" key={`${c.provider}:${c.account}:${c.id}`} onClick={()=>navigate({view:'conversation',provider:c.provider,account:c.account||'personal',id:c.id})}><div className="conv-main"><strong>{c.title}</strong><div className="meta">{c.provider} · {c.account||'personal'} · {c.message_count||0} messages</div>{snippets.get(c)?<div className="preview search-snippet">{snippets.get(c).map((part,i)=>part.match?<mark key={i}>{part.text}</mark>:<span key={i}>{part.text}</span>)}</div>:c.preview&&<div className="preview">{c.preview.replace(/\s+/g,' ').slice(0,160)}</div>}</div><div className="conv-side"><time>{sortDate(c,activeSort)?new Date(sortDate(c,activeSort)).toLocaleDateString():''}</time>{c.assets?.length?<span className="asset-count">{c.assets.length} attachment{c.assets.length===1?'':'s'}</span>:null}</div></button>;
   if(!settings)return <Settings onSave={s=>{localStorage.setItem(KEY,JSON.stringify(s));setSettings(s)}}/>;
   if(selected&&conversation)return <Reader settings={settings} selected={selected} conversation={conversation} onBack={()=>navigate({view:'list',provider,account,q:search,sort})} sidebar={sidebar}/>;
-  return <div className="app">{sidebar}<main><header><div><h1>{provider==='all'?'All conversations':provider[0].toUpperCase()+provider.slice(1)}</h1><p>{items.length} conversation{items.length===1?'':'s'}</p></div><div className="list-controls"><input className="search" placeholder='Search every conversation… use "quotes" for phrases' value={search} onChange={e=>setSearch(e.target.value)}/><select className="sort" aria-label="Sort conversations" value={sortOptions(searching).some(o=>o.value===sort)?sort:'auto'} onChange={e=>setSort(e.target.value)}>{sortOptions(searching).map(o=><option key={o.value} value={o.value}>{o.label}</option>)}</select></div></header>{error&&<div className="error banner">{error}</div>}<div className="list">{loading?<div className="loading">Loading archive…</div>:groups?groups.map(g=><section className="list-group" key={g.label}><h3 className="list-group-label">{g.label}</h3>{g.items.map(renderRow)}</section>):sorted.map(renderRow)}{!loading&&!items.length&&<div className="empty">No matching conversations.</div>}</div></main></div>;
+  return <div className="app">{sidebar}<main><header><div><h1>{provider==='all'?'All conversations':provider[0].toUpperCase()+provider.slice(1)}</h1><p>{items.length} conversation{items.length===1?'':'s'}</p></div><div className="list-controls"><input ref={searchRef} className="search" placeholder='Search every conversation… use "quotes" for phrases (press /)' value={search} onChange={e=>setSearch(e.target.value)}/><select className="sort" aria-label="Sort conversations" value={sortOptions(searching).some(o=>o.value===sort)?sort:'auto'} onChange={e=>setSort(e.target.value)}>{sortOptions(searching).map(o=><option key={o.value} value={o.value}>{o.label}</option>)}</select></div></header>{error&&<div className="error banner">{error}</div>}<div className="list">{loading?<div className="loading">Loading archive…</div>:groups?groups.map(g=><section className="list-group" key={g.label}><h3 className="list-group-label">{g.label}</h3>{g.items.map(renderRow)}</section>):sorted.map(renderRow)}{!loading&&!items.length&&<div className="empty">No matching conversations.</div>}</div></main></div>;
 }
 
 createRoot(document.getElementById('root')).render(<App/>);
