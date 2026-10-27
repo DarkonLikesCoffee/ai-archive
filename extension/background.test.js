@@ -1539,3 +1539,25 @@ test('an out-of-order or incomplete chunked handoff publishes nothing and says t
   const unknown = loadBackgroundForSyncState();
   assert.equal(unknown.send({ type: 'syncNormalized', transferId: 'never-sent' }, { tab: { id: 7 } }).ok, false);
 });
+
+test('an attachment over GitHub\'s 100 MB file limit is left out with a note instead of failing the sync', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
+  const [conversation] = sampleConversation();
+  conversation.messages[0].files = [{ file_uuid: 'huge', file_name: 'screen recording.mov' }, { file_uuid: 'small', file_name: 'notes.txt' }];
+  conversation.assets = [
+    { file_uuid: 'huge', name: 'screen recording.mov', mime: 'video/quicktime', base64: 'AAAA', sha256: 'b'.repeat(64), size: 150 * 1024 * 1024, message_external_id: 'message-1' },
+    { file_uuid: 'small', name: 'notes.txt', mime: 'text/plain', base64: btoa('hi'), sha256: 'c'.repeat(64), size: 2, message_external_id: 'message-1' },
+  ];
+  const result = await harness.sync([conversation], () => {});
+  assert.equal(result.commit, 'new-commit');
+
+  const blobs = harness.requests.filter((r) => r.pathname.endsWith('/git/blobs') && r.method === 'POST').map((r) => r.body);
+  const markdown = blobs.map((b) => b.content).find((c) => c.includes('AI_ARCHIVE_METADATA'));
+  assert.match(markdown, /\*\*Not archived: screen recording\.mov\*\* \(150 MB; GitHub does not accept files over 100 MB\)/);
+  assert.match(markdown, /\[notes\.txt\]\(assets\/[^)]*notes\.txt\)/);
+  const tree = harness.requests.find((r) => r.pathname.endsWith('/git/trees') && r.method === 'POST').body.tree;
+  assert.equal(tree.some((entry) => /recording/.test(entry.path)), false, 'the oversized file is never uploaded');
+  assert.equal(tree.some((entry) => /notes\.txt$/.test(entry.path) && entry.sha), true);
+  const index = JSON.parse(blobs.at(-1).content);
+  assert.deepEqual(index.conversations[0].assets.map((a) => a.name), ['notes.txt'], 'the index lists only archived files');
+});
