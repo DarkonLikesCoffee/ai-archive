@@ -306,8 +306,21 @@ function escapeMarkdownLabel(value) {
     .replace(/([*_\x60!])/g, '\\$1');
 }
 
+// GitHub rejects any file over 100 MiB, so such an attachment can never be
+// archived; uploading it would fail every sync. It is left out with a note.
+const MAX_ARCHIVED_FILE_BYTES = 100 * 1024 * 1024;
+
+function assetByteSize(raw) {
+  const size = Number(raw?.size);
+  return Number.isFinite(size) && size > 0 ? size : Math.floor(String(raw?.base64 || '').length * 3 / 4);
+}
+
 function assetMarkdown(asset, path) {
   const label = escapeMarkdownLabel(asset.name || 'file');
+  if (asset.omitted) {
+    const megabytes = Math.round(assetByteSize(asset) / (1024 * 1024));
+    return `**Not archived: ${label}** (${megabytes} MB; GitHub does not accept files over 100 MB)`;
+  }
   const rel = `assets/${String(path).split('/assets/').pop()}`;
   if (isImageAsset(asset)) return `![${label}](${rel})`;
   return `[${label}](${rel})`;
@@ -532,11 +545,13 @@ function normalizeAssetList(c, provider, accountSlug) {
   for (const raw of (c.assets || [])) {
     if (!raw?.base64 || !raw?.sha256) continue;
     const path = assetPath(c, raw, provider, accountSlug, usedPaths);
+    const omitted = assetByteSize(raw) > MAX_ARCHIVED_FILE_BYTES;
     const asset = {
       ...raw,
       path,
       encoding: 'base64',
-      base64: raw.base64,
+      base64: omitted ? '' : raw.base64,
+      ...(omitted ? { omitted: true, size: assetByteSize(raw) } : {}),
     };
     assets.push(asset);
     if (raw.file_uuid) byKey.set(`id:${raw.file_uuid}`, asset);
@@ -558,7 +573,7 @@ function indexEntry(c, path, provider, account, assets) {
     created_at: c.source_created_at || null,
     updated_at: c.source_updated_at || c.source_created_at || null,
     message_count: c.message_count || c.messages.length,
-    assets: assets.map((a) => ({ path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name })),
+    assets: assets.filter((a) => !a.omitted).map((a) => ({ path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name })),
     format_version: 4,
     exporter_version: EXPORTER_VERSION,
     preview: String(contents.find(Boolean) || '').slice(0, 300),
@@ -789,6 +804,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       if (changed) {
         changes.push({ path, content: markdown, encoding: 'utf-8' });
         for (const asset of normalizedAssets.assets) {
+          if (asset.omitted) continue;
           const previousAsset = previousAssets.find((a) => a.path === asset.path && a.sha256 === asset.sha256);
           if (!previousAsset || !existingPaths.has(asset.path)) {
             changes.push({ path: asset.path, content: asset.base64, encoding: 'base64' });

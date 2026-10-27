@@ -16,7 +16,21 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const extensionDir = path.resolve(__dirname, '..', 'extension');
+const sourceExtensionDir = path.resolve(__dirname, '..', 'extension');
+// The extension under test is a copy whose only change is a lower size cap
+// for attachments (30 MiB instead of GitHub's 100 MiB): Playwright cannot pass
+// a single response over 100 MB through its DevTools pipe, so the cap's path
+// is exercised with a 31 MiB file. The real constant is unit-tested.
+const TEST_FILE_CAP_MIB = 30;
+const extensionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-archive-extension-'));
+fs.cpSync(sourceExtensionDir, extensionDir, { recursive: true });
+{
+  const backgroundPath = path.join(extensionDir, 'background.js');
+  const original = fs.readFileSync(backgroundPath, 'utf8');
+  const patched = original.replace('const MAX_ARCHIVED_FILE_BYTES = 100 * 1024 * 1024;', `const MAX_ARCHIVED_FILE_BYTES = ${TEST_FILE_CAP_MIB} * 1024 * 1024;`);
+  if (patched === original) throw new Error('MAX_ARCHIVED_FILE_BYTES not found in background.js');
+  fs.writeFileSync(backgroundPath, patched);
+}
 const OWNER = 'me';
 const REPO = 'archive';
 const TOKEN = 'good-token';
@@ -315,10 +329,30 @@ function handleClaude(url) {
     check('large attachments are archived byte for byte',
       bigPaths.length === 3 && bigPaths.every((file) => BIG_FILES.some((bytes) => files[file].equals(bytes))), bigPaths.join(', '));
 
+    // An attachment over the size cap (GitHub rejects files over 100 MiB; 30 MiB
+    // in this test copy) is left out with a note, and the sync still publishes.
+    {
+      const hugeIndex = BIG_FILES.length;
+      BIG_FILES.push(crypto.randomBytes((TEST_FILE_CAP_MIB + 1) * 1024 * 1024));
+      addConversation('conv-huge', 'Huge recording', '2026-10-27T13:00:00Z', [
+        ['human', 'Here is the recording', [{ file_uuid: 'huge', file_name: `big-${hugeIndex}.bin`, preview_url: `/api/fake-assets/big-${hugeIndex}.bin` }]],
+        ['assistant', 'Thanks.'],
+      ]);
+      const commitsBeforeHuge = github.commitCount();
+      last = await syncAll();
+      files = github.files();
+      const hugeMarkdown = Object.entries(files).find(([file, content]) => file.endsWith('.md') && content.toString().includes('Here is the recording'));
+      check('an attachment over 100 MB is left out with a note, and the sync publishes',
+        github.commitCount() === commitsBeforeHuge + 1 && /1 conversation changed/.test(last)
+        && hugeMarkdown && /\*\*Not archived: big-\d+\.bin\*\* \(31 MB; GitHub does not accept files over 100 MB\)/.test(hugeMarkdown[1].toString())
+        && !Object.keys(files).some((file) => file.endsWith(`big-${hugeIndex}.bin`)), last);
+    }
+
     check('no page errors', errors.length === 0, errors.join(' | '));
   } finally {
-    await context.close();
+    await context.close().catch(() => {}); // keep the original error if the browser died
     fs.rmSync(profile, { recursive: true, force: true });
+    fs.rmSync(extensionDir, { recursive: true, force: true });
   }
 })().catch((error) => {
   console.error(error);
