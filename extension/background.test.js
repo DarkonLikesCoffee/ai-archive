@@ -166,6 +166,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
   let settingsReadCount = 0;
   let activeBlobRequests = 0;
   let maxActiveBlobRequests = 0;
+  const storedValues = {};
   const chrome = {
     storage: {
       local: {
@@ -178,6 +179,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
             archive_account: 'personal',
           };
         },
+        set: async (values) => { Object.assign(storedValues, values); },
       },
     },
     runtime: {
@@ -300,13 +302,14 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
   vm.runInNewContext(`${fastSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
-  conversationPath, indexEntry, sha256, archiveState,
+  conversationPath, indexEntry, sha256, archiveState, broadcast,
 };
 `, context, { filename: 'extension/background.js' });
 
   return {
     sync: context.__testHooks.sync,
     archiveState: context.__testHooks.archiveState,
+    storedValues: () => storedValues,
     hooks: context.__testHooks,
     requests,
     metrics() {
@@ -1452,4 +1455,40 @@ test('records the exporter version for a previously archived conversation even w
   const result = await second.sync(sampleConversation(), () => {});
   assert.equal(result.changed, 0, 'the Markdown itself did not change');
   assert.equal(result.commit, 'new-commit', 'an index-only commit records the exporter version');
+});
+
+test('persists the outcome of every finished sync, including content-side failures', async () => {
+  const stored = {};
+  const listeners = [];
+  const chrome = {
+    storage: { local: { get: async () => ({}), set: async (values) => { Object.assign(stored, values); } } },
+    runtime: { onMessage: { addListener(listener) { listeners.push(listener); } }, sendMessage() { return Promise.resolve(); } },
+    tabs: { sendMessage() { return Promise.resolve(); } },
+  };
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__broadcast = broadcast;`, (() => {
+    const context = { chrome, AbortController, fetch: () => new Promise(() => {}) };
+    context.globalThis = context;
+    return context;
+  })());
+  const send = (message, sender = {}) => listeners[0](message, sender, () => {});
+
+  // Progress stages are not persisted; only final outcomes are.
+  send({ type: 'syncProgress', stage: 'fetching', current: 1, total: 3 }, { tab: { id: 1 } });
+  assert.equal(stored.last_sync, undefined);
+
+  send({ type: 'syncProgress', stage: 'error', error: 'Claude conversations: 500' }, { tab: { id: 1 } });
+  assert.equal(stored.last_sync.stage, 'error');
+  assert.equal(stored.last_sync.message, 'Claude conversations: 500');
+  assert.match(stored.last_sync.at, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('persists a completed GitHub sync with its summary', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
+  // The extension runs syncs with broadcast() as the progress callback.
+  await harness.sync(sampleConversation(), harness.hooks.broadcast);
+  const record = harness.storedValues().last_sync;
+  assert.equal(record.stage, 'done');
+  assert.equal(record.changed, 1);
+  assert.equal(record.commit, 'new-commit');
+  assert.match(record.message, /^Sync complete: 1 conversation changed in 1 GitHub commit\./);
 });
