@@ -298,13 +298,50 @@ function handleClaude(url) {
     const claudeTabs = context.pages().filter((p) => p.url().startsWith('https://claude.ai/'));
     check('Sync without a Claude tab opens one and syncs', claudeTabs.length === 1 && github.commitCount() === 5 && /1 conversation changed/.test(last), `tabs=${claudeTabs.length} ${last}`);
 
+    // Rich content end to end: tool calls and results, citations, and an inline
+    // image travel from Claude's format through the extension into Markdown.
+    claudeConversations.set('conv-rich', {
+      uuid: 'conv-rich', name: 'Research with tools', created_at: '2026-10-27T09:00:00Z', updated_at: '2026-10-27T09:30:00Z',
+      model: 'claude-test', current_leaf_message_uuid: 'rich-a',
+      chat_messages: [
+        { uuid: 'rich-u', parent_message_uuid: ROOT, sender: 'human', created_at: '2026-10-27T09:00:00Z', content: [{ type: 'text', text: 'Find the study and chart it' }], files: [], attachments: [] },
+        { uuid: 'rich-a', parent_message_uuid: 'rich-u', sender: 'assistant', created_at: '2026-10-27T09:30:00Z', files: [], attachments: [], content: [
+          { type: 'tool_use', name: 'web_search', input: { query: 'effect size study 2024' } },
+          { type: 'tool_result', name: 'web_search', content: [{ type: 'text', text: 'Found 3 results.' }] },
+          { type: 'text', text: 'The study found a strong effect.', citations: [{ type: 'web_search_result_location', url: 'https://example.com/study', title: 'The study', cited_text: 'A strong effect was observed.' }] },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG.toString('base64') } },
+          { type: 'text', text: 'Above: the chart.' },
+        ] },
+      ],
+    });
+    last = await syncAll();
+    files = github.files();
+    const rich = Object.entries(files).find(([file, content]) => file.endsWith('.md') && content.toString().includes('Find the study'));
+    const richText = rich ? rich[1].toString() : '';
+    check('tool calls and results are archived', richText.includes('### Claude tool: web_search') && richText.includes('effect size study 2024') && richText.includes('Found 3 results.'));
+    check('citations are archived as links', richText.includes('https://example.com/study') && richText.includes('A strong effect was observed.'));
+    const imageLink = richText.match(/!\[[^\]]*\]\((assets\/[^)]+)\)/);
+    const imagePath = imageLink && path.posix.join(path.posix.dirname(rich[0]), imageLink[1]);
+    check('the inline image is archived in place, before the text that follows it', Boolean(imagePath && files[imagePath]?.equals(PNG))
+      && richText.indexOf(imageLink[0]) < richText.indexOf('Above: the chart.') && richText.indexOf(imageLink[0]) > richText.indexOf('strong effect'), imageLink?.[0]);
+
     if (process.env.VIEWER_URL) {
       const viewer = await context.newPage();
       viewer.on('pageerror', (e) => errors.push(`viewer: ${e}`));
       await viewer.addInitScript(([owner, repo, token]) => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner, repo, token })), [OWNER, REPO, TOKEN]);
       await viewer.goto(process.env.VIEWER_URL);
       await viewer.waitForSelector('.conversation');
-      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 3);
+      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 4);
+      await viewer.locator('.conversation', { hasText: 'Research with tools' }).click();
+      await viewer.waitForSelector('.content img[src^="data:image/png"]');
+      const richView = await viewer.evaluate(() => ({
+        tool: [...document.querySelectorAll('.message')].some((m) => /web_search/.test(m.textContent)),
+        citation: !!document.querySelector('.content a[href="https://example.com/study"]'),
+        image: !!document.querySelector('.content img[src^="data:image/png"]'),
+      }));
+      check('viewer shows the tool call, the citation link, and the inline image', richView.tool && richView.citation && richView.image, JSON.stringify(richView));
+      await viewer.goBack();
+      await viewer.waitForSelector('.conversation');
       await viewer.locator('.conversation', { hasText: 'SQL question' }).click();
       await viewer.waitForSelector('.message');
       check('viewer shows the synced turns', (await viewer.locator('.message').count()) === 4);
