@@ -34,10 +34,13 @@ function createHarness(conversation, {
   cancelOnFirstDigest = false,
   storage = null,
   archiveState = null,
+  handoffChunkChars = null,
+  rejectChunkAt = -1,
 } = {}) {
   const listeners = [];
   const requests = [];
   const handoffs = [];
+  const transferChunks = [];
   const progressMessages = [];
   let resolveFirstHandoff;
   const firstHandoff = new Promise((resolve) => { resolveFirstHandoff = resolve; });
@@ -80,7 +83,14 @@ function createHarness(conversation, {
           callback?.(archiveState ? { ok: true, conversations: archiveState } : { ok: false, error: 'not configured in test' });
           return Promise.resolve();
         }
+        if (message.type === 'syncTransferChunk') {
+          transferChunks.push(message);
+          callback?.(message.index === rejectChunkAt ? { ok: false, error: 'rejected in test' } : { ok: true });
+          return Promise.resolve();
+        }
         if (message.type === 'syncNormalized') {
+          // A chunked handoff is reassembled here exactly as the background does.
+          if (message.transferId) message = { type: 'syncNormalized', transferId: message.transferId, ...JSON.parse(transferChunks.filter((c) => c.transferId === message.transferId).map((c) => c.data).join('')) };
           handoffs.push(message);
           if (handoffs.length === 1) {
             finishFirstHandoff = callback;
@@ -166,10 +176,13 @@ function createHarness(conversation, {
     throw new Error(`Unexpected request in test: ${url}`);
   };
 
-  const harnessSource = contentSource.replace(
+  let harnessSource = contentSource.replace(
     'const ASSET_DOWNLOAD_CONCURRENCY = 3;',
     `const ASSET_DOWNLOAD_CONCURRENCY = ${assetDownloadConcurrency};`,
   );
+  if (handoffChunkChars) {
+    harnessSource = harnessSource.replace('const HANDOFF_CHUNK_CHARS = 8 * 1024 * 1024;', `const HANDOFF_CHUNK_CHARS = ${handoffChunkChars};`);
+  }
   vm.runInNewContext(harnessSource, {
     chrome,
     fetch,
@@ -197,6 +210,7 @@ function createHarness(conversation, {
   return {
     onMessage: listeners[0],
     requests,
+    transferChunks,
     storageState,
     handoffs,
     progressMessages,
@@ -2323,4 +2337,44 @@ test('a Latest N sync always re-downloads those conversations, even if unchanged
   assert.equal(handoff.conversations.length, 1, 'an explicit Latest N sync refreshes its conversations');
   assert.equal(handoff.unchangedIds.length, 0);
   harness.finishFirstHandoff({ ok: true });
+});
+
+function chunkTestConversation() {
+  return {
+    uuid: 'conversation-big',
+    name: 'Large handoff',
+    current_leaf_message_uuid: 'm2',
+    chat_messages: [
+      { uuid: 'm1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'Question ' + 'x'.repeat(3000) }] },
+      { uuid: 'm2', parent_message_uuid: 'm1', sender: 'assistant', content: [{ type: 'text', text: 'Answer ✓ "quoted" ' + 'y'.repeat(3000) }] },
+    ],
+  };
+}
+
+test('a sync too large for one extension message is handed off in ordered chunks', async () => {
+  const small = createHarness(chunkTestConversation());
+  small.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const expected = await small.firstHandoff;
+  assert.equal(small.transferChunks.length, 0, 'a small sync stays one message');
+
+  const harness = createHarness(chunkTestConversation(), { handoffChunkChars: 1000 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.ok(harness.transferChunks.length > 5, `chunks: ${harness.transferChunks.length}`);
+  assert.deepEqual(harness.transferChunks.map((c) => c.index), harness.transferChunks.map((_, i) => i));
+  assert.ok(harness.transferChunks.every((c) => c.total === harness.transferChunks.length && c.data.length <= 1000 && c.transferId === handoff.transferId));
+  const { type: _a, ...expectedPayload } = expected;
+  const { type: _b, transferId: _c, ...payload } = handoff;
+  // Each run picks a new random inline-marker nonce; everything else must match.
+  const normalize = (value) => JSON.parse(JSON.stringify(value).replace(/"inline_marker_nonce":"[0-9a-f]{32}"/g, '"inline_marker_nonce":"n"'));
+  assert.deepEqual(normalize(payload), normalize(expectedPayload), 'reassembled payload equals the single-message one');
+});
+
+test('a rejected chunk stops the handoff with an error and publishes nothing', async () => {
+  const harness = createHarness(chunkTestConversation(), { handoffChunkChars: 1000, rejectChunkAt: 2 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+  assert.equal(error.error, 'rejected in test');
+  assert.equal(harness.transferChunks.length, 3);
+  assert.equal(harness.handoffs.length, 0);
 });

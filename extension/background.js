@@ -20,6 +20,7 @@ let lastSyncState = { stage: 'idle' };
 const CONTENT_PROGRESS_STALE_MS = 5 * 60 * 1000;
 const CONTENT_ACTIVE_STAGES = ['fetching', 'preparing'];
 let contentSyncState = null;
+let pendingTransfer = null;
 
 function contentSyncRunning() {
   return Boolean(contentSyncState
@@ -1052,22 +1053,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  if (msg.type === 'syncTransferChunk') {
+    // A large sync arrives as chunks of its JSON text (see handOff in
+    // content.js). Only one transfer is assembled at a time, strictly in order.
+    if (msg.index === 0) pendingTransfer = { id: msg.transferId, total: msg.total, chunks: [] };
+    if (!pendingTransfer || pendingTransfer.id !== msg.transferId || pendingTransfer.total !== msg.total
+      || msg.index !== pendingTransfer.chunks.length || typeof msg.data !== 'string') {
+      pendingTransfer = null;
+      sendResponse({ ok: false, error: 'The sync data reached the extension out of order. Nothing was published; sync again.' });
+      return false;
+    }
+    pendingTransfer.chunks.push(msg.data);
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg.type === 'syncNormalized') {
     // A content script can finish collecting data before the GitHub sync has
     // completed. Ignore duplicate handoffs rather than creating competing
     // commits against the same branch head.
     if (syncRunning) {
+      pendingTransfer = null;
       sendResponse({ ok: true, alreadyRunning: true });
       return false;
+    }
+
+    let payload = msg;
+    if (msg.transferId != null) {
+      const transfer = pendingTransfer;
+      pendingTransfer = null;
+      try {
+        if (!transfer || transfer.id !== msg.transferId || transfer.chunks.length !== transfer.total) throw new Error('incomplete');
+        payload = JSON.parse(transfer.chunks.join(''));
+      } catch {
+        const error = 'The sync data did not fully reach the extension (it may have restarted). Nothing was published; sync again.';
+        broadcast({ stage: 'error', error });
+        sendResponse({ ok: false, error });
+        return false;
+      }
     }
 
     // The content script's fetching phase is over; from here the GitHub sync
     // reports progress. Leaving its last "fetching" state behind would make a
     // reopened popup show a finished sync as still running.
     contentSyncState = null;
-    sync(msg.conversations, broadcast, Array.isArray(msg.skipped) ? msg.skipped : [], {
-      fullList: msg.fullList === true,
-      unchangedIds: Array.isArray(msg.unchangedIds) ? msg.unchangedIds : [],
+    sync(payload.conversations, broadcast, Array.isArray(payload.skipped) ? payload.skipped : [], {
+      fullList: payload.fullList === true,
+      unchangedIds: Array.isArray(payload.unchangedIds) ? payload.unchangedIds : [],
     })
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((e) => {

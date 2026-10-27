@@ -1010,15 +1010,7 @@
       // Keep the content-script lock until the background sync has actually
       // finished; otherwise another startSync message can trigger a second fetch
       // while the first batch is still being committed to GitHub.
-      const result = await new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'syncNormalized', conversations, skipped, unchangedIds, fullList: limit === 'all' }, (response) => {
-          if (chrome.runtime.lastError) {
-            reject(Error(chrome.runtime.lastError.message));
-            return;
-          }
-          resolve(response);
-        });
-      });
+      const result = await handOff({ conversations, skipped, unchangedIds, fullList: limit === 'all' }, signal);
       if (!result?.ok && !result?.cancelled) {
         sendProgress({ stage: 'error', error: result?.error || 'No response' });
       }
@@ -1037,6 +1029,40 @@
   // share one throttle so they do not start a sync each.
   const AUTO_SYNC_LIMIT = 20;
   const AUTO_SYNC_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+  // Chrome rejects extension messages over 64 MiB, and attachments travel as
+  // base64, so a large sync is handed to the background as consecutive chunks
+  // of its JSON text, which the background reassembles before syncing. A chunk
+  // of 8M characters stays under the limit even if every character needed
+  // escaping as several bytes.
+  const HANDOFF_CHUNK_CHARS = 8 * 1024 * 1024;
+
+  function sendRuntimeMessage(message) {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.runtime.sendMessage(message, (response) => {
+          if (chrome.runtime.lastError) reject(Error(chrome.runtime.lastError.message));
+          else resolve(response);
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  async function handOff(payload, signal) {
+    const text = JSON.stringify(payload);
+    if (text.length <= HANDOFF_CHUNK_CHARS) return sendRuntimeMessage({ type: 'syncNormalized', ...payload });
+    const transferId = createInlineMarkerNonce();
+    const total = Math.ceil(text.length / HANDOFF_CHUNK_CHARS);
+    for (let index = 0; index < total; index++) {
+      if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+      const data = text.slice(index * HANDOFF_CHUNK_CHARS, (index + 1) * HANDOFF_CHUNK_CHARS);
+      const response = await sendRuntimeMessage({ type: 'syncTransferChunk', transferId, index, total, data });
+      if (!response?.ok) throw new Error(response?.error || 'The extension did not accept the sync data. Nothing was published; sync again.');
+    }
+    return sendRuntimeMessage({ type: 'syncNormalized', transferId });
+  }
 
   async function maybeAutoSync() {
     let stored;
