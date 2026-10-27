@@ -522,3 +522,4 @@ mark{background:transparent!important;color:inherit!important}
 }
 .header-title{display:flex;align-items:center;gap:12px;min-width:0}.menu-button{display:none;flex:0 0 auto;width:40px;height:40px;align-items:center;justify-content:center;border:1px solid var(--border);background:var(--surface-2);color:var(--text);border-radius:9px;font-size:18px;cursor:pointer}.sidebar-backdrop{display:none}
 @media(max-width:700px){.menu-button{display:inline-flex}.app.sidebar-open>.sidebar{display:flex!important;position:fixed!important;top:0;bottom:0;left:0;height:100vh!important;height:100dvh!important;width:min(280px,85vw);z-index:60;overflow-y:auto!important;box-shadow:0 0 40px rgba(0,0,0,.45)}.app.sidebar-open>.sidebar-backdrop{display:block;position:fixed;inset:0;z-index:55;border:0;padding:0;background:rgba(0,0,0,.45);cursor:pointer}}
+.conversation:focus-visible{outline:2px solid var(--accent);outline-offset:2px}

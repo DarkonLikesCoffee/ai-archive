@@ -175,6 +175,31 @@ files['archive/index.json'] = JSON.stringify(index);
   check('tapping outside closes the menu', !(await page.locator('.sidebar').isVisible()));
   await page.setViewportSize({ width: 1280, height: 720 });
 
+  // Keyboard: / focuses search, j/k move through the list, Enter opens,
+  // Escape leaves the find bar and then goes back to the list.
+  await page.addInitScript(() => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner: 'me', repo: 'archive', token: 't' })));
+  await page.goto(`${base}#/`);
+  await page.reload(); // a hash-only navigation would not rerun the init script
+  await page.waitForSelector('.conversation');
+  const focused = () => page.evaluate(() => document.activeElement?.className || document.activeElement?.tagName);
+  await page.keyboard.press('/');
+  check('/ focuses the search box', (await focused()) === 'search', await focused());
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('j');
+  await page.keyboard.press('j');
+  await page.keyboard.press('k');
+  check('j/k move between conversations', (await page.evaluate(() => document.activeElement?.querySelector('strong')?.textContent)) === 'Rust ownership');
+  await page.keyboard.press('Enter');
+  await page.waitForSelector('.message');
+  check('Enter opens the focused conversation', page.url().includes('#/c/'), page.url());
+  await page.keyboard.press('/');
+  check('/ focuses the find bar in a conversation', (await focused()).includes('reader-search'), await focused());
+  await page.keyboard.press('Escape');
+  check('Escape leaves the empty find bar', !(await focused()).includes('reader-search'), await focused());
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('.conversation');
+  check('Escape goes back to the list', !page.url().includes('#/c/'), page.url());
+
   check('no uncaught page errors', errors.length === 0, errors.join(' | '));
   await browser.close();
 })().catch((e) => { console.error(e); process.exit(1); });
