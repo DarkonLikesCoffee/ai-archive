@@ -500,3 +500,22 @@ body,.app,.reader-shell,.auth{background:var(--bg)!important;color:var(--text)!i
 }
 .search-snippet mark{background:rgba(255,200,0,.28);color:inherit;border-radius:3px;padding:0 1px}
 .list-controls{display:flex;gap:8px;align-items:center;width:min(560px,55vw)}.list-controls .search{flex:1;min-width:0}.sort{background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:9px;padding:10px 10px;outline:none;cursor:pointer}.sort:focus{border-color:var(--muted)}.list-group-label{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:650;margin:22px 4px 6px}.list-group:first-child .list-group-label{margin-top:8px}@media(max-width:760px){.list-controls{width:100%}}
+.reader-header-actions{display:flex;gap:8px;justify-content:flex-end;align-items:center}.print-button{font:inherit;font-size:12px}.print-button:disabled{opacity:.6;cursor:default}@media(max-width:700px){.reader-header-actions{display:none}}
+/* Print / Save as PDF: only the conversation, light and page-friendly in every theme. */
+@media print{
+:root,:root[data-theme]{--bg:#fff;--surface:#fff;--surface-2:#f3f4f6;--surface-3:#eceef2;--border:#d4d8df;--text:#111;--muted:#555;--accent:#1a4fb4;--code-bg:#f6f7f9;--code-border:#d4d8df;color-scheme:light}
+html,body,.app,.reader-shell,.reader-main,main{background:#fff!important;color:#111!important;display:block!important;min-height:0!important}
+aside,.sidebar,.reader-sticky-header,.message-actions,.copy-code{display:none!important}
+.reader{max-width:none!important;padding:0!important;margin:0!important}
+.reader h2,.reader-head .meta,.pill,.message .role,.content,.content p,.content li,.content h1,.content h2,.content h3,.content td,.content th,.content blockquote{color:#111!important}
+.pill{background:#fff!important;border-color:#bbb!important}
+.reader-head,.message{border-color:#ddd!important}
+.message.user .content{background:#f3f4f6!important;border-color:#ddd!important;box-shadow:none!important;color:#111!important}
+.code-block,.content pre{background:#f6f7f9!important;border-color:#d4d8df!important;box-shadow:none!important;break-inside:avoid}
+.content pre,.content pre code,.code-block pre,.code-block code{white-space:pre-wrap!important;overflow-wrap:anywhere;overflow:visible!important;max-height:none!important}
+.content code,.content .code-block code,.content .code-block .hljs,.content .code-block .hljs *{color:#111!important;background:transparent!important}
+.content a{color:#1a4fb4!important}
+.content img,.md-image{max-width:100%!important;break-inside:avoid}
+mark{background:transparent!important;color:inherit!important}
+@page{margin:16mm}
+}

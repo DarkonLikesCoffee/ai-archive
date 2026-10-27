@@ -123,6 +123,25 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.reload();
   await imageShown();
   check('revisiting shows the image from the cache, without GitHub', assetRequests.length === firstVisit, `asset requests=${assetRequests.length}`);
+  // Print / PDF: the button prints, and print media shows only the conversation.
+  await page.evaluate(() => { window.__printed = 0; window.print = () => { window.__printed += 1; }; });
+  await page.click('.print-button');
+  check('Print / PDF opens the print dialog', (await page.evaluate(() => window.__printed)) === 1);
+  await page.emulateMedia({ media: 'print' });
+  const printed = await page.evaluate(() => ({
+    sidebar: getComputedStyle(document.querySelector('aside')).display,
+    header: getComputedStyle(document.querySelector('.reader-sticky-header')).display,
+    copy: document.querySelector('.copy-message').checkVisibility() ? 'visible' : 'none',
+    background: getComputedStyle(document.body).backgroundColor,
+    text: getComputedStyle(document.querySelector('.message .content')).color,
+    image: !!document.querySelector('.content img[src^="data:image/png"]'),
+  }));
+  check('print hides the app chrome and uses dark text on white', printed.sidebar === 'none' && printed.header === 'none' && printed.copy === 'none'
+    && printed.background === 'rgb(255, 255, 255)' && printed.text === 'rgb(17, 17, 17)' && printed.image, JSON.stringify(printed));
+  if (process.env.PRINT_PDF) await page.pdf({ path: process.env.PRINT_PDF });
+  const pdf = await page.pdf();
+  check('the conversation renders to PDF', pdf.length > 1000 && pdf.subarray(0, 4).toString() === '%PDF', `${pdf.length} bytes`);
+  await page.emulateMedia({ media: 'screen' });
   await page.locator('button.nav', { hasText: 'Disconnect' }).click();
   await page.waitForFunction(async () => !(await caches.keys()).length);
   check('Disconnect clears the attachment cache', true);
