@@ -351,9 +351,9 @@
     try {
       binary = atob(normalized);
     } catch {
-      throw new Error('Claude returned an invalid base64 inline content block. Sync stopped before anything was sent to GitHub.');
+      throw new Error('Claude returned an invalid base64 inline content block.');
     }
-    if (!binary.length) throw new Error('Claude returned an empty base64 inline content block. Sync stopped before anything was sent to GitHub.');
+    if (!binary.length) throw new Error('Claude returned an empty base64 inline content block.');
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   }
 
@@ -403,7 +403,7 @@
     }
     try {
       const r = await fetch(url, { credentials: 'include', signal });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
       const buffer = await r.arrayBuffer();
       if (!buffer.byteLength) throw new Error('the download returned an empty file');
       return {
@@ -415,8 +415,27 @@
       };
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw new Error(`Failed to download attachment "${label}": ${e?.message || 'network error'}. Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw Object.assign(new Error(`Failed to download attachment "${label}": ${e?.message || 'network error'}.`), { status: e?.status });
     }
+  }
+
+  // A download Claude answers with 404/410 is gone, not temporarily failing:
+  // retrying cannot recover it. Such a file is archived as a visible "not
+  // archived" note (and the conversation marked incomplete) instead of
+  // keeping the whole conversation out of the archive. Any other failure
+  // (network, 5xx, 403, 429) skips the conversation so a later sync retries it.
+  const UNAVAILABLE_STATUSES = new Set([404, 410]);
+  const isUnavailable = (error) => UNAVAILABLE_STATUSES.has(error?.status);
+
+  // Signs that Claude's tools may have written files into the conversation's
+  // sandbox: a file-oriented tool call or a sandbox path in the active lineage.
+  function mayHaveSandboxFiles(messages) {
+    for (const message of messages) {
+      for (const block of (Array.isArray(message?.content) ? message.content : [])) {
+        if (block?.type === 'tool_use' && /file|bash|str_replace|present/i.test(String(block.name || ''))) return true;
+      }
+    }
+    return /\/mnt\/(?:user-data|data)\//.test(JSON.stringify(messages));
   }
 
   function sandboxFileIsReferenced(file, messages, allFiles, directAssets = []) {
@@ -445,17 +464,22 @@
     });
   }
 
-  async function fetchSandboxFiles(org, conversationId, messages, directAssets, signal) {
+  // Returns { assets, listStatus }. Claude answers the file list with 404 for a
+  // conversation that has no sandbox (observed on a real account: the same
+  // endpoint succeeds for other conversations of the same organization), so
+  // 404 is an empty list here; the caller decides whether files may be missing.
+  async function fetchSandboxFiles(org, conversationId, messages, directAssets, signal, incomplete = []) {
     const endpoint = `/api/organizations/${org}/conversations/${conversationId}/wiggle/list-files`;
     let r;
     try {
       r = await fetch(endpoint, { credentials: 'include', signal });
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}": ${e?.message || 'network error'}. Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}": ${e?.message || 'network error'}.`);
     }
+    if (r.status === 404) return { assets: [], listStatus: 404 };
     if (!r.ok) {
-      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}" (HTTP ${r.status}). Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}" (HTTP ${r.status}).`);
     }
 
     let data;
@@ -463,15 +487,15 @@
       data = await r.json();
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw new Error(`Claude returned an unreadable sandbox file list for conversation "${conversationId}". Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw new Error(`Claude returned an unreadable sandbox file list for conversation "${conversationId}".`);
     }
     if (!Array.isArray(data?.files_metadata)) {
-      throw new Error(`Claude returned an invalid sandbox file list for conversation "${conversationId}". Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw new Error(`Claude returned an invalid sandbox file list for conversation "${conversationId}".`);
     }
 
     for (const file of data.files_metadata) {
       if (!file?.path) {
-        throw new Error(`Claude returned sandbox file metadata without a path for conversation "${conversationId}". Sync stopped before anything was sent to GitHub.`);
+        throw new Error(`Claude returned sandbox file metadata without a path for conversation "${conversationId}".`);
       }
     }
 
@@ -482,7 +506,7 @@
       sandboxFileIsReferenced(file, messages, data.files_metadata, directAssets)
     );
 
-    return mapWithConcurrency(
+    const downloaded = await mapWithConcurrency(
       activeFiles,
       ASSET_DOWNLOAD_CONCURRENCY,
       async (file) => {
@@ -492,12 +516,17 @@
           asset = await fetchAsset(url, file.path.split('/').pop() || file.path, file.content_type, signal);
         } catch (e) {
           if (e?.name === 'AbortError') throw e;
+          if (isUnavailable(e)) {
+            incomplete.push({ kind: 'sandbox-file', name: file.path, reason: `Claude returned HTTP ${e.status} for this file's download` });
+            return null;
+          }
           throw new Error(`Failed to download sandbox file "${file.path}": ${e?.message || 'download error'}`);
         }
         return { ...asset, source_path: file.path, source: 'sandbox' };
       },
       signal,
     );
+    return { assets: downloaded.filter(Boolean), listStatus: r.status };
   }
 
   function isReplyExcerptAttachment(file) {
@@ -505,7 +534,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map()) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map(), incomplete = []) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -573,13 +602,22 @@
       directTasks,
       ASSET_DOWNLOAD_CONCURRENCY,
       async ({ message, file, url, name, messageExternalIds, messageReferences }) => {
-        const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
-        return { asset, message, file, messageExternalIds, messageReferences };
+        try {
+          const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
+          return { asset, message, file, messageExternalIds, messageReferences };
+        } catch (e) {
+          if (!isUnavailable(e)) throw e;
+          // Handled like a file without a URL: the sandbox may still hold it.
+          for (const referenced of messageReferences) {
+            filesWithoutDownloadUrl.push({ message: referenced, file, name, reason: `Claude returned HTTP ${e.status} for its download` });
+          }
+          return null;
+        }
       },
       signal,
     );
 
-    for (const { asset, message, file, messageExternalIds, messageReferences } of directAssets) {
+    for (const { asset, message, file, messageExternalIds, messageReferences } of directAssets.filter(Boolean)) {
       const messageId = message.uuid || message.id || null;
       const linkedMessageIds = messageExternalIds.length
         ? messageExternalIds
@@ -603,7 +641,10 @@
     }
 
     // The sandbox contains the original uploads and files generated by Claude's tools.
-    const sandbox = await fetchSandboxFiles(org, conversationId, messages, directAssets, signal);
+    const { assets: sandbox, listStatus } = await fetchSandboxFiles(org, conversationId, messages, directAssets.filter(Boolean), signal, incomplete);
+    if (listStatus === 404 && mayHaveSandboxFiles(messages)) {
+      incomplete.push({ kind: 'sandbox', reason: 'Claude returned HTTP 404 for this conversation\'s file list, so files created by Claude\'s tools may be missing' });
+    }
     for (const asset of sandbox) {
       const key = `${asset.source_path}|${asset.sha256}`;
       const nameKey = String(asset.name || '').toLowerCase();
@@ -767,11 +808,13 @@
       }
     }
 
-    // A listed message file with no URL is not necessarily lost: Claude may
-    // expose its extracted text or include it in the conversation sandbox.
-    // But if neither source yielded a matching asset, failing safely is better
-    // than claiming the conversation was archived completely.
-    for (const { message, file, name } of filesWithoutDownloadUrl) {
+    // A listed message file with no URL (or whose download Claude answered with
+    // 404/410) is not necessarily lost: Claude may expose its extracted text or
+    // include it in the conversation sandbox. If neither source yielded a
+    // matching asset, it is recorded as not archived: the conversation shows a
+    // note in its place and is marked incomplete, so it is never mistaken for
+    // a complete archive and later syncs retry it.
+    for (const { message, file, name, reason } of filesWithoutDownloadUrl) {
       const messageId = message.uuid || message.id || null;
       const fileId = file.file_uuid || file.uuid || null;
       const nameKeys = new Set([
@@ -802,9 +845,7 @@
       });
 
       if (!scopedMatch && !sandboxMatch) {
-        throw new Error(
-          `Cannot safely export Claude conversation "${conversationId}": attachment "${name}" has no downloadable URL and no matching archiveable file was found. Sync stopped before anything was sent to GitHub; retry or inspect the attachment in Claude.`,
-        );
+        incomplete.push({ kind: 'attachment', message_external_id: messageId, file_uuid: fileId, name, reason: reason || 'Claude did not provide a download link for this file' });
       }
     }
     return assets;
@@ -899,7 +940,10 @@
       };
     });
 
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage);
+    // Files that could not be archived; rendered as visible notes and recorded
+    // in the index so the conversation is retried by later syncs.
+    const incomplete = [];
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage, incomplete);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',
@@ -911,6 +955,7 @@
       inline_marker_nonce: inlineMarkerNonce,
       messages,
       assets,
+      incomplete,
     };
   }
 
