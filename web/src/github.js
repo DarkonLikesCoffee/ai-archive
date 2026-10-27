@@ -125,8 +125,26 @@ async function decompressSearchText(encoded) {
   return new Response(stream).text();
 }
 
+// Connecting checks the repository first; say what a failure means.
+export function describeConnectError(error, settings) {
+  const message = String(error?.message || error || '');
+  if (/^GitHub 404/.test(message)) {
+    return `Repository ${settings.owner}/${settings.repo} was not found, or the token cannot access it. Check the owner and repository names and the token's repository access.`;
+  }
+  return message;
+}
+
+// A repository the extension has not synced to yet has no index (404), or no
+// commits at all (409). That is an empty archive, not an error.
 export async function readIndex(settings) {
-  const index = JSON.parse(await readText(settings, 'archive/index.json'));
+  let text;
+  try {
+    text = await readText(settings, 'archive/index.json');
+  } catch (error) {
+    if (/^GitHub (404|409)/.test(String(error?.message || ''))) return { version: 2, conversations: [], missing: true };
+    throw error;
+  }
+  const index = JSON.parse(text);
   if (!Array.isArray(index?.conversations)) return index;
 
   // Keep memory bounded while inflating per-conversation search caches. Older
