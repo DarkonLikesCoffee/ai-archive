@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-27 07:10 UTC — post-roadmap product cycle (#57–#71).
+Last updated: 2026-10-27 07:22 UTC — post-roadmap product cycle (#57–#74).
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -36,7 +36,10 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | Viewer | Keyboard shortcuts (/, j/k, Enter, Escape) | ✅ real Chromium | #68 |
 | Popup | Bug: finished sync reported as "fetching" for 5 min (Sync disabled) | ✅ fixed | #69 |
 | Popup | Sync from any tab: finds or opens a Claude tab | ✅ real Chromium e2e | #70 |
-| Viewer | Outline of your prompts in long conversations | ✅ real Chromium | #71 (open) |
+| Viewer | Outline of your prompts in long conversations | ✅ real Chromium | #71 |
+| Viewer | Print / Open on GitHub reachable on phones | ✅ real Chromium | #72 |
+| Viewer | First run: clear "repository not found"; empty archive shows next steps | ✅ real Chromium | #73 |
+| Export | **Bug:** syncs over ~48 MB of attachments failed (Chrome 64 MiB message limit) → chunked handoff | ✅ reproduced + fixed in real Chromium | #74 |
 | Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
 | All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible here; the extension now runs end to end in headless Chromium against faithful fakes (#61), but real claude.ai responses and real GitHub remain unverified | — |
 
@@ -106,7 +109,12 @@ Secondary items left (none blocks the product):
 - #69 bug found by the extension e2e once it clicked the real Sync button: a reopened popup showed a finished
   sync as still fetching (and disabled Sync) for 5 minutes after every sync — fixed
 - #70 Sync from any tab (find most recent Claude tab, or open one in the background)
-- #71 prompt outline (open; CI pending at time of writing)
+- #71 prompt outline · #72 phone reader actions · #73 first-run states
+- #74 **serious bug**: the content→background handoff was one message; Chrome caps messages at 64 MiB, so any
+  sync carrying > ~48 MB of base64 attachments failed and published nothing (a big first sync could never
+  succeed). Reproduced with the real extension (3 × 25 MB) → chunked handoff; e2e checks bytes end to end.
+- Open finding (not fixed, needs GitHub limits I cannot test): one attachment over GitHub's 100 MB file limit
+  would fail the whole sync on every retry. Option: skip assets above a cap with a visible placeholder.
 - Test totals on master + #71: extension 118/118, web 67/67, viewer e2e 41/41, extension e2e 24/24.
 - Next candidates: reader controls on phones (Print/Open on GitHub are hidden < 700px), archive overview.
 
