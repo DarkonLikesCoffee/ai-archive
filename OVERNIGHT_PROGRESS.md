@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-27 07:40 UTC — post-roadmap product cycle (#57–#78); feature set comprehensive within what this environment can verify.
+Last updated: 2026-10-27 16:50 UTC — real-account sync failures diagnosed and fixed in code (PR #79, merged as `00c4850`); real-account confirmation pending.
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -45,6 +45,49 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | Viewer | Archive overview (totals, per month, models, accounts) | ✅ real Chromium | #78 |
 | Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
 | All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible here; the extension now runs end to end in headless Chromium against faithful fakes (#61), but real claude.ai responses and real GitHub remain unverified | — |
+
+## Real-account sync investigation (2026-10-27, owner report) — PR #79, squash-merged as `00c4850` (branch head `8d25566`, CI green)
+
+Owner's first real sync: Claude listed 11 conversations (sidebar shows 11); 1 committed, 7 "could not be
+exported", the rest unchanged; viewer showed 4.
+
+### Per-conversation status (from code + owner's popup text; IDs not available to me)
+| Conversation | Returned by Claude's list | Fetched | Export | Committed | In viewer | Cause |
+|---|---|---|---|---|---|---|
+| Busqueda y Uso de la informacion, Carrera de estudios, Information science, Rutina del gym | yes | 1 of them re-fetched (changed), 3 unchanged | ok | yes (earlier syncs + 1 now) | yes | — |
+| Repaso de Information Science | yes (it was attempted) | yes | failed | no | no | sandbox `list-files` HTTP 404 (error text seen) |
+| Canva con guion de diapositivas | yes | yes | failed | no | no | sandbox `list-files` HTTP 404 (error text seen) |
+| Base de datos | yes | yes | failed | no | no | PDF listed without a download URL, no sandbox/extracted match (error text seen) |
+| Proyecto web open-source, Edición digital 1, Édition digital asignatura, Medios de comunicacion y sociedad digital | yes (11 = 1 + 3 + 7) | yes | failed | no | no | not shown (popup listed only 3 errors) — most likely sandbox 404 too; **unconfirmed** |
+
+Why "returned by Claude" is a deduction: every listed conversation ends up unchanged, exported, or in
+`skipped`; 1 + 3 + 7 = 11 = the sidebar count. Why "not hidden by the viewer": skipped conversations never
+reach the background; index entries are never removed; the viewer lists every index entry unless the URL
+carries an account/provider filter — so the 7 were never archived.
+
+### Confirmed causes and fixes (code, tests, and a real-browser reproduction against a fake claude.ai)
+1. `list-files` 404 threw → whole conversation skipped. Fix: 404 = no sandbox; conversation archived; if file
+   tools were used, a visible "Incomplete archive" note + `incomplete` in the index. Other statuses still skip
+   and retry.
+2. File without URL (or download 404/410) threw → whole conversation skipped. Fix: try the sandbox; else
+   archive with "Attachment not archived: <name> (<reason>)" in place, `incomplete` in the index.
+3. Incomplete entries are never "unchanged" → every sync retries them.
+4. Integrity guard: an incomplete export never replaces an archived copy that has files the new export lacks.
+5. Reporting: listed / committed / unchanged / failed (new vs archived copy kept) / incomplete / kept-previous;
+   "Sync finished with problems"; popup list with titles + IDs; viewer "files missing" badge; outdated
+   "Sync stopped before anything was sent to GitHub" texts removed.
+6. "Copy diagnostic report" (sanitized response structure; no text, titles, file names, contents, credentials).
+
+Reproduction: the extension e2e's fake claude.ai answers `list-files` with 404 + Claude-style error body and
+lists the PDF without a URL; on master it fails with the exact real error text, on the branch it passes.
+
+Tests: extension 135/135, web 73/73, build OK, viewer e2e 47/47, extension e2e 37/37.
+
+### Still needs the real account
+- That `list-files` 404 means "no sandbox" (inferred: same endpoint works for other conversations).
+- Where Claude exposes the PDF's file (needs the diagnostic report) — the PDF is now visibly marked, not lost,
+  but not yet downloaded.
+- That the 4 conversations without visible error text failed for the same reason, and that all 7 now archive.
 
 ## Ground rules followed
 - No force-push, no history rewrite, no deploys/releases.
