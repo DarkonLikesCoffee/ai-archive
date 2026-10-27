@@ -8,6 +8,7 @@ import { searchConversations } from './archiveSearch.js';
 import { formatRoute, parseRoute } from './route.js';
 import { clearAssetCache, readAssetCached } from './assetCache.js';
 import { moveFocusIndex, shortcutFor } from './shortcuts.js';
+import { promptOutline } from './outline.js';
 import { effectiveSort, groupByDate, sortConversations, sortDate, sortOptions } from './listOrder.js';
 import './styles.css';
 
@@ -374,7 +375,7 @@ async function copyCodeBlock(event) {
   } catch {}
 }
 
-function Message({ message, assets, assetBusy }) {
+function Message({ message, assets, assetBusy, anchor }) {
   const hasLocalAssets = /!?(?:\[[^\]]*\])\((?!https?:\/\/)[^)]+\)/i.test(String(message.content || ''));
   const [html, setHtml] = useState(renderMarkdown(message.content));
   const [copied, setCopied] = useState(false);
@@ -434,9 +435,9 @@ function Message({ message, assets, assetBusy }) {
   const role = <div className="role">{roleLabel}</div>;
   const copyButton = <div className="message-actions"><button className="copy-message" type="button" onClick={copyMessage} title="Copy message" aria-label="Copy message">{copied ? '✓ Copied' : 'Copy'}</button></div>;
   if (assetBusy && hasLocalAssets) {
-    return <article className={messageClass}>{role}<div className="content asset-loading"><div className="asset-skeleton" aria-label="Loading attachments"></div></div>{copyButton}</article>;
+    return <article id={anchor} className={messageClass}>{role}<div className="content asset-loading"><div className="asset-skeleton" aria-label="Loading attachments"></div></div>{copyButton}</article>;
   }
-  return <article className={messageClass}>{role}<div className="content" dangerouslySetInnerHTML={html}/>{copyButton}</article>;
+  return <article id={anchor} className={messageClass}>{role}<div className="content" dangerouslySetInnerHTML={html}/>{copyButton}</article>;
 }
 
 function Reader({ settings, selected, conversation, onBack, sidebar }) {
@@ -599,11 +600,24 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
     if (e.key==='Escape') { e.preventDefault(); if (findQuery) setFindQuery(''); else e.currentTarget.blur(); }
   }
 
+  // Outline of your prompts (wide screens): jump to a prompt, and follow the
+  // one being read while scrolling.
+  const outline=useMemo(()=>promptOutline(conversation.messages),[conversation]);
+  const [activePrompt,setActivePrompt]=useState(-1);
+  useEffect(()=>{
+    if(outline.length<3)return;
+    let frame=0;
+    const update=()=>{frame=0;let current=outline[0].index;for(const entry of outline){const el=document.getElementById(`message-${entry.index}`);if(el&&el.getBoundingClientRect().top<=140)current=entry.index;else break}setActivePrompt(current)};
+    const onScroll=()=>{if(!frame)frame=requestAnimationFrame(update)};
+    update();window.addEventListener('scroll',onScroll,{passive:true});
+    return()=>{window.removeEventListener('scroll',onScroll);if(frame)cancelAnimationFrame(frame)};
+  },[outline]);
+  const outlineNav=outline.length>=3?<nav className="reader-outline" aria-label="Your prompts"><div className="reader-outline-title">Your prompts</div>{outline.map(entry=><button key={entry.index} type="button" className={entry.index===activePrompt?'active':''} title={entry.label} onClick={()=>document.getElementById(`message-${entry.index}`)?.scrollIntoView({behavior:'smooth',block:'start'})}>{entry.label}</button>)}</nav>:null;
   const findCount=findTotal;
   const date=conversation.updated_at?new Date(conversation.updated_at).toLocaleString():'';
   return <div className="reader-shell">{sidebar}<main className="reader-main">
     <div className="reader-sticky-header"><button className="back" onClick={onBack}>← Back</button><div className="reader-find"><input ref={findInputRef} className="search reader-search" placeholder="Search in conversation…" aria-label="Search in conversation" value={findQuery} onChange={e=>{setFindQuery(e.target.value);setFindIndex(0)}} onKeyDown={handleFindKeyDown}/>{findQuery.trim()&&<div className="reader-find-controls"><span className="reader-find-count">{findCount ? `${Math.min(findIndex+1,findCount)} / ${findCount}` : 'No results'}</span><button className="reader-find-button" type="button" onClick={()=>cycleFind(-1)} disabled={!findCount} aria-label="Previous result" title="Previous result">↑</button><button className="reader-find-button" type="button" onClick={()=>cycleFind(1)} disabled={!findCount} aria-label="Next result" title="Next result">↓</button></div>}</div><div className="reader-header-actions"><button className="github-link print-button" type="button" onClick={()=>window.print()} disabled={assetBusy} title={assetBusy?"Waiting for attachments to load":"Print or save this conversation as PDF"}>{assetBusy?"Loading…":"Print / PDF"}</button><a className="github-link" href={githubBlobUrl(settings, selected.path)} target="_blank" rel="noreferrer">Open on GitHub ↗</a></div></div>
-    <div className="reader"><div className="reader-head"><div className="pills"><div className="pill">{conversation.provider}</div><div className="pill">{conversation.account||'personal'}</div></div><h2>{conversation.title}</h2><div className="meta">{conversation.model||'model unknown'}{date?` · ${date}`:''}{assetBusy?' · loading attachments…':''}</div></div><div className="conversation-body" ref={bodyRef} onClick={copyCodeBlock}>{conversation.messages.map((m,i)=><Message key={i} message={m} assets={assets} assetBusy={assetBusy}/>)}</div></div>
+    <div className="reader-layout"><div className="reader"><div className="reader-head"><div className="pills"><div className="pill">{conversation.provider}</div><div className="pill">{conversation.account||'personal'}</div></div><h2>{conversation.title}</h2><div className="meta">{conversation.model||'model unknown'}{date?` · ${date}`:''}{assetBusy?' · loading attachments…':''}</div></div><div className="conversation-body" ref={bodyRef} onClick={copyCodeBlock}>{conversation.messages.map((m,i)=><Message key={i} anchor={`message-${i}`} message={m} assets={assets} assetBusy={assetBusy}/>)}</div></div>{outlineNav}</div>
   </main></div>;
 }
 

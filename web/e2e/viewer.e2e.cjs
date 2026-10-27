@@ -24,7 +24,11 @@ const conversations = [
     assets: [{ file_uuid: 'img-1', name: 'diagram.png', mime: 'image/png', base64: PNG, sha256: pngSha256, size: Buffer.from(PNG, 'base64').length, message_external_ids: ['u1'] }] },
   { external_id: 'conv/rust?#1', title: 'Rust ownership', source_updated_at: '2026-10-25T10:00:00Z', message_count: 2, messages: [
     { external_id: 'u2', role: 'user', content: 'Explain the borrow checker', files: [], attachments: [] },
-    { external_id: 'a2', role: 'assistant', content: 'The borrow checker enforces ownership.\n\n```rust\nlet s = String::from("hi");\nlet t = &s;\n```', files: [], attachments: [] }], assets: [] },
+    { external_id: 'a2', role: 'assistant', content: 'The borrow checker enforces ownership.\n\n```rust\nlet s = String::from("hi");\nlet t = &s;\n```', files: [], attachments: [] },
+    ...['Lifetimes?', 'What about **Rc** and RefCell?', 'Summarize'].flatMap((q, i) => [
+      { external_id: `u2-${i}`, role: 'user', content: q, files: [], attachments: [] },
+      { external_id: `a2-${i}`, role: 'assistant', content: Array.from({ length: 12 }, () => 'Ownership rules keep memory safe without a garbage collector.').join('\n\n'), files: [], attachments: [] },
+    ])], assets: [] },
 ];
 const files = {};
 const index = { version: 2, conversations: [] };
@@ -199,6 +203,20 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.keyboard.press('Escape');
   await page.waitForSelector('.conversation');
   check('Escape goes back to the list', !page.url().includes('#/c/'), page.url());
+
+  // Outline of your prompts in a long conversation (wide screens only).
+  await page.setViewportSize({ width: 1400, height: 800 });
+  await page.goto(`${base}#/c/claude/personal/${encodeURIComponent('conv/rust?#1')}`);
+  await page.waitForSelector('.reader-outline button');
+  const outlineLabels = await page.locator('.reader-outline button').allTextContents();
+  check('the outline lists every prompt as plain text', JSON.stringify(outlineLabels) === JSON.stringify(['Explain the borrow checker', 'Lifetimes?', 'What about Rc and RefCell?', 'Summarize']), JSON.stringify(outlineLabels));
+  await page.locator('.reader-outline button').nth(2).click();
+  await page.waitForFunction(() => Math.abs(document.getElementById('message-4').getBoundingClientRect().top - 84) < 30);
+  await page.waitForFunction(() => document.querySelector('.reader-outline button.active')?.textContent === 'What about Rc and RefCell?');
+  check('clicking a prompt scrolls to it and marks it as current', true);
+  await page.setViewportSize({ width: 1000, height: 800 });
+  check('narrower screens hide the outline', !(await page.locator('.reader-outline').isVisible()));
+  await page.setViewportSize({ width: 1280, height: 720 });
 
   check('no uncaught page errors', errors.length === 0, errors.join(' | '));
   await browser.close();
