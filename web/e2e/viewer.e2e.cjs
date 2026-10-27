@@ -218,6 +218,29 @@ files['archive/index.json'] = JSON.stringify(index);
   check('narrower screens hide the outline', !(await page.locator('.reader-outline').isVisible()));
   await page.setViewportSize({ width: 1280, height: 720 });
 
+  // First run: a mistyped repository is explained, and a repository the
+  // extension has not synced to yet shows an empty archive with next steps.
+  const fresh = await (await browser.newContext()).newPage();
+  fresh.on('pageerror', (e) => errors.push(String(e)));
+  await fresh.route('https://api.github.com/**', (route) => {
+    const { pathname } = new URL(route.request().url());
+    if (pathname === '/repos/me/new-archive') return route.fulfill({ status: 200, contentType: 'application/json', body: '{"full_name":"me/new-archive"}' });
+    if (pathname.startsWith('/repos/me/new-archive/')) return route.fulfill({ status: 409, contentType: 'application/json', body: '{"message":"Git Repository is empty."}' });
+    return route.fulfill({ status: 404, contentType: 'application/json', body: '{"message":"Not Found"}' });
+  });
+  await fresh.goto(base);
+  await fresh.fill('input[placeholder="your-username"]', 'me');
+  await fresh.fill('input[placeholder="ai-conversation-archive"]', 'new-archiv');
+  await fresh.fill('input[type="password"]', 't');
+  await fresh.click('.auth button');
+  await fresh.waitForSelector('.auth .error');
+  check('a repository that does not exist is explained', /^Repository me\/new-archiv was not found/.test(await fresh.locator('.auth .error').textContent()), await fresh.locator('.auth .error').textContent());
+  await fresh.fill('input[placeholder="ai-conversation-archive"]', 'new-archive');
+  await fresh.click('.auth button');
+  await fresh.waitForSelector('.empty-archive');
+  check('an archive that was never synced shows next steps, not an error',
+    (await fresh.locator('.empty-archive').textContent()).includes('This archive is empty') && !(await fresh.locator('.error').count()));
+
   check('no uncaught page errors', errors.length === 0, errors.join(' | '));
   await browser.close();
 })().catch((e) => { console.error(e); process.exit(1); });
