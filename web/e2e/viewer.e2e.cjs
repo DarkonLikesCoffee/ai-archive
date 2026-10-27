@@ -177,6 +177,14 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.click('.menu-button');
   await page.mouse.click(370, 400);
   check('tapping outside closes the menu', !(await page.locator('.sidebar').isVisible()));
+  await page.locator('.conversation', { hasText: 'Frontend help' }).click();
+  await page.waitForSelector('.message');
+  const phoneActions = page.locator('.reader-head-actions');
+  check('phones show Print / PDF and Open on GitHub under the title',
+    await phoneActions.locator('.print-button').isVisible() && await phoneActions.locator('a.github-link').isVisible()
+    && !(await page.locator('.reader-header-actions').isVisible()));
+  await page.goBack();
+  await page.waitForSelector('.conversation');
   await page.setViewportSize({ width: 1280, height: 720 });
 
   // Keyboard: / focuses search, j/k move through the list, Enter opens,
