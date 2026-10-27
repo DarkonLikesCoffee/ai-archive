@@ -45,6 +45,8 @@ function rememberLastSync(payload) {
     message: String(payload.message || payload.error || ''),
     changed: Number.isFinite(payload.changed) ? payload.changed : null,
     commit: payload.commit || null,
+    partial: payload.partial === true,
+    ...(payload.report ? { report: payload.report } : {}),
   };
   try {
     chrome.storage?.local?.set?.({ last_sync: record })?.catch?.(() => {});
@@ -439,7 +441,25 @@ function contentWithoutInlineMarkers(c, content) {
   return String(content || '').replace(INLINE_ASSET_MARKER, (marker, nonce) => (isOwnInlineMarker(c, nonce) ? '' : marker));
 }
 
-function attachmentMarkdown(message, assetMap, allAssets) {
+// What the content script could not archive for a conversation (see
+// collectMessageAssets in content.js), reduced to plain fields.
+function incompleteItems(c) {
+  return (Array.isArray(c?.incomplete) ? c.incomplete : [])
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => ({
+      kind: String(item.kind || 'attachment'),
+      ...(item.name ? { name: String(item.name) } : {}),
+      ...(item.message_external_id ? { message_external_id: String(item.message_external_id) } : {}),
+      ...(item.file_uuid ? { file_uuid: String(item.file_uuid) } : {}),
+      reason: String(item.reason || 'not archived').replace(/\s+/g, ' ').slice(0, 300),
+    }));
+}
+
+function notArchivedMarkdown(item) {
+  return `**Attachment not archived: ${escapeMarkdownLabel(item.name || 'file')}** (${escapeMd(item.reason)})`;
+}
+
+function attachmentMarkdown(message, assetMap, allAssets, missing = []) {
   const parts = [];
   const assets = findMessageAssets(message, allAssets);
   const used = new Set();
@@ -455,7 +475,18 @@ function attachmentMarkdown(message, assetMap, allAssets) {
 
   for (const file of (message.files || [])) {
     const name = file?.file_name || file?.name || null;
-    addAsset(attachmentAssetForMessage(message, file, name, assetMap, assets, allAssets));
+    const asset = attachmentAssetForMessage(message, file, name, assetMap, assets, allAssets);
+    if (asset) {
+      addAsset(asset);
+      continue;
+    }
+    // A file Claude listed but the exporter could not archive stays visible
+    // where it was attached, instead of disappearing from the conversation.
+    const messageId = String(message.external_id || message.uuid || message.id || '');
+    const fileId = String(file?.file_uuid || file?.uuid || '');
+    const gone = missing.find((item) => item.kind === 'attachment' && item.message_external_id === messageId
+      && (item.file_uuid ? item.file_uuid === fileId : item.name === name));
+    if (gone) parts.push(notArchivedMarkdown(gone));
   }
 
   for (const attachment of (message.attachments || [])) {
@@ -502,13 +533,17 @@ function fenceMarkdown(text, language = '') {
 
 function conversationMarkdown(c, provider, account, assetMap, allAssets) {
   const metadata = conversationMetadata(c, provider, account);
+  const missing = incompleteItems(c);
+  // Files that belong to the conversation rather than to one message.
+  const notices = missing.filter((item) => item.kind !== 'attachment')
+    .map((item) => `> **Incomplete archive:** ${item.kind === 'sandbox-file' ? `${escapeMarkdownLabel(item.name || 'a file')} was not archived (${escapeMd(item.reason)})` : escapeMd(item.reason)}.`);
   const sections = c.messages.map((m) => {
     const role = m.role === 'user'
       ? 'You'
       : m.role === 'assistant'
         ? provider[0].toUpperCase() + provider.slice(1)
         : m.role;
-    const attachments = attachmentMarkdown(m, assetMap, allAssets);
+    const attachments = attachmentMarkdown(m, assetMap, allAssets, missing);
     const content = String(m.content || '').replace(INLINE_ASSET_MARKER, (marker, nonce, rawIndex) => {
       // Marker-shaped text from the conversation itself stays verbatim.
       if (!isOwnInlineMarker(c, nonce)) return marker;
@@ -535,7 +570,8 @@ function conversationMarkdown(c, provider, account, assetMap, allAssets) {
 
   const metadataJson = JSON.stringify(metadata, null, 2).replace(/--/g, '-\\u002d');
   const hiddenMetadata = `<!-- AI_ARCHIVE_METADATA\n${metadataJson}\n-->`;
-  return `${hiddenMetadata}\n\n# ${escapeMd(c.title || 'Untitled conversation')}\n\n${sections.join('\n---\n\n')}`;
+  const noticeBlock = notices.length ? `${notices.join('\n>\n')}\n\n` : '';
+  return `${hiddenMetadata}\n\n# ${escapeMd(c.title || 'Untitled conversation')}\n\n${noticeBlock}${sections.join('\n---\n\n')}`;
 }
 
 function normalizeAssetList(c, provider, accountSlug) {
@@ -576,6 +612,9 @@ function indexEntry(c, path, provider, account, assets) {
     assets: assets.filter((a) => !a.omitted).map((a) => ({ path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name })),
     format_version: 4,
     exporter_version: EXPORTER_VERSION,
+    // Present only when files could not be archived; such a conversation is
+    // never treated as unchanged, so every sync retries it.
+    ...(incompleteItems(c).length ? { incomplete: incompleteItems(c) } : {}),
     preview: String(contents.find(Boolean) || '').slice(0, 300),
     search_text: [c.title, ...contents].join('\n').slice(0, 250000),
   };
@@ -627,13 +666,31 @@ function onProgressSafe(payload) {
   activeProgressCallback?.(payload);
 }
 
-// Conversations the content script could not export are left out of the
-// sync (their archived copies are untouched); say so in every completion.
-function skippedSummary(skipped) {
-  if (!Array.isArray(skipped) || !skipped.length) return '';
-  const listed = skipped.slice(0, 3).map((item) => `"${item.title || item.id}" (${String(item.error || 'unknown error').slice(0, 160)})`);
-  const more = skipped.length > 3 ? `; and ${skipped.length - 3} more` : '';
-  return ` ${skipped.length} conversation${skipped.length === 1 ? '' : 's'} could not be exported and ${skipped.length === 1 ? 'was' : 'were'} left unchanged in the archive: ${listed.join('; ')}${more}. Sync again later to retry ${skipped.length === 1 ? 'it' : 'them'}.`;
+const listTitles = (items, describe, limit = 5) => {
+  const shown = items.slice(0, limit).map(describe).join('; ');
+  return items.length > limit ? `${shown}; and ${items.length - limit} more` : shown;
+};
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+// One sentence per outcome other than "written", so a partial sync is never
+// mistaken for a complete one. `report` lists every conversation by ID.
+function syncReportSummary(report) {
+  let text = '';
+  if (report.listed != null) text += ` Claude listed ${plural(report.listed, 'conversation', 'conversations')}.`;
+  if (report.unchanged) text += ` ${plural(report.unchanged, 'unchanged conversation was', 'unchanged conversations were')} not downloaded again.`;
+  const describeFailure = (item) => `"${item.title || item.id}" (${String(item.error || 'unknown error').slice(0, 160)})`;
+  const failedNew = report.failed.filter((item) => !item.archived);
+  const failedKept = report.failed.filter((item) => item.archived);
+  if (failedNew.length) text += ` ${plural(failedNew.length, 'conversation', 'conversations')} could not be exported and ${failedNew.length === 1 ? 'is' : 'are'} not in the archive yet: ${listTitles(failedNew, describeFailure)}.`;
+  if (failedKept.length) text += ` ${plural(failedKept.length, 'conversation', 'conversations')} could not be exported; ${failedKept.length === 1 ? 'its' : 'their'} previously archived ${failedKept.length === 1 ? 'copy was' : 'copies were'} kept: ${listTitles(failedKept, describeFailure)}.`;
+  if (report.failed.length) text += ` The next sync retries ${report.failed.length === 1 ? 'it' : 'them'}.`;
+  if (report.incomplete.length) {
+    text += ` ${plural(report.incomplete.length, 'conversation was', 'conversations were')} archived with files missing (marked "not archived" in the conversation and retried by every sync): ${listTitles(report.incomplete, (item) => `"${item.title || item.id}" (${item.missing.join(', ')})`)}.`;
+  }
+  if (report.keptPrevious.length) {
+    text += ` ${plural(report.keptPrevious.length, 'conversation was', 'conversations were')} not updated because the new export is missing files that are already archived; the archived ${report.keptPrevious.length === 1 ? 'copy was' : 'copies were'} kept: ${listTitles(report.keptPrevious, (item) => `"${item.title || item.id}"`)}.`;
+  }
+  return text;
 }
 
 // Read the branch head, its full tree, and archive/index.json exactly as a
@@ -705,19 +762,24 @@ async function archiveState() {
   return index.conversations
     .filter((entry) => entry?.provider === 'claude' && entry.account === account
       && entry.exporter_version === EXPORTER_VERSION && entry.updated_at
+      && !(Array.isArray(entry.incomplete) && entry.incomplete.length)
       && [entry.path, ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : [])]
         .every((path) => path && existingPaths.has(path)))
     .map((entry) => ({ id: entry.id, updated_at: entry.updated_at }));
 }
 
-function unchangedSummary(count) {
-  if (!count) return '';
-  return ` ${count} unchanged conversation${count === 1 ? ' was' : 's were'} not downloaded again.`;
-}
-
-async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [] } = {}) {
+async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null } = {}) {
   const unchanged = Array.isArray(unchangedIds) ? unchangedIds.map(String) : [];
-  let skippedNote = skippedSummary(skipped) + unchangedSummary(unchanged.length);
+  const failedItems = Array.isArray(skipped) ? skipped : [];
+  const report = {
+    listed: fullList && Number.isFinite(listed) ? listed : null,
+    committed: [],
+    unchanged: unchanged.length,
+    incomplete: [],
+    failed: [],
+    keptPrevious: [],
+  };
+  let skippedNote = '';
   syncRunning = true;
   cancelRequested = false;
   syncAbortController = new AbortController();
@@ -733,6 +795,12 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     let { ref, branch, baseCommit, baseTree, existingPaths, index } = await loadArchiveSnapshot();
 
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
+    report.failed = failedItems.map((item) => ({
+      id: String(item.id),
+      title: String(item.title || item.id),
+      error: String(item.error || 'unknown error'),
+      archived: map.has(`${provider}:${account}:${item.id}`),
+    }));
     if (fullList) {
       const listed = new Set([
         ...conversations.map((c) => String(c.external_id)),
@@ -740,7 +808,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         ...unchanged,
       ]);
       const unlisted = index.conversations.filter((x) => x.provider === provider && x.account === account && !listed.has(String(x.id)));
-      skippedNote += unlistedSummary(unlisted.length);
+      report.unlisted = unlisted.length;
     }
     let changes = [];
     let changedConversations = 0;
@@ -768,6 +836,21 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       const key = `${provider}:${account}:${c.external_id}`;
       const previous = map.get(key);
       const previousAssets = Array.isArray(previous?.assets) ? previous.assets : [];
+      const missingItems = incompleteItems(c);
+      // Never let an incomplete export replace an archived copy that has files
+      // the new export lacks: keep the archived copy until a complete export.
+      if (missingItems.length && previous) {
+        const exportedPaths = new Set(entry.assets.map((asset) => asset.path));
+        if (previousAssets.some((asset) => asset?.path && !exportedPaths.has(asset.path))) {
+          report.keptPrevious.push({ id: String(c.external_id), title: c.title || String(c.external_id) });
+          onProgress?.({ stage: 'checking', current: i + 1, total, changed: changedConversations });
+          continue;
+        }
+      }
+      if (missingItems.length) {
+        report.incomplete.push({ id: String(c.external_id), title: c.title || String(c.external_id), missing: missingItems.map((item) => item.name || 'files created by tools') });
+      }
+      if (JSON.stringify(previous?.incomplete || []) !== JSON.stringify(entry.incomplete || [])) indexNeedsUpdate = true;
       const currentAssetSignature = JSON.stringify(entry.assets);
       const previousAssetSignature = JSON.stringify(previousAssets);
       const searchCacheChanged = previous?.search_text_encoding !== entry.search_text_encoding
@@ -788,7 +871,10 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         || !existingPaths.has(path)
         || previousAssets.some((asset) => asset?.path && !existingPaths.has(asset.path));
 
-      if (changed) changedConversations += 1;
+      if (changed) {
+        changedConversations += 1;
+        report.committed.push({ id: String(c.external_id), title: c.title || String(c.external_id) });
+      }
       if (changed && previous?.path && previous.path !== path) {
         changes.push({ path: previous.path, delete: true });
       }
@@ -813,6 +899,8 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       }
       onProgress?.({ stage: 'checking', current: i + 1, total, changed: changedConversations });
     }
+
+    skippedNote = syncReportSummary(report) + unlistedSummary(report.unlisted || 0);
 
     // Migrate older entries too, so a limited sync compacts the complete cache
     // instead of leaving large uncompressed search strings in untouched entries.
@@ -900,14 +988,19 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
     }
 
+    // A sync that left any conversation out, or archived one with files
+    // missing, is partial: the popup says so instead of "complete".
+    const partial = report.failed.length > 0 || report.incomplete.length > 0 || report.keptPrevious.length > 0;
+    const outcome = { report, partial };
     if (changedConversations === 0 && !indexNeedsUpdate && ref) {
-      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: `Everything is already up to date. No GitHub commit was needed.${skippedNote}` });
-      return { total, changed: 0, commit: null, skipped: skipped.length };
+      const head = partial ? 'Sync finished with problems: no archived conversation changed, so no GitHub commit was made.' : 'Everything is already up to date. No GitHub commit was needed.';
+      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: `${head}${skippedNote}`, ...outcome });
+      return { total, changed: 0, commit: null, skipped: skipped.length, ...outcome };
     }
 
-    const completionMessage = (changedConversations === 0
-      ? 'Sync complete: the search cache was compacted; no conversation Markdown changed in 1 GitHub commit.'
-      : `Sync complete: ${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`) + skippedNote;
+    const completionMessage = (partial ? 'Sync finished with problems: ' : 'Sync complete: ') + (changedConversations === 0
+      ? 'the search cache was compacted; no conversation Markdown changed in 1 GitHub commit.'
+      : `${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`) + skippedNote;
 
     const treeEntries = new Array(changes.length);
     const uploadTotal = changes.filter((x) => !x.delete).length + 1;
@@ -1006,8 +1099,9 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
           changed: changedConversations,
           commit: commit.sha,
           message: `${completionMessage} The response to the final update was interrupted, but GitHub confirms the commit is published.`,
+          ...outcome,
         });
-        return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length };
+        return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length, ...outcome };
       }
 
       if (baseCommit && observedRef?.object?.sha === baseCommit.sha) {
@@ -1023,8 +1117,8 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       throw error;
     }
 
-    onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: completionMessage });
-    return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length };
+    onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: completionMessage, ...outcome });
+    return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length, ...outcome };
   } finally {
     syncRunning = false;
     syncAbortController = null;
@@ -1115,6 +1209,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sync(payload.conversations, broadcast, Array.isArray(payload.skipped) ? payload.skipped : [], {
       fullList: payload.fullList === true,
       unchangedIds: Array.isArray(payload.unchangedIds) ? payload.unchangedIds : [],
+      listed: Number.isFinite(payload.listed) ? payload.listed : null,
     })
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((e) => {

@@ -1055,7 +1055,7 @@
       // Keep the content-script lock until the background sync has actually
       // finished; otherwise another startSync message can trigger a second fetch
       // while the first batch is still being committed to GitHub.
-      const result = await handOff({ conversations, skipped, unchangedIds, fullList: limit === 'all' }, signal);
+      const result = await handOff({ conversations, skipped, unchangedIds, fullList: limit === 'all', listed: listData.length }, signal);
       if (!result?.ok && !result?.cancelled) {
         sendProgress({ stage: 'error', error: result?.error || 'No response' });
       }
