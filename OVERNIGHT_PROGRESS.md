@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-26 21:20 UTC — milestone reached in code/tests (#46–#56).
+Last updated: 2026-10-27 07:00 UTC — post-roadmap product cycle (#57–#63).
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -22,8 +22,15 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | Viewer | Load index/conversations/assets, large files, bounded asset loading, retries | ✅ | #43, #52 |
 | Viewer | Markdown, code, images, citations, tool groups, artifacts, safe rendering | ✅ | #36, #43, #46, #47 |
 | Viewer | Global search, in-conversation find bar, provider/account filters | ✅ (existing) | — |
+| Export | Incremental "All conversations" sync (unchanged conversations not re-downloaded) | ✅ (🟡 relies on Claude's `updated_at`) | #57 |
+| Viewer | Multi-word / phrase search, ranked, with highlighted snippets | ✅ | #58 |
+| Popup | Last sync outcome (manual or automatic) shown with time | ✅ | #59 |
+| Viewer | Deep links for conversations/search/sort; Back/reload work | ✅ real Chromium | #60 |
+| Test | Real-browser e2e of the extension (popup + content script + service worker) vs fake claude.ai/GitHub | ✅ 23/23 | #61 |
+| Viewer | "Open on GitHub" follows the default branch (main or master) | ✅ | #62 |
+| Viewer | Date groups + sort (updated / created / oldest / title) | ✅ real Chromium | #63 |
 | Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
-| All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible in this environment | — |
+| All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible here; the extension now runs end to end in headless Chromium against faithful fakes (#61), but real claude.ai responses and real GitHub remain unverified | — |
 
 ## Ground rules followed
 - No force-push, no history rewrite, no deploys/releases.
@@ -78,6 +85,16 @@ Secondary items left (none blocks the product):
 - #55 report archived conversations a full sync did not receive
 - #56 escape filenames in unarchived-attachment placeholders
 - Final master `d95d9ee`: syntax OK, extension 102/102, web 39/39, build OK
+
+## Post-roadmap cycle (owner: keep building useful capabilities)
+- #57 incremental sync · #58 search syntax/ranking/snippets · #59 last-sync status in popup
+- #60 viewer deep links + Playwright viewer e2e (`web/e2e/viewer.e2e.cjs`)
+- #61 extension e2e (`e2e/extension-sync.e2e.cjs`): loads the unpacked extension with `channel: 'chromium'`
+  (old headless never starts the service worker); service-worker fetches are routable with
+  `PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS=1`. Optional `VIEWER_URL` stage opens the synced archive.
+- #62 "Open on GitHub" link used blob/main (404 on master archives) → blob/HEAD
+- #63 date groups + sort (open at time of writing; CI pending)
+- Next candidates: asset cache by sha256 in the viewer (faster revisits), copy-code buttons, archive stats.
 
 ## Process note
 - A merge-conflict resolution on #54 briefly pushed an unparsable test file because a `grep`-based check did not
