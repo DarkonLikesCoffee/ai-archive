@@ -36,6 +36,8 @@ files['archive/index.json'] = JSON.stringify(index);
 (async () => {
   const browser = await chromium.launch();
   const page = await browser.newPage();
+  // Date groups are relative to "now".
+  await page.clock.setFixedTime(new Date('2026-10-27T12:00:00'));
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
   await page.route('https://api.github.com/**', (route) => {
@@ -82,6 +84,25 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.goto(`${base}#/c/claude/personal/does-not-exist`);
   await page.waitForSelector('.error.banner');
   check('a dead link shows a clear error over the list', (await page.locator('.error.banner').textContent()).includes('not in the archive index'));
+
+  await page.goto(base);
+  await page.waitForSelector('.conversation');
+  const titles = () => page.locator('.conversation strong').allTextContents();
+  const labels = () => page.locator('.list-group-label').allTextContents();
+  check('list is grouped by update date', JSON.stringify(await labels()) === JSON.stringify(['Previous 7 days', 'Previous 30 days']), JSON.stringify(await labels()));
+  check('newest first by default', (await titles())[0] === 'Rust ownership', JSON.stringify(await titles()));
+  await page.selectOption('.sort', 'oldest');
+  check('oldest first reverses the order', (await titles())[0] === 'Frontend help', JSON.stringify(await titles()));
+  check('the sort is in the URL', page.url().includes('sort=oldest'), page.url());
+  await page.reload();
+  await page.waitForSelector('.conversation');
+  check('reload keeps the sort', (await page.inputValue('.sort')) === 'oldest' && (await titles())[0] === 'Frontend help');
+  await page.selectOption('.sort', 'title');
+  check('title sort has no date groups', (await labels()).length === 0 && (await titles())[0] === 'Frontend help');
+  await page.selectOption('.sort', 'auto');
+  await page.fill('.search', 'the');
+  await page.waitForFunction(() => !document.querySelector('.list-group-label'));
+  check('search results offer "Best match" and are not date-grouped', (await page.locator('.sort option').first().textContent()) === 'Best match');
 
   check('no uncaught page errors', errors.length === 0, errors.join(' | '));
   await browser.close();

@@ -499,3 +499,4 @@ body,.app,.reader-shell,.auth{background:var(--bg)!important;color:var(--text)!i
   .reader-header-actions{display:none}
 }
 .search-snippet mark{background:rgba(255,200,0,.28);color:inherit;border-radius:3px;padding:0 1px}
+.list-controls{display:flex;gap:8px;align-items:center;width:min(560px,55vw)}.list-controls .search{flex:1;min-width:0}.sort{background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:9px;padding:10px 10px;outline:none;cursor:pointer}.sort:focus{border-color:var(--muted)}.list-group-label{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:650;margin:22px 4px 6px}.list-group:first-child .list-group-label{margin-top:8px}@media(max-width:760px){.list-controls{width:100%}}
