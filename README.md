@@ -87,6 +87,11 @@ Enter the owner, repository, and the read-only token. The token is stored only i
 - The extension reads Claude.ai's internal web API, which can change without notice.
 - **All conversations** relies on Claude.ai returning the full conversation list in one response, which is how it is read today. This has not been verified against very large accounts. If an **All conversations** sync does not receive a conversation that is already archived for that account (deleted in Claude, or a truncated list), the completion message reports how many; their archived copies are always kept.
 
+## Testing
+
+- `node --test extension/*.test.js` and `cd web && npm test` run the unit tests; CI also builds the viewer.
+- `node e2e/extension-sync.e2e.cjs` runs the unpacked extension in headless Chromium against fake claude.ai and GitHub servers. It goes through popup setup (including a rejected token), a first sync into an empty repository, an unchanged incremental sync, a changed conversation, a GitHub outage that publishes nothing, and the retry, and inspects the commits and files the extension published. With `VIEWER_URL` set to a running viewer (see `web/README.md`), it also opens the synced archive in the viewer. It needs Playwright with a Chromium browser and is not part of CI. It does not replace a real sync: claude.ai's actual API responses and GitHub's real API are only modelled.
+
 ## Repository layout
 
 ```text
