@@ -342,6 +342,37 @@ function extractCopyMarkdown(source) {
   return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+const COPY_CODE_BUTTON = /<button class="copy-code"[^>]*><\/button>/g;
+
+async function copyPlainText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  document.execCommand('copy');
+  textarea.remove();
+}
+
+// Code blocks are rendered HTML, so their copy buttons are handled by one
+// delegated listener on the conversation body.
+async function copyCodeBlock(event) {
+  const button = event.target.closest?.('[data-copy-code]');
+  const code = button?.parentElement?.querySelector('code');
+  if (!code) return;
+  try {
+    await copyPlainText(code.textContent);
+    button.classList.add('copied');
+    window.setTimeout(() => button.classList.remove('copied'), 1400);
+  } catch {}
+}
+
 function Message({ message, assets, assetBusy }) {
   const hasLocalAssets = /!?(?:\[[^\]]*\])\((?!https?:\/\/)[^)]+\)/i.test(String(message.content || ''));
   const [html, setHtml] = useState(renderMarkdown(message.content));
@@ -349,7 +380,7 @@ function Message({ message, assets, assetBusy }) {
 
   async function copyMessage() {
     const markdown = extractCopyMarkdown(message.content);
-    const renderedHtml = renderMarkdown(markdown).__html;
+    const renderedHtml = renderMarkdown(markdown).__html.replace(COPY_CODE_BUTTON, '');
     try {
       if (navigator.clipboard?.write && window.ClipboardItem) {
         const item = new ClipboardItem({
@@ -357,18 +388,8 @@ function Message({ message, assets, assetBusy }) {
           'text/html': new Blob([renderedHtml], { type: 'text/html' }),
         });
         await navigator.clipboard.write([item]);
-      } else if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(markdown);
       } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = markdown;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
-        document.execCommand('copy');
-        textarea.remove();
+        await copyPlainText(markdown);
       }
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1400);
@@ -449,7 +470,7 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
     const walker=document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const parent=node.parentElement;
-        if (!parent || parent.closest('script,style,mark')) return NodeFilter.FILTER_REJECT;
+        if (!parent || parent.closest('script,style,mark,button')) return NodeFilter.FILTER_REJECT;
         return node.nodeValue && node.nodeValue.toLocaleLowerCase().includes(lower)
           ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
       }
@@ -575,8 +596,8 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
   const findCount=findTotal;
   const date=conversation.updated_at?new Date(conversation.updated_at).toLocaleString():'';
   return <div className="reader-shell">{sidebar}<main className="reader-main">
-    <div className="reader-sticky-header"><button className="back" onClick={onBack}>← Back</button><div className="reader-find"><input ref={findInputRef} className="search reader-search" placeholder="Search in conversation…" aria-label="Search in conversation" value={findQuery} onChange={e=>{setFindQuery(e.target.value);setFindIndex(0)}} onKeyDown={handleFindKeyDown}/>{findQuery.trim()&&<div className="reader-find-controls"><span className="reader-find-count">{findCount ? `${Math.min(findIndex+1,findCount)} / ${findCount}` : 'No results'}</span><button className="reader-find-button" type="button" onClick={()=>cycleFind(-1)} disabled={!findCount} aria-label="Previous result" title="Previous result">↑</button><button className="reader-find-button" type="button" onClick={()=>cycleFind(1)} disabled={!findCount} aria-label="Next result" title="Next result">↓</button></div>}</div><div className="reader-header-actions"><a className="github-link" href={githubBlobUrl(settings, selected.path)} target="_blank" rel="noreferrer">Open on GitHub ↗</a></div></div>
-    <div className="reader"><div className="reader-head"><div className="pills"><div className="pill">{conversation.provider}</div><div className="pill">{conversation.account||'personal'}</div></div><h2>{conversation.title}</h2><div className="meta">{conversation.model||'model unknown'}{date?` · ${date}`:''}{assetBusy?' · loading attachments…':''}</div></div><div className="conversation-body" ref={bodyRef}>{conversation.messages.map((m,i)=><Message key={i} message={m} assets={assets} assetBusy={assetBusy}/>)}</div></div>
+    <div className="reader-sticky-header"><button className="back" onClick={onBack}>← Back</button><div className="reader-find"><input ref={findInputRef} className="search reader-search" placeholder="Search in conversation…" aria-label="Search in conversation" value={findQuery} onChange={e=>{setFindQuery(e.target.value);setFindIndex(0)}} onKeyDown={handleFindKeyDown}/>{findQuery.trim()&&<div className="reader-find-controls"><span className="reader-find-count">{findCount ? `${Math.min(findIndex+1,findCount)} / ${findCount}` : 'No results'}</span><button className="reader-find-button" type="button" onClick={()=>cycleFind(-1)} disabled={!findCount} aria-label="Previous result" title="Previous result">↑</button><button className="reader-find-button" type="button" onClick={()=>cycleFind(1)} disabled={!findCount} aria-label="Next result" title="Next result">↓</button></div>}</div><div className="reader-header-actions"><button className="github-link print-button" type="button" onClick={()=>window.print()} disabled={assetBusy} title={assetBusy?"Waiting for attachments to load":"Print or save this conversation as PDF"}>{assetBusy?"Loading…":"Print / PDF"}</button><a className="github-link" href={githubBlobUrl(settings, selected.path)} target="_blank" rel="noreferrer">Open on GitHub ↗</a></div></div>
+    <div className="reader"><div className="reader-head"><div className="pills"><div className="pill">{conversation.provider}</div><div className="pill">{conversation.account||'personal'}</div></div><h2>{conversation.title}</h2><div className="meta">{conversation.model||'model unknown'}{date?` · ${date}`:''}{assetBusy?' · loading attachments…':''}</div></div><div className="conversation-body" ref={bodyRef} onClick={copyCodeBlock}>{conversation.messages.map((m,i)=><Message key={i} message={m} assets={assets} assetBusy={assetBusy}/>)}</div></div>
   </main></div>;
 }
 

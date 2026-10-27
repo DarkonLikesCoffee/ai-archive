@@ -24,7 +24,7 @@ const conversations = [
     assets: [{ file_uuid: 'img-1', name: 'diagram.png', mime: 'image/png', base64: PNG, sha256: pngSha256, size: Buffer.from(PNG, 'base64').length, message_external_ids: ['u1'] }] },
   { external_id: 'conv/rust?#1', title: 'Rust ownership', source_updated_at: '2026-10-25T10:00:00Z', message_count: 2, messages: [
     { external_id: 'u2', role: 'user', content: 'Explain the borrow checker', files: [], attachments: [] },
-    { external_id: 'a2', role: 'assistant', content: 'The borrow checker enforces ownership.', files: [], attachments: [] }], assets: [] },
+    { external_id: 'a2', role: 'assistant', content: 'The borrow checker enforces ownership.\n\n```rust\nlet s = String::from("hi");\nlet t = &s;\n```', files: [], attachments: [] }], assets: [] },
 ];
 const files = {};
 const index = { version: 2, conversations: [] };
@@ -40,7 +40,7 @@ files['archive/index.json'] = JSON.stringify(index);
 
 (async () => {
   const browser = await chromium.launch();
-  const page = await browser.newPage();
+  const page = await (await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] })).newPage();
   // Date groups are relative to "now".
   await page.clock.setFixedTime(new Date('2026-10-27T12:00:00'));
   const errors = [];
@@ -90,6 +90,15 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.goto(`${base}#/c/claude/personal/${encodeURIComponent('conv/rust?#1')}`);
   await page.waitForSelector('.message');
   check('deep link with an unusual ID opens it', (await page.locator('.message .content').first().textContent()).includes('borrow checker'));
+  await page.locator('.code-block').first().hover();
+  await page.locator('.copy-code').first().click();
+  await page.waitForSelector('.copy-code.copied');
+  const copiedCode = await page.evaluate(() => navigator.clipboard.readText());
+  check('the copy button copies exactly the code', copiedCode === 'let s = String::from("hi");\nlet t = &s;' || copiedCode === 'let s = String::from("hi");\nlet t = &s;\n', JSON.stringify(copiedCode));
+  await page.fill('.reader-search', 'copy');
+  await page.waitForSelector('.reader-find-count');
+  check('find ignores button labels', (await page.locator('.reader-find-count').textContent()) === 'No results', await page.locator('.reader-find-count').textContent());
+  await page.fill('.reader-search', '');
 
   await page.goto(`${base}#/c/claude/personal/does-not-exist`);
   await page.waitForSelector('.error.banner');
@@ -123,6 +132,25 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.reload();
   await imageShown();
   check('revisiting shows the image from the cache, without GitHub', assetRequests.length === firstVisit, `asset requests=${assetRequests.length}`);
+  // Print / PDF: the button prints, and print media shows only the conversation.
+  await page.evaluate(() => { window.__printed = 0; window.print = () => { window.__printed += 1; }; });
+  await page.click('.print-button');
+  check('Print / PDF opens the print dialog', (await page.evaluate(() => window.__printed)) === 1);
+  await page.emulateMedia({ media: 'print' });
+  const printed = await page.evaluate(() => ({
+    sidebar: getComputedStyle(document.querySelector('aside')).display,
+    header: getComputedStyle(document.querySelector('.reader-sticky-header')).display,
+    copy: document.querySelector('.copy-message').checkVisibility() ? 'visible' : 'none',
+    background: getComputedStyle(document.body).backgroundColor,
+    text: getComputedStyle(document.querySelector('.message .content')).color,
+    image: !!document.querySelector('.content img[src^="data:image/png"]'),
+  }));
+  check('print hides the app chrome and uses dark text on white', printed.sidebar === 'none' && printed.header === 'none' && printed.copy === 'none'
+    && printed.background === 'rgb(255, 255, 255)' && printed.text === 'rgb(17, 17, 17)' && printed.image, JSON.stringify(printed));
+  if (process.env.PRINT_PDF) await page.pdf({ path: process.env.PRINT_PDF });
+  const pdf = await page.pdf();
+  check('the conversation renders to PDF', pdf.length > 1000 && pdf.subarray(0, 4).toString() === '%PDF', `${pdf.length} bytes`);
+  await page.emulateMedia({ media: 'screen' });
   await page.locator('button.nav', { hasText: 'Disconnect' }).click();
   await page.waitForFunction(async () => !(await caches.keys()).length);
   check('Disconnect clears the attachment cache', true);
