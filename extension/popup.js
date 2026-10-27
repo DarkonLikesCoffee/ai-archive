@@ -76,14 +76,53 @@ async function refresh() {
   }
 }
 
-async function sendToClaude(message) {
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  const tab = tabs[0];
-  if (!tab?.id || !tab.url?.startsWith('https://claude.ai/')) throw Error('Open a Claude.ai tab first.');
-  return new Promise((resolve, reject) => chrome.tabs.sendMessage(tab.id, message, (r) => {
-    if (chrome.runtime.lastError) reject(Error('Refresh the Claude.ai tab, then try again.'));
+const CLAUDE_URL = 'https://claude.ai/';
+const TAB_RETRY_DELAY_MS = 500;
+const TAB_RETRY_ATTEMPTS = 40;
+const isClaudeTab = (tab) => Boolean(tab?.id) && typeof tab.url === 'string' && tab.url.startsWith(CLAUDE_URL);
+
+// The active tab if it is Claude, otherwise the most recently used Claude tab.
+async function findClaudeTab() {
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (isClaudeTab(active)) return active;
+  const tabs = (await chrome.tabs.query({ url: 'https://claude.ai/*' })).filter(isClaudeTab);
+  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  return tabs[0] || null;
+}
+
+function messageTab(tabId, message) {
+  return new Promise((resolve, reject) => chrome.tabs.sendMessage(tabId, message, (r) => {
+    if (chrome.runtime.lastError) reject(Error(chrome.runtime.lastError.message || 'No response'));
     else resolve(r);
   }));
+}
+
+// Send a message to Claude's content script. With openIfMissing, a Claude tab
+// is opened in the background when none exists, and the message is retried
+// until the page has loaded and its content script answers.
+async function sendToClaude(message, { openIfMissing = false } = {}) {
+  const tab = await findClaudeTab();
+  if (tab) {
+    try {
+      return await messageTab(tab.id, message);
+    } catch {
+      throw Error('Refresh the Claude.ai tab, then try again.');
+    }
+  }
+  if (!openIfMissing) throw Error('Open a Claude.ai tab first.');
+  status.className = 'status';
+  status.textContent = 'Opening Claude.ai in a background tab…';
+  const opened = await chrome.tabs.create({ url: CLAUDE_URL, active: false });
+  for (let attempt = 1; attempt <= TAB_RETRY_ATTEMPTS; attempt++) {
+    try {
+      const response = await messageTab(opened.id, message);
+      status.textContent = 'Claude.ai opened in a background tab.';
+      return response;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, TAB_RETRY_DELAY_MS));
+    }
+  }
+  throw Error('Claude.ai did not finish loading in the new tab. Check that you are signed in, then sync again.');
 }
 
 // Turn the repository check into an actionable message, or null when the
@@ -135,7 +174,7 @@ $('sync').onclick = async () => {
     const limit = $('syncLimit').value;
     status.className = 'status'; status.textContent = `Starting sync (${limit === 'all' ? 'all conversations' : `latest ${limit}`})…`;
     setProgress({ stage: 'fetching', current: 0, total: 0 });
-    await sendToClaude({ type: 'startSync', limit });
+    await sendToClaude({ type: 'startSync', limit }, { openIfMissing: true });
   } catch (e) { status.className = 'status err'; status.textContent = e.message; }
 };
 
