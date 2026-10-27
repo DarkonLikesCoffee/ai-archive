@@ -31,8 +31,30 @@ async function settings() {
   return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account']);
 }
 
+// Keep the outcome of the most recent sync (manual or automatic) in storage,
+// so the popup can show it after the service worker restarts or when the
+// sync ran unattended.
+const FINAL_SYNC_STAGES = ['done', 'error', 'cancelled'];
+
+function rememberLastSync(payload) {
+  if (!FINAL_SYNC_STAGES.includes(payload?.stage)) return;
+  const record = {
+    stage: payload.stage,
+    at: new Date(Date.now()).toISOString(),
+    message: String(payload.message || payload.error || ''),
+    changed: Number.isFinite(payload.changed) ? payload.changed : null,
+    commit: payload.commit || null,
+  };
+  try {
+    chrome.storage?.local?.set?.({ last_sync: record })?.catch?.(() => {});
+  } catch {
+    // Storage is best effort; the live progress UI does not depend on it.
+  }
+}
+
 function broadcast(payload) {
   lastSyncState = { ...payload };
+  rememberLastSync(payload);
   chrome.runtime.sendMessage({ type: 'syncProgress', ...payload }).catch(() => {});
 }
 
@@ -998,6 +1020,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'syncProgress' && sender?.tab) {
     const { type, ...progress } = msg;
     contentSyncState = { ...progress, tabId: sender.tab.id, at: Date.now() };
+    // Failures before the GitHub phase (for example Claude's list) end here.
+    rememberLastSync(progress);
     return false;
   }
   if (msg.type === 'getArchiveState') {
