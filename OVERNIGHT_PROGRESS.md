@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-27 07:35 UTC — post-roadmap product cycle (#57–#77).
+Last updated: 2026-10-27 07:40 UTC — post-roadmap product cycle (#57–#78); feature set comprehensive within what this environment can verify.
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -41,7 +41,8 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | Viewer | First run: clear "repository not found"; empty archive shows next steps | ✅ real Chromium | #73 |
 | Export | **Bug:** syncs over ~48 MB of attachments failed (Chrome 64 MiB message limit) → chunked handoff | ✅ reproduced + fixed in real Chromium | #74 |
 | Export | Attachment over GitHub's 100 MB limit no longer fails every sync (left out with a visible note) | ✅ unit + real Chromium (cap lowered in a test copy) | #75 |
-| Test | Rich content (tools, citations, inline image) end to end, extension → Markdown → viewer | ✅ 31/31, no bug found | #77 (open) |
+| Test | Rich content (tools, citations, inline image) end to end, extension → Markdown → viewer | ✅ 31/31, no bug found | #77 |
+| Viewer | Archive overview (totals, per month, models, accounts) | ✅ real Chromium | #78 |
 | Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
 | All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible here; the extension now runs end to end in headless Chromium against faithful fakes (#61), but real claude.ai responses and real GitHub remain unverified | — |
 
@@ -120,6 +121,17 @@ Secondary items left (none blocks the product):
   a copy of the extension with the cap lowered to 30 MiB; the real constant is unit-tested.
 - #76 ignore web/dist · #77 rich-content end-to-end fidelity check (no bug found)
 - Not verified: GitHub API behaviour for single files between 50 and 100 MB.
+- #78 archive overview.
+
+## Status after #78 (2026-10-27 07:40 UTC)
+No further capability is both meaningful and verifiable in this environment. What remains needs the owner:
+1. **Real-world run** (most important): a real claude.ai account in real Chrome against a real GitHub repo —
+   especially "All conversations" on a large account (list completeness/paging, `updated_at` semantics for
+   incremental sync, sign-in redirect when Sync opens a background tab).
+2. **Decision:** explicit message separator in the export format (fixes the `---` + `## You` ambiguity, but
+   rewrites every archived conversation once).
+3. **Decision:** delete the superseded `fix/materialize-inline-audio-video` branch.
+Check-ins switched to the long fallback (≈50 min, then ≈4 h, stop after 3 empty) per the policy.
 - Test totals on master + #71: extension 118/118, web 67/67, viewer e2e 41/41, extension e2e 24/24.
 - Next candidates: reader controls on phones (Print/Open on GitHub are hidden < 700px), archive overview.
 
