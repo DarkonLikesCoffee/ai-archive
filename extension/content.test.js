@@ -441,11 +441,10 @@ test('aborts the sync when an explicitly referenced message attachment fails to 
 
   assert.match(error.error, /photo\.png/);
   assert.match(error.error, /HTTP 503/);
-  assert.match(error.error, /Sync stopped before anything was sent to GitHub/);
-  assert.equal(harness.handoffs.length, 0, 'no partial conversation batch may reach GitHub sync');
+  assert.equal(harness.handoffs.length, 0, 'a transient download failure keeps the conversation out of this sync, to be retried');
 });
 
-test('aborts the sync when a listed sandbox attachment cannot be downloaded', async () => {
+test('records a listed sandbox file whose download Claude answers with 404 as not archived', async () => {
   const conversation = {
     uuid: 'conversation-1',
     name: 'Failed sandbox download test',
@@ -463,11 +462,14 @@ test('aborts the sync when a listed sandbox attachment cannot be downloaded', as
   });
 
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
-  const error = await harness.errorProgress;
+  const handoff = await harness.firstHandoff;
+  const [exported] = handoff.conversations;
 
-  assert.match(error.error, /outputs\/render\.png/);
-  assert.match(error.error, /HTTP 404/);
-  assert.equal(harness.handoffs.length, 0, 'a missing sandbox file must stop the archive sync');
+  assert.equal(exported.assets.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), [
+    { kind: 'sandbox-file', name: 'outputs/render.png', reason: "Claude returned HTTP 404 for this file's download" },
+  ], 'the conversation is archived, and the missing file is recorded, not silently dropped');
+  harness.finishFirstHandoff({ ok: true });
 });
 
 test('aborts the sync when the sandbox file list cannot be retrieved', async () => {
@@ -929,7 +931,7 @@ test('associates a single downloaded direct asset with every message that refere
 });
 
 
-test('refuses to silently skip a listed message file with no URL or matching archive asset', async () => {
+test('archives a conversation whose listed file has no URL or matching asset, recording the file as not archived', async () => {
   const conversation = {
     uuid: 'conversation-file-without-url',
     name: 'Missing file URL',
@@ -945,11 +947,15 @@ test('refuses to silently skip a listed message file with no URL or matching arc
   const harness = createHarness(conversation);
 
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
-  const error = await harness.errorProgress;
+  const handoff = await harness.firstHandoff;
+  const [exported] = handoff.conversations;
 
-  assert.match(error.error, /attachment "lost-report\.pdf" has no downloadable URL/);
-  assert.match(error.error, /no matching archiveable file was found/);
-  assert.equal(harness.handoffs.length, 0, 'an uncovered attachment must block the archive handoff');
+  assert.match(exported.messages[0].content, /Please archive this attachment\./, 'the message text is archived');
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), [{
+    kind: 'attachment', message_external_id: 'user-message', file_uuid: 'file-without-url', name: 'lost-report.pdf',
+    reason: 'Claude did not provide a download link for this file',
+  }], 'the missing file is recorded, so the archive is marked incomplete and retried');
+  harness.finishFirstHandoff({ ok: true });
 });
 
 test('accepts a listed message file without a URL when the sandbox contains a unique matching file', async () => {
@@ -2377,4 +2383,119 @@ test('a rejected chunk stops the handoff with an error and publishes nothing', a
   assert.equal(error.error, 'rejected in test');
   assert.equal(harness.transferChunks.length, 3);
   assert.equal(harness.handoffs.length, 0);
+});
+
+// Regression tests for failures seen in a real account's first sync: Claude
+// answers the sandbox file list with HTTP 404 for conversations without a
+// sandbox, and some uploaded files (a PDF) come without a download URL.
+function plainConversation(uuid, extraContent = []) {
+  return {
+    uuid,
+    name: 'Real-sync regression',
+    current_leaf_message_uuid: 'a1',
+    chat_messages: [
+      { uuid: 'u1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'Hola, repasemos el tema 2.' }], files: [], attachments: [] },
+      { uuid: 'a1', parent_message_uuid: 'u1', sender: 'assistant', content: [{ type: 'text', text: 'Claro, empecemos.' }, ...extraContent], files: [], attachments: [] },
+    ],
+  };
+}
+
+test('a conversation whose sandbox file list is HTTP 404 is archived completely when no tool wrote files', async () => {
+  const harness = createHarness(plainConversation('conv-404-plain'), { sandboxListStatus: 404 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations.length, 1);
+  assert.equal(handoff.skipped.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(handoff.conversations[0].incomplete)), []);
+  assert.match(handoff.conversations[0].messages[1].content, /Claro, empecemos\./);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a sandbox file list of HTTP 404 after file tools ran marks the archive incomplete instead of claiming it is whole', async () => {
+  const conversation = plainConversation('conv-404-tools', [
+    { type: 'tool_use', name: 'create_file', input: { path: '/mnt/user-data/outputs/resumen.md', file_text: '# Resumen' } },
+  ]);
+  const harness = createHarness(conversation, { sandboxListStatus: 404 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const [exported] = handoff.conversations;
+  assert.equal(handoff.skipped.length, 0, 'the conversation text is archived');
+  assert.equal(exported.incomplete.length, 1);
+  assert.equal(exported.incomplete[0].kind, 'sandbox');
+  assert.match(exported.incomplete[0].reason, /HTTP 404 .*files created by Claude's tools may be missing/);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('other sandbox list failures still skip the conversation so a later sync retries it', async () => {
+  for (const status of [401, 403, 429, 500, 503]) {
+    const harness = createHarness(plainConversation(`conv-${status}`), { sandboxListStatus: status });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const error = await harness.errorProgress;
+    assert.match(error.error, new RegExp(`HTTP ${status}`));
+    assert.equal(harness.handoffs.length, 0, `HTTP ${status} is not treated as "no sandbox"`);
+  }
+});
+
+test('an uploaded file whose download is HTTP 404 is still archived from the sandbox when it is there', async () => {
+  const conversation = plainConversation('conv-direct-404-sandbox');
+  conversation.chat_messages[0].files = [{ file_uuid: 'pdf-1', file_name: 'BD-GICD-Tema2-MER+DC+UML.pdf', preview_url: 'https://claude.ai/api/fake/preview/pdf-1' }];
+  const harness = createHarness(conversation, {
+    assetResponses: { 'https://claude.ai/api/fake/preview/pdf-1': { status: 404 } },
+    sandboxFiles: [{ path: 'uploads/BD-GICD-Tema2-MER+DC+UML.pdf', content_type: 'application/pdf' }],
+    sandboxContents: { 'uploads/BD-GICD-Tema2-MER+DC+UML.pdf': 'pdf bytes' },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const [exported] = handoff.conversations;
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), []);
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.assets.map((a) => a.name))), ['BD-GICD-Tema2-MER-DC-UML.pdf']);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a sync stores a sanitized diagnostic for each conversation not archived completely, with nothing private in it', async () => {
+  const secretText = 'Mi nota privada sobre el examen';
+  const conversation = plainConversation('11111111-2222-4333-8444-555555555555');
+  conversation.name = 'Base de datos (privado)';
+  conversation.chat_messages[0].content = [{ type: 'text', text: secretText }];
+  conversation.chat_messages[0].files = [{
+    file_uuid: '99999999-8888-4777-8666-555555555555',
+    file_name: 'BD-GICD-Tema2-MER+DC+UML.pdf',
+    file_kind: 'document',
+    document_asset: { page_count: 12 },
+    thumbnail_asset: { url: '/api/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/files/99999999-8888-4777-8666-555555555555/thumbnail?sig=SECRET-TOKEN' },
+  }];
+  const harness = createHarness(conversation, { storage: {} });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  await harness.firstHandoff;
+  const stored = harness.storageState.last_sync_diagnostics;
+  const text = JSON.stringify(stored);
+  for (const secret of [secretText, 'Base de datos', 'BD-GICD', 'SECRET-TOKEN', 'sig=', '99999999-8888', 'aaaaaaaa-bbbb']) {
+    assert.equal(text.includes(secret), false, `diagnostics must not contain ${secret}`);
+  }
+  assert.equal(stored.items.length, 1);
+  const [item] = stored.items;
+  assert.equal(item.conversation_id, '11111111-2222-4333-8444-555555555555', 'the conversation ID is kept so the owner can match it');
+  assert.equal(item.outcome, 'incomplete');
+  assert.deepEqual(JSON.parse(JSON.stringify(item.problems)), [{ kind: 'attachment', reason: 'Claude did not provide a download link for this file', message_id: 'u1', file_extension: 'pdf' }]);
+  assert.equal(item.sandbox_list_status, 200);
+  const [message] = item.messages_with_files;
+  assert.deepEqual(JSON.parse(JSON.stringify(message.files)), [{
+    document_asset: { page_count: 12 },
+    file_kind: 'document',
+    file_name: '<string:28>',
+    file_uuid: '{uuid}',
+    thumbnail_asset: { url: '/api/{uuid}/files/{uuid}/thumbnail?<query removed>' },
+  }], 'the structure of the file entry is visible: where a download link would be, and what kinds of assets exist');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('diagnostics record the sandbox list status and error shape of a failed conversation', async () => {
+  const harness = createHarness(plainConversation('22222222-2222-4333-8444-555555555555'), { storage: {}, sandboxListStatus: 503 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  await harness.errorProgress;
+  const [item] = harness.storageState.last_sync_diagnostics.items;
+  assert.equal(item.outcome, 'failed');
+  assert.equal(item.sandbox_list_status, 503);
+  assert.deepEqual(JSON.parse(JSON.stringify(item.sandbox_list_body)), { error: '<string:12>' });
+  assert.match(item.error, /^Could not list Claude sandbox files for conversation "22222222-2222-4333-8444-555555555555" \(HTTP 503\)\.$/);
 });

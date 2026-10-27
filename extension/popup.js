@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 const status = $('status');
 let activeSync = false;
 
-async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'last_sync']); }
+async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'last_sync', 'last_sync_diagnostics']); }
 
 // One line about the most recent finished sync (manual or automatic), so an
 // unattended automatic sync's success or failure is visible.
@@ -14,9 +14,52 @@ function describeLastSync(record, now = Date.now()) {
     : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago`
       : seconds < 86400 ? `${Math.floor(seconds / 3600)} h ago`
         : `on ${new Date(at).toISOString().slice(0, 10)}`;
-  const label = record.stage === 'error' ? 'Last sync failed' : record.stage === 'cancelled' ? 'Last sync cancelled' : 'Last sync';
+  const label = record.stage === 'error' ? 'Last sync failed'
+    : record.stage === 'cancelled' ? 'Last sync cancelled'
+      : record.partial ? 'Last sync finished with problems' : 'Last sync';
   const message = String(record.message || '').slice(0, 300);
   return message ? `${label} ${when}: ${message}` : `${label} ${when}.`;
+}
+
+// One line per conversation that was not archived completely, so a partial
+// sync can be checked conversation by conversation (titles plus IDs).
+function describeSyncReport(report) {
+  if (!report || typeof report !== 'object') return [];
+  const lines = [];
+  const name = (item) => `${item.title || item.id} (${item.id})`;
+  for (const item of Array.isArray(report.failed) ? report.failed : []) {
+    lines.push(`Not exported${item.archived ? ', archived copy kept' : ', not in the archive yet'}: ${name(item)} — ${item.error || 'unknown error'}`);
+  }
+  for (const item of Array.isArray(report.incomplete) ? report.incomplete : []) {
+    lines.push(`Archived with files missing: ${name(item)} — ${(item.missing || []).join(', ')}`);
+  }
+  for (const item of Array.isArray(report.keptPrevious) ? report.keptPrevious : []) {
+    lines.push(`Not updated, archived copy kept (new export is missing files): ${name(item)}`);
+  }
+  return lines;
+}
+
+function showSyncReport(report) {
+  const list = $('syncReport');
+  if (!list) return;
+  list.replaceChildren(...describeSyncReport(report).map((line) => {
+    const item = document.createElement('li');
+    item.textContent = line;
+    return item;
+  }));
+  list.classList.toggle('hidden', !list.children.length);
+}
+
+// The sanitized diagnostics the content script stored for the last sync (see
+// sanitizeShape in content.js), offered for copying when there are any.
+let lastDiagnostics = null;
+function showDiagnostics(diagnostics) {
+  lastDiagnostics = Array.isArray(diagnostics?.items) && diagnostics.items.length ? diagnostics : null;
+  $('copyDiagnostics')?.classList.toggle('hidden', !lastDiagnostics);
+}
+
+function diagnosticReportText(diagnostics, version) {
+  return JSON.stringify({ report: 'AI Archive sync diagnostics', extension_version: version || null, ...diagnostics }, null, 2);
 }
 
 function setProgress(msg) {
@@ -68,6 +111,8 @@ async function refresh() {
   $('accountLogged').value = s.archive_account || 'personal';
   $('autoSync').checked = s.auto_sync === true;
   $('lastSync').textContent = describeLastSync(s.last_sync);
+  showSyncReport(s.last_sync?.report);
+  showDiagnostics(s.last_sync_diagnostics);
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
     $('accountText').textContent = `GitHub: ${s.github_owner}/${s.github_repo} · account: ${s.archive_account || 'personal'}`;
@@ -192,11 +237,25 @@ $('cancel').onclick = async () => {
 
 $('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'auto_sync_configured']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
 
+$('copyDiagnostics').onclick = async () => {
+  if (!lastDiagnostics) return;
+  try {
+    await navigator.clipboard.writeText(diagnosticReportText(lastDiagnostics, chrome.runtime.getManifest?.()?.version));
+    status.className = 'status ok';
+    status.textContent = 'Diagnostic report copied. It contains no message text, titles, file names, file contents or credentials.';
+  } catch (e) {
+    status.className = 'status err';
+    status.textContent = `Could not copy the diagnostic report: ${e.message}`;
+  }
+};
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'syncProgress') return;
   setProgress(msg);
   if (['done', 'error', 'cancelled'].includes(msg.stage)) {
-    $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error });
+    $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error, partial: msg.partial === true });
+    showSyncReport(msg.report);
+    chrome.storage.local.get('last_sync_diagnostics').then((stored) => showDiagnostics(stored.last_sync_diagnostics)).catch(() => {});
   }
 });
 chrome.runtime.sendMessage({ type: 'getSyncState' }, (state) => { if (!chrome.runtime.lastError && state?.running) setProgress(state); });

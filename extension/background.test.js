@@ -1305,7 +1305,8 @@ test('names conversations that could not be exported in the completion message',
   assert.equal(result.commit, 'new-commit');
   assert.equal(result.skipped, 1);
   const done = progress.find((event) => event.stage === 'done');
-  assert.match(done.message, /^Sync complete: 1 conversation changed in 1 GitHub commit\. 1 conversation could not be exported and was left unchanged in the archive: "Broken one" \(Claude returned an invalid payload\)\. Sync again later to retry it\.$/);
+  assert.match(done.message, /^Sync finished with problems: 1 conversation changed in 1 GitHub commit\. 1 conversation could not be exported and is not in the archive yet: "Broken one" \(Claude returned an invalid payload\)\. The next sync retries it\.$/);
+  assert.equal(done.partial, true);
 });
 
 function loadBackgroundForSyncState() {
@@ -1560,4 +1561,92 @@ test('an attachment over GitHub\'s 100 MB file limit is left out with a note ins
   assert.equal(tree.some((entry) => /notes\.txt$/.test(entry.path) && entry.sha), true);
   const index = JSON.parse(blobs.at(-1).content);
   assert.deepEqual(index.conversations[0].assets.map((a) => a.name), ['notes.txt'], 'the index lists only archived files');
+});
+
+// The shape of the owner's first real sync: Claude listed 11 conversations;
+// 3 were archived and unchanged, 1 exported, 7 could not be exported (sandbox
+// list HTTP 404 and an attachment without a URL) and were never archived.
+test('a partial sync reports every conversation by outcome and never calls itself complete', async () => {
+  const unchangedIds = ['busqueda', 'carrera', 'gym'];
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: unchangedIds.map((id) => archivedEntry(id)) });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const failed = ['repaso', 'canva', 'base-de-datos', 'proyecto', 'edicion-1', 'edition', 'medios'].map((id) => ({
+    id, title: id, error: `Could not list Claude sandbox files for conversation "${id}" (HTTP 404).`,
+  }));
+  const progress = [];
+  const result = await harness.sync(sampleConversation(), (event) => progress.push(event), failed, { fullList: true, unchangedIds, listed: 11 });
+  const done = progress.find((event) => event.stage === 'done');
+
+  assert.equal(result.commit, 'new-commit');
+  assert.equal(done.partial, true);
+  assert.match(done.message, /^Sync finished with problems: 1 conversation changed in 1 GitHub commit\. Claude listed 11 conversations\. 3 unchanged conversations were not downloaded again\. 7 conversations could not be exported and are not in the archive yet: "repaso" .*; and 2 more\. The next sync retries them\.$/);
+  const report = JSON.parse(JSON.stringify(done.report));
+  assert.equal(report.listed, 11);
+  assert.equal(report.unchanged, 3);
+  assert.deepEqual(report.committed.map((item) => item.id), ['conversation-123456']);
+  assert.deepEqual(report.failed.map((item) => [item.id, item.archived]), failed.map((item) => [item.id, false]));
+  assert.equal(report.committed.length + report.unchanged + report.failed.length, report.listed, 'every listed conversation is accounted for');
+
+  const index = JSON.parse(harness.requests.filter((r) => r.pathname.endsWith('/git/blobs') && r.method === 'POST').at(-1).body.content);
+  assert.deepEqual(index.conversations.map((entry) => entry.id).sort(), ['busqueda', 'carrera', 'conversation-123456', 'gym'], 'failed conversations are not written to the index');
+});
+
+test('a failed export of an archived conversation keeps its archived copy and says so', async () => {
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [archivedEntry('archived-before', { assets: [{ path: 'archive/conversations/claude/personal/assets/a/keep.png', sha256: 'f'.repeat(64) }] })] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const progress = [];
+  await harness.sync(sampleConversation(), (event) => progress.push(event), [{ id: 'archived-before', title: 'Archived before', error: 'HTTP 503' }], { fullList: true, listed: 2 });
+  const done = progress.find((event) => event.stage === 'done');
+  assert.match(done.message, /1 conversation could not be exported; its previously archived copy was kept: "Archived before" \(HTTP 503\)\./);
+  const tree = harness.requests.find((r) => r.pathname.endsWith('/git/trees') && r.method === 'POST').body.tree;
+  assert.equal(tree.some((entry) => entry.path.includes('archived-before') || entry.path.includes('keep.png')), false, 'nothing of the archived copy is touched');
+  const index = JSON.parse(harness.requests.filter((r) => r.pathname.endsWith('/git/blobs') && r.method === 'POST').at(-1).body.content);
+  assert.deepEqual(index.conversations.find((entry) => entry.id === 'archived-before'), JSON.parse(indexText).conversations[0]);
+});
+
+function incompleteConversation() {
+  const [conversation] = sampleConversation();
+  conversation.title = 'Base de datos';
+  conversation.messages[0].files = [{ file_uuid: 'pdf-1', file_name: 'BD-GICD-Tema2-MER+DC+UML.pdf' }];
+  conversation.incomplete = [{ kind: 'attachment', message_external_id: 'message-1', file_uuid: 'pdf-1', name: 'BD-GICD-Tema2-MER+DC+UML.pdf', reason: 'Claude did not provide a download link for this file' }];
+  return conversation;
+}
+
+test('a file that could not be archived is shown where it was attached, and the conversation is marked incomplete', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
+  const progress = [];
+  await harness.sync([incompleteConversation()], (event) => progress.push(event), [], { fullList: true, listed: 1 });
+  const blobs = harness.requests.filter((r) => r.pathname.endsWith('/git/blobs') && r.method === 'POST').map((r) => r.body.content);
+  const markdown = blobs.find((content) => content.includes('AI_ARCHIVE_METADATA'));
+  assert.match(markdown, /## You\n\n\*\*Attachment not archived: BD-GICD-Tema2-MER\+DC\+UML\.pdf\*\* \(Claude did not provide a download link for this file\)\n\nhello/);
+  const entry = JSON.parse(blobs.at(-1)).conversations[0];
+  assert.deepEqual(entry.incomplete.map((item) => item.name), ['BD-GICD-Tema2-MER+DC+UML.pdf']);
+  const done = progress.find((event) => event.stage === 'done');
+  assert.equal(done.partial, true);
+  assert.match(done.message, /1 conversation was archived with files missing .*"Base de datos" \(BD-GICD-Tema2-MER\+DC\+UML\.pdf\)/);
+});
+
+test('an incomplete archive is never treated as unchanged, so the next sync retries it', async () => {
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [
+    archivedEntry('complete'),
+    archivedEntry('incomplete', { incomplete: [{ kind: 'attachment', name: 'x.pdf', reason: 'Claude did not provide a download link for this file' }] }),
+  ] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const state = JSON.parse(JSON.stringify(await harness.archiveState()));
+  assert.deepEqual(state.map((entry) => entry.id), ['complete']);
+});
+
+test('an incomplete export never replaces an archived copy that has files the new export lacks', async () => {
+  const conversation = incompleteConversation();
+  const keptAsset = { path: 'archive/conversations/claude/personal/assets/conversation-123456/aaaa-BD.pdf', sha256: 'a'.repeat(64), size: 10, mime: 'application/pdf', name: 'BD-GICD-Tema2-MER+DC+UML.pdf' };
+  const previous = archivedEntry('conversation-123456', { title: 'Base de datos', assets: [keptAsset], updated_at: '2026-10-01T00:00:00Z' });
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [previous] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const progress = [];
+  const result = await harness.sync([conversation], (event) => progress.push(event), [], { fullList: true, listed: 1 });
+
+  assert.equal(result.commit, null, 'nothing is published');
+  assert.equal(harness.requests.some((r) => r.method === 'POST' || r.method === 'PATCH'), false);
+  const done = progress.find((event) => event.stage === 'done');
+  assert.match(done.message, /^Sync finished with problems: no archived conversation changed, so no GitHub commit was made\. Claude listed 1 conversation\. 1 conversation was not updated because the new export is missing files that are already archived; the archived copy was kept: "Base de datos"\.$/);
 });

@@ -12,7 +12,8 @@ function loadPopup({ tabs = {} } = {}) {
     if (!elements.has(id)) {
       elements.set(id, {
         id, value: '', checked: false, disabled: false, textContent: '', className: '', style: {},
-        classList: { add() {}, remove() {} },
+        classList: { add() {}, remove() {}, toggle() {} },
+        children: [], replaceChildren(...nodes) { this.children = nodes; },
       });
     }
     return elements.get(id);
@@ -30,8 +31,8 @@ function loadPopup({ tabs = {} } = {}) {
     fetch: async () => { throw new Error('unexpected fetch'); },
     setTimeout: (fn) => setImmediate(fn),
   };
-  vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__sendToClaude = sendToClaude;`, context);
-  return { describeRepoCheck: context.__describeRepoCheck, describeLastSync: context.__describeLastSync, sendToClaude: context.__sendToClaude, element, chrome };
+  vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__describeSyncReport = describeSyncReport;\nglobalThis.__sendToClaude = sendToClaude;`, context);
+  return { describeRepoCheck: context.__describeRepoCheck, describeLastSync: context.__describeLastSync, describeSyncReport: context.__describeSyncReport, sendToClaude: context.__sendToClaude, element, chrome };
 }
 
 test('explains repository check failures before saving GitHub settings', () => {
@@ -136,4 +137,22 @@ test('cancel never opens a tab, and an unresponsive Claude tab asks for a refres
   const stale = loadWithTabs({ open: [{ id: 1, url: 'https://claude.ai/new' }], activeId: 1, ready: () => false });
   await assert.rejects(stale.sendToClaude({ type: 'startSync', limit: 'all' }, { openIfMissing: true }), /Refresh the Claude.ai tab/);
   assert.equal(stale.created.length, 0);
+});
+
+test('a partial sync is labelled as such and lists each affected conversation with its ID', () => {
+  const { describeLastSync, describeSyncReport } = loadPopup();
+  const now = Date.parse('2026-10-27T12:00:00Z');
+  assert.match(describeLastSync({ stage: 'done', at: '2026-10-27T11:58:00Z', message: 'Sync finished with problems: …', partial: true }, now), /^Last sync finished with problems 2 min ago: /);
+  const lines = JSON.parse(JSON.stringify(describeSyncReport({
+    failed: [{ id: 'c-1', title: 'Repaso de Information Science', error: 'HTTP 503', archived: false }, { id: 'c-2', title: 'Old', error: 'HTTP 500', archived: true }],
+    incomplete: [{ id: 'c-3', title: 'Base de datos', missing: ['BD-GICD-Tema2-MER+DC+UML.pdf'] }],
+    keptPrevious: [{ id: 'c-4', title: 'Kept' }],
+  })));
+  assert.deepEqual(lines, [
+    'Not exported, not in the archive yet: Repaso de Information Science (c-1) — HTTP 503',
+    'Not exported, archived copy kept: Old (c-2) — HTTP 500',
+    'Archived with files missing: Base de datos (c-3) — BD-GICD-Tema2-MER+DC+UML.pdf',
+    'Not updated, archived copy kept (new export is missing files): Kept (c-4)',
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(describeSyncReport(null))), []);
 });

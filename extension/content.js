@@ -351,9 +351,9 @@
     try {
       binary = atob(normalized);
     } catch {
-      throw new Error('Claude returned an invalid base64 inline content block. Sync stopped before anything was sent to GitHub.');
+      throw new Error('Claude returned an invalid base64 inline content block.');
     }
-    if (!binary.length) throw new Error('Claude returned an empty base64 inline content block. Sync stopped before anything was sent to GitHub.');
+    if (!binary.length) throw new Error('Claude returned an empty base64 inline content block.');
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   }
 
@@ -403,7 +403,7 @@
     }
     try {
       const r = await fetch(url, { credentials: 'include', signal });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
       const buffer = await r.arrayBuffer();
       if (!buffer.byteLength) throw new Error('the download returned an empty file');
       return {
@@ -415,8 +415,27 @@
       };
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw new Error(`Failed to download attachment "${label}": ${e?.message || 'network error'}. Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw Object.assign(new Error(`Failed to download attachment "${label}": ${e?.message || 'network error'}.`), { status: e?.status });
     }
+  }
+
+  // A download Claude answers with 404/410 is gone, not temporarily failing:
+  // retrying cannot recover it. Such a file is archived as a visible "not
+  // archived" note (and the conversation marked incomplete) instead of
+  // keeping the whole conversation out of the archive. Any other failure
+  // (network, 5xx, 403, 429) skips the conversation so a later sync retries it.
+  const UNAVAILABLE_STATUSES = new Set([404, 410]);
+  const isUnavailable = (error) => UNAVAILABLE_STATUSES.has(error?.status);
+
+  // Signs that Claude's tools may have written files into the conversation's
+  // sandbox: a file-oriented tool call or a sandbox path in the active lineage.
+  function mayHaveSandboxFiles(messages) {
+    for (const message of messages) {
+      for (const block of (Array.isArray(message?.content) ? message.content : [])) {
+        if (block?.type === 'tool_use' && /file|bash|str_replace|present/i.test(String(block.name || ''))) return true;
+      }
+    }
+    return /\/mnt\/(?:user-data|data)\//.test(JSON.stringify(messages));
   }
 
   function sandboxFileIsReferenced(file, messages, allFiles, directAssets = []) {
@@ -445,17 +464,27 @@
     });
   }
 
-  async function fetchSandboxFiles(org, conversationId, messages, directAssets, signal) {
+  // Returns { assets, listStatus }. Claude answers the file list with 404 for a
+  // conversation that has no sandbox (observed on a real account: the same
+  // endpoint succeeds for other conversations of the same organization), so
+  // 404 is an empty list here; the caller decides whether files may be missing.
+  async function fetchSandboxFiles(org, conversationId, messages, directAssets, signal, incomplete = [], sandboxInfo = {}) {
     const endpoint = `/api/organizations/${org}/conversations/${conversationId}/wiggle/list-files`;
     let r;
     try {
       r = await fetch(endpoint, { credentials: 'include', signal });
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}": ${e?.message || 'network error'}. Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}": ${e?.message || 'network error'}.`);
     }
+    sandboxInfo.sandbox_list_status = r.status;
     if (!r.ok) {
-      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}" (HTTP ${r.status}). Sync stopped before anything was sent to GitHub; retry the sync.`);
+      // The shape of Claude's error body (for diagnostics; never its text).
+      try { sandboxInfo.sandbox_list_body = sanitizeShape(await r.json()); } catch {}
+    }
+    if (r.status === 404) return { assets: [], listStatus: 404 };
+    if (!r.ok) {
+      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}" (HTTP ${r.status}).`);
     }
 
     let data;
@@ -463,15 +492,15 @@
       data = await r.json();
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw new Error(`Claude returned an unreadable sandbox file list for conversation "${conversationId}". Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw new Error(`Claude returned an unreadable sandbox file list for conversation "${conversationId}".`);
     }
     if (!Array.isArray(data?.files_metadata)) {
-      throw new Error(`Claude returned an invalid sandbox file list for conversation "${conversationId}". Sync stopped before anything was sent to GitHub; retry the sync.`);
+      throw new Error(`Claude returned an invalid sandbox file list for conversation "${conversationId}".`);
     }
 
     for (const file of data.files_metadata) {
       if (!file?.path) {
-        throw new Error(`Claude returned sandbox file metadata without a path for conversation "${conversationId}". Sync stopped before anything was sent to GitHub.`);
+        throw new Error(`Claude returned sandbox file metadata without a path for conversation "${conversationId}".`);
       }
     }
 
@@ -482,7 +511,7 @@
       sandboxFileIsReferenced(file, messages, data.files_metadata, directAssets)
     );
 
-    return mapWithConcurrency(
+    const downloaded = await mapWithConcurrency(
       activeFiles,
       ASSET_DOWNLOAD_CONCURRENCY,
       async (file) => {
@@ -492,12 +521,17 @@
           asset = await fetchAsset(url, file.path.split('/').pop() || file.path, file.content_type, signal);
         } catch (e) {
           if (e?.name === 'AbortError') throw e;
+          if (isUnavailable(e)) {
+            incomplete.push({ kind: 'sandbox-file', name: file.path, reason: `Claude returned HTTP ${e.status} for this file's download` });
+            return null;
+          }
           throw new Error(`Failed to download sandbox file "${file.path}": ${e?.message || 'download error'}`);
         }
         return { ...asset, source_path: file.path, source: 'sandbox' };
       },
       signal,
     );
+    return { assets: downloaded.filter(Boolean), listStatus: r.status };
   }
 
   function isReplyExcerptAttachment(file) {
@@ -505,7 +539,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map()) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map(), incomplete = [], sandboxInfo = {}) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -573,13 +607,22 @@
       directTasks,
       ASSET_DOWNLOAD_CONCURRENCY,
       async ({ message, file, url, name, messageExternalIds, messageReferences }) => {
-        const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
-        return { asset, message, file, messageExternalIds, messageReferences };
+        try {
+          const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
+          return { asset, message, file, messageExternalIds, messageReferences };
+        } catch (e) {
+          if (!isUnavailable(e)) throw e;
+          // Handled like a file without a URL: the sandbox may still hold it.
+          for (const referenced of messageReferences) {
+            filesWithoutDownloadUrl.push({ message: referenced, file, name, reason: `Claude returned HTTP ${e.status} for its download` });
+          }
+          return null;
+        }
       },
       signal,
     );
 
-    for (const { asset, message, file, messageExternalIds, messageReferences } of directAssets) {
+    for (const { asset, message, file, messageExternalIds, messageReferences } of directAssets.filter(Boolean)) {
       const messageId = message.uuid || message.id || null;
       const linkedMessageIds = messageExternalIds.length
         ? messageExternalIds
@@ -603,7 +646,10 @@
     }
 
     // The sandbox contains the original uploads and files generated by Claude's tools.
-    const sandbox = await fetchSandboxFiles(org, conversationId, messages, directAssets, signal);
+    const { assets: sandbox, listStatus } = await fetchSandboxFiles(org, conversationId, messages, directAssets.filter(Boolean), signal, incomplete, sandboxInfo);
+    if (listStatus === 404 && mayHaveSandboxFiles(messages)) {
+      incomplete.push({ kind: 'sandbox', reason: 'Claude returned HTTP 404 for this conversation\'s file list, so files created by Claude\'s tools may be missing' });
+    }
     for (const asset of sandbox) {
       const key = `${asset.source_path}|${asset.sha256}`;
       const nameKey = String(asset.name || '').toLowerCase();
@@ -767,11 +813,13 @@
       }
     }
 
-    // A listed message file with no URL is not necessarily lost: Claude may
-    // expose its extracted text or include it in the conversation sandbox.
-    // But if neither source yielded a matching asset, failing safely is better
-    // than claiming the conversation was archived completely.
-    for (const { message, file, name } of filesWithoutDownloadUrl) {
+    // A listed message file with no URL (or whose download Claude answered with
+    // 404/410) is not necessarily lost: Claude may expose its extracted text or
+    // include it in the conversation sandbox. If neither source yielded a
+    // matching asset, it is recorded as not archived: the conversation shows a
+    // note in its place and is marked incomplete, so it is never mistaken for
+    // a complete archive and later syncs retry it.
+    for (const { message, file, name, reason } of filesWithoutDownloadUrl) {
       const messageId = message.uuid || message.id || null;
       const fileId = file.file_uuid || file.uuid || null;
       const nameKeys = new Set([
@@ -802,9 +850,7 @@
       });
 
       if (!scopedMatch && !sandboxMatch) {
-        throw new Error(
-          `Cannot safely export Claude conversation "${conversationId}": attachment "${name}" has no downloadable URL and no matching archiveable file was found. Sync stopped before anything was sent to GitHub; retry or inspect the attachment in Claude.`,
-        );
+        incomplete.push({ kind: 'attachment', message_external_id: messageId, file_uuid: fileId, name, reason: reason || 'Claude did not provide a download link for this file' });
       }
     }
     return assets;
@@ -878,7 +924,7 @@
     return chain;
   }
 
-  async function normalize(c, org, signal) {
+  async function normalize(c, org, signal, sandboxInfo = {}) {
     const raw = selectActiveLineage(c);
     const inlineMarkerNonce = createInlineMarkerNonce();
     const inlineByMessage = new Map();
@@ -899,7 +945,10 @@
       };
     });
 
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage);
+    // Files that could not be archived; rendered as visible notes and recorded
+    // in the index so the conversation is retried by later syncs.
+    const incomplete = [];
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage, incomplete, sandboxInfo);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',
@@ -911,6 +960,7 @@
       inline_marker_nonce: inlineMarkerNonce,
       messages,
       assets,
+      incomplete,
     };
   }
 
@@ -945,6 +995,81 @@
   // an existing archive it checks every conversation incrementally; without
   // one (first use, or the archive state cannot be read) it only takes the
   // latest AUTO_SYNC_LIMIT, so it never starts a full first import by itself.
+  // ---- Sanitized diagnostics (popup: "Copy diagnostic report") ----
+  // For conversations that were not archived completely, record the *shape*
+  // of Claude's responses: keys, types, counts, HTTP statuses, and structural
+  // values such as "type" or "file_kind". Message text, titles, file names,
+  // file contents and URL query strings (where signed tokens could be) are
+  // never recorded; IDs inside values become {uuid}.
+  const DIAGNOSTIC_VALUE_KEYS = new Set(['type', 'sender', 'kind', 'file_kind', 'mime_type', 'content_type', 'file_type', 'media_type', 'encoding', 'stop_reason']);
+  const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+  function sanitizePathLike(value) {
+    const match = value.match(/^(https?:\/\/[^/?#]+)?([^?#]*)/i);
+    const origin = match[1] || '';
+    const path = match[2].split('/').map((segment) => {
+      if (!segment) return segment;
+      if (/^[0-9a-f-]{36}$/i.test(segment)) return '{uuid}';
+      if (/^[a-z_-]{1,24}$/.test(segment)) return segment;
+      const extension = segment.match(/\.([a-z0-9]{1,5})$/i);
+      return extension ? `<name>.${extension[1].toLowerCase()}` : `<segment:${segment.length}>`;
+    }).join('/');
+    return `${origin}${path}${/[?#]/.test(value) ? '?<query removed>' : ''}`;
+  }
+
+  function sanitizeShape(value, key = '', depth = 0) {
+    if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      if (DIAGNOSTIC_VALUE_KEYS.has(key) && value.length <= 60 && /^[\w.\/+-]+$/.test(value)) return value;
+      if (/^(https?:\/\/|\/)/i.test(value) && value.length <= 2048) return sanitizePathLike(value);
+      if (/^[0-9a-f-]{36}$/i.test(value)) return '{uuid}';
+      return `<string:${value.length}>`;
+    }
+    if (depth >= 6) return '<nested>';
+    if (Array.isArray(value)) {
+      const items = value.slice(0, 5).map((item) => sanitizeShape(item, key, depth + 1));
+      return value.length > 5 ? [...items, `<+${value.length - 5} more>`] : items;
+    }
+    if (typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map((k) => [k, sanitizeShape(value[k], k, depth + 1)]));
+    }
+    return `<${typeof value}>`;
+  }
+
+  // Quoted parts of an error message can be titles or file names.
+  const sanitizeError = (message) => String(message || '').replace(/"[^"]*"/g, (quoted) => (/^"[0-9a-f-]{36}"$/i.test(quoted) ? quoted : '"<redacted>"')).slice(0, 400);
+  const fileExtension = (name) => (String(name || '').match(/\.([a-z0-9]{1,5})$/i)?.[1] || '').toLowerCase() || null;
+
+  function diagnosticFor(conversationId, payload, outcome, details) {
+    const messages = Array.isArray(payload?.chat_messages) ? payload.chat_messages : (Array.isArray(payload?.messages) ? payload.messages : []);
+    const hasFiles = (m) => ['files', 'files_v2', 'attachments'].some((k) => Array.isArray(m?.[k]) && m[k].length);
+    return {
+      conversation_id: conversationId,
+      outcome,
+      ...details,
+      conversation_keys: payload && typeof payload === 'object' ? Object.keys(payload).sort() : null,
+      message_count: messages.length,
+      // Messages carrying files, where attachment problems come from.
+      messages_with_files: messages.filter(hasFiles).slice(0, 20).map((m) => ({
+        message_id: typeof m?.uuid === 'string' ? m.uuid : null,
+        sender: sanitizeShape(m?.sender, 'sender'),
+        keys: Object.keys(m || {}).sort(),
+        content_block_types: Array.isArray(m?.content) ? m.content.map((block) => sanitizeShape(block?.type, 'type')) : [],
+        files: sanitizeShape(m?.files),
+        files_v2: sanitizeShape(m?.files_v2),
+        attachments: sanitizeShape(m?.attachments),
+      })),
+    };
+  }
+
+  function storeDiagnostics(items) {
+    try {
+      chrome.storage?.local?.set?.({ last_sync_diagnostics: { at: new Date().toISOString(), items: items.slice(0, 30) } })?.catch?.(() => {});
+    } catch {
+      // Diagnostics are best effort and never affect the sync.
+    }
+  }
+
   async function runSync(limit = 'all', { automatic = false } = {}) {
     if (syncing) return;
     syncing = true;
@@ -982,15 +1107,31 @@
       // exactly as it was, and the completion message names it. Cancellation
       // still stops everything, and if nothing could be exported the sync fails.
       const skipped = [];
+      const diagnostics = [];
       let firstExportError = null;
       for (let i = 0; i < selected.length; i++) {
         if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        let payload = null;
+        const sandboxInfo = {};
         try {
-          const conversation = await normalize(await full(org, selected[i].uuid, signal), org, signal);
+          payload = await full(org, selected[i].uuid, signal);
+          const conversation = await normalize(payload, org, signal, sandboxInfo);
           if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
           conversations.push(conversation);
+          if (conversation.incomplete.length) {
+            diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'incomplete', {
+              problems: conversation.incomplete.map((item) => ({
+                kind: item.kind,
+                reason: item.reason,
+                message_id: item.message_external_id || null,
+                file_extension: fileExtension(item.name),
+              })),
+              ...sandboxInfo,
+            }));
+          }
         } catch (e) {
           if (e?.name === 'AbortError' || signal.aborted) throw e;
+          diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'failed', { error: sanitizeError(e?.message || e), ...sandboxInfo }));
           firstExportError ??= e;
           skipped.push({
             id: selected[i].uuid,
@@ -1000,6 +1141,7 @@
         }
         sendProgress({ stage: 'fetching', current: i + 1, total, selected: limit });
       }
+      storeDiagnostics(diagnostics);
       if (!conversations.length && firstExportError) throw firstExportError;
 
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
@@ -1010,7 +1152,7 @@
       // Keep the content-script lock until the background sync has actually
       // finished; otherwise another startSync message can trigger a second fetch
       // while the first batch is still being committed to GitHub.
-      const result = await handOff({ conversations, skipped, unchangedIds, fullList: limit === 'all' }, signal);
+      const result = await handOff({ conversations, skipped, unchangedIds, fullList: limit === 'all', listed: listData.length }, signal);
       if (!result?.ok && !result?.cancelled) {
         sendProgress({ stage: 'error', error: result?.error || 'No response' });
       }
