@@ -498,3 +498,4 @@ body,.app,.reader-shell,.auth{background:var(--bg)!important;color:var(--text)!i
   .reader-sticky-header{grid-template-columns:auto 1fr}
   .reader-header-actions{display:none}
 }
+.search-snippet mark{background:rgba(255,200,0,.28);color:inherit;border-radius:3px;padding:0 1px}
