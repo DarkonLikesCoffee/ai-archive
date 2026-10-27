@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseConversationMarkdown, readAsset, readText, readIndex, githubBlobUrl } from './github.js';
+import { parseConversationMarkdown, readAsset, readText, readIndex, githubBlobUrl, describeConnectError } from './github.js';
 
 test('parses canonical metadata, title, and messages', () => {
   const markdown = `<!-- AI_ARCHIVE_METADATA
@@ -326,4 +326,21 @@ test('GitHub file links follow the default branch and encode the path', () => {
     githubBlobUrl({ owner: 'me', repo: 'archive' }, 'archive/conversations/claude/personal/What is #1? 100%.md'),
     'https://github.com/me/archive/blob/HEAD/archive/conversations/claude/personal/What%20is%20%231%3F%20100%25.md',
   );
+});
+
+test('a repository without an archive yet reads as an empty archive', async (t) => {
+  const settings = { owner: 'me', repo: 'archive', token: 't' };
+  for (const [status, body] of [[404, '{"message":"Not Found"}'], [409, '{"message":"Git Repository is empty."}']]) {
+    t.mock.method(globalThis, 'fetch', async () => new Response(body, { status }));
+    assert.deepEqual(await readIndex(settings), { version: 2, conversations: [], missing: true }, `HTTP ${status}`);
+    t.mock.restoreAll();
+  }
+  t.mock.method(globalThis, 'fetch', async () => new Response('{"message":"Bad credentials"}', { status: 401 }));
+  await assert.rejects(readIndex(settings), /GitHub 401/);
+});
+
+test('explains a repository that cannot be found when connecting', () => {
+  const settings = { owner: 'me', repo: 'archiv' };
+  assert.match(describeConnectError(new Error('GitHub 404: {"message":"Not Found"}'), settings), /^Repository me\/archiv was not found, or the token cannot access it\./);
+  assert.equal(describeConnectError(new Error('GitHub 401: GitHub rejected the access token.'), settings), 'GitHub 401: GitHub rejected the access token.');
 });
