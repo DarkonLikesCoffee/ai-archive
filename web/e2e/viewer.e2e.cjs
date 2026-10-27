@@ -155,6 +155,26 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.waitForFunction(async () => !(await caches.keys()).length);
   check('Disconnect clears the attachment cache', true);
 
+  // Phones: the sidebar is a drawer behind a menu button.
+  await page.addInitScript(() => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner: 'me', repo: 'archive', token: 't' })));
+  await page.goto(base);
+  await page.waitForSelector('.conversation');
+  check('desktop has no menu button', !(await page.locator('.menu-button').isVisible()) && await page.locator('.sidebar').isVisible());
+  await page.setViewportSize({ width: 390, height: 800 });
+  check('phone hides the sidebar behind a menu button', await page.locator('.menu-button').isVisible() && !(await page.locator('.sidebar').isVisible()));
+  await page.click('.menu-button');
+  check('the menu opens the sidebar', await page.locator('.sidebar').isVisible());
+  await page.locator('.sidebar button.nav', { hasText: 'personal' }).click();
+  await page.waitForFunction(() => location.hash.includes('account=personal'));
+  check('choosing an account filters and closes the menu', !(await page.locator('.sidebar').isVisible()));
+  await page.click('.menu-button');
+  await page.keyboard.press('Escape');
+  check('Escape closes the menu', !(await page.locator('.sidebar').isVisible()));
+  await page.click('.menu-button');
+  await page.mouse.click(370, 400);
+  check('tapping outside closes the menu', !(await page.locator('.sidebar').isVisible()));
+  await page.setViewportSize({ width: 1280, height: 720 });
+
   // Keyboard: / focuses search, j/k move through the list, Enter opens,
   // Escape leaves the find bar and then goes back to the list.
   await page.addInitScript(() => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner: 'me', repo: 'archive', token: 't' })));
