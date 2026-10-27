@@ -205,14 +205,12 @@ function handleClaude(url) {
     await popup.waitForFunction(() => /saved/.test(document.querySelector('#status').textContent));
     check('popup saves working GitHub settings', await popup.locator('#logged').isVisible(), await status());
 
-    // The popup normally targets the active claude.ai tab; opened as a tab
-    // itself it is the active tab, so send the same message to the claude tab.
+    // The popup is open as a tab here, so it is the active tab; Sync finds the
+    // claude.ai tab itself, exactly as when the popup is opened from another tab.
     async function syncAll(limit = 'all') {
       await popup.evaluate(() => { document.querySelector('#lastSync').textContent = ''; });
-      await popup.evaluate(async (syncLimit) => {
-        const [tab] = await chrome.tabs.query({ url: 'https://claude.ai/*' });
-        await chrome.tabs.sendMessage(tab.id, { type: 'startSync', limit: syncLimit });
-      }, limit);
+      await popup.selectOption('#syncLimit', limit);
+      await popup.click('#sync');
       await popup.waitForFunction(() => /^Last sync/.test(document.querySelector('#lastSync').textContent), null, { timeout: 30000 });
       return popup.locator('#lastSync').textContent();
     }
@@ -276,13 +274,20 @@ function handleClaude(url) {
     await popup.waitForFunction(() => document.querySelector('#lastSync').textContent.length > 0);
     check('reopened popup remembers the last sync', /^Last sync just now: Sync complete/.test(await popup.locator('#lastSync').textContent()));
 
+    // With no claude.ai tab open, Sync opens one in the background and syncs.
+    await claude.close();
+    addConversation('conv-c', 'New idea', '2026-10-27T11:00:00Z', [['human', 'Name a cat'], ['assistant', 'Miso.']]);
+    last = await syncAll();
+    const claudeTabs = context.pages().filter((p) => p.url().startsWith('https://claude.ai/'));
+    check('Sync without a Claude tab opens one and syncs', claudeTabs.length === 1 && github.commitCount() === 5 && /1 conversation changed/.test(last), `tabs=${claudeTabs.length} ${last}`);
+
     if (process.env.VIEWER_URL) {
       const viewer = await context.newPage();
       viewer.on('pageerror', (e) => errors.push(`viewer: ${e}`));
       await viewer.addInitScript(([owner, repo, token]) => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner, repo, token })), [OWNER, REPO, TOKEN]);
       await viewer.goto(process.env.VIEWER_URL);
       await viewer.waitForSelector('.conversation');
-      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 2);
+      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 3);
       await viewer.locator('.conversation', { hasText: 'SQL question' }).click();
       await viewer.waitForSelector('.message');
       check('viewer shows the synced turns', (await viewer.locator('.message').count()) === 4);
