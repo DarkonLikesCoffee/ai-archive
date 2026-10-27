@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseConversationMarkdown, readAsset, readText, readIndex } from './github.js';
+import { parseConversationMarkdown, readAsset, readText, readIndex, githubBlobUrl } from './github.js';
 
 test('parses canonical metadata, title, and messages', () => {
   const markdown = `<!-- AI_ARCHIVE_METADATA
@@ -319,4 +319,11 @@ test('readIndex inflates compressed search entries and preserves legacy plain en
   assert.equal(result.conversations[0].search_text_gzip, undefined, 'compressed payload should not remain in the UI search model');
   assert.equal(result.conversations[0].search_text_encoding, undefined);
   assert.equal(calls.length, 1, 'search data should be decoded from the single index request');
+});
+
+test('GitHub file links follow the default branch and encode the path', () => {
+  assert.equal(
+    githubBlobUrl({ owner: 'me', repo: 'archive' }, 'archive/conversations/claude/personal/What is #1? 100%.md'),
+    'https://github.com/me/archive/blob/HEAD/archive/conversations/claude/personal/What%20is%20%231%3F%20100%25.md',
+  );
 });

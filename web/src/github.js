@@ -2,6 +2,12 @@ const API = 'https://api.github.com';
 
 export function encodePath(path) { return path.split('/').map(encodeURIComponent).join('/'); }
 
+// A github.com link to an archived file. HEAD is the repository's default
+// branch, the same branch the Contents API reads, whether it is main or master.
+export function githubBlobUrl(settings, path) {
+  return `https://github.com/${encodeURIComponent(settings.owner)}/${encodeURIComponent(settings.repo)}/blob/HEAD/${encodePath(path)}`;
+}
+
 // The viewer only reads, so every request can be retried safely. Tests lower
 // the base delay; the attempt budget and Retry-After cap stay the same.
 export const retryPolicy = { attempts: 3, baseDelayMs: 1000, maxRetryAfterMs: 60000 };
