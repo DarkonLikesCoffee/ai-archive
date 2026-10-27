@@ -1,0 +1,88 @@
+// Real-browser check of the web viewer against a GitHub API mock whose archive
+// is produced by the real exporter (extension/background.js).
+//
+// Requires Playwright with a Chromium browser (not part of CI). Run:
+//   cd web && npm run build && npx vite preview --port 4317 --strictPort &
+//   node e2e/viewer.e2e.cjs            # BASE_URL=http://localhost:4317/ by default
+const { chromium } = require('playwright');
+const fs = require('fs');
+const vm = require('vm');
+const { webcrypto } = require('crypto');
+
+const path = require('path');
+const repoRoot = path.resolve(__dirname, '..', '..');
+const bg = fs.readFileSync(`${repoRoot}/extension/background.js`, 'utf8');
+const ctx = { chrome: { storage: { local: { get: async () => ({}) } }, runtime: { onMessage: { addListener() {} }, sendMessage: () => Promise.resolve() } }, AbortController, fetch: () => new Promise(() => {}), TextEncoder, TextDecoder, Uint8Array, crypto: webcrypto, btoa, atob };
+vm.runInNewContext(`${bg}\nglobalThis.h={normalizeAssetList,conversationMarkdown,conversationPath,indexEntry};`, ctx);
+
+const conversations = [
+  { external_id: 'conv-react', title: 'Frontend help', source_updated_at: '2026-10-20T10:00:00Z', message_count: 2, messages: [
+    { external_id: 'u1', role: 'user', content: 'How do React hooks work?', files: [], attachments: [] },
+    { external_id: 'a1', role: 'assistant', content: 'Intro.\n\n---\n\n## Details\n\nhooks let components keep state.', files: [], attachments: [] }], assets: [] },
+  { external_id: 'conv/rust?#1', title: 'Rust ownership', source_updated_at: '2026-10-25T10:00:00Z', message_count: 2, messages: [
+    { external_id: 'u2', role: 'user', content: 'Explain the borrow checker', files: [], attachments: [] },
+    { external_id: 'a2', role: 'assistant', content: 'The borrow checker enforces ownership.', files: [], attachments: [] }], assets: [] },
+];
+const files = {};
+const index = { version: 2, conversations: [] };
+for (const c of conversations) {
+  const { assets, byKey } = ctx.h.normalizeAssetList(c, 'claude', 'personal');
+  const path = ctx.h.conversationPath(c, 'claude', 'personal');
+  files[path] = ctx.h.conversationMarkdown(c, 'claude', 'personal', byKey, assets);
+  index.conversations.push(ctx.h.indexEntry(c, path, 'claude', 'personal', assets));
+}
+files['archive/index.json'] = JSON.stringify(index);
+
+(async () => {
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.route('https://api.github.com/**', (route) => {
+    const url = new URL(route.request().url());
+    const m = url.pathname.match(/^\/repos\/me\/archive\/contents\/(.+)$/);
+    const path = m && decodeURIComponent(m[1]);
+    if (path && files[path] !== undefined) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ type: 'file', encoding: 'base64', content: Buffer.from(files[path]).toString('base64'), sha: 'x' }) });
+    }
+    return route.fulfill({ status: 404, contentType: 'application/json', body: '{"message":"Not Found"}' });
+  });
+  await page.addInitScript(() => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner: 'me', repo: 'archive', token: 't' })));
+  const base = process.env.BASE_URL || 'http://localhost:4317/';
+  const check = (name, ok, detail = '') => { console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`); if (!ok) process.exitCode = 1; };
+
+  await page.goto(base);
+  await page.waitForSelector('.conversation');
+  check('list shows both conversations', (await page.locator('.conversation').count()) === 2);
+
+  await page.fill('.search', 'hooks react');
+  await page.waitForFunction(() => document.querySelectorAll('.conversation').length === 1);
+  check('multi-word search matches non-adjacent words', (await page.locator('.conversation strong').first().textContent()) === 'Frontend help');
+  check('search snippet highlights terms', (await page.locator('.search-snippet mark').count()) >= 2);
+  check('search is in the URL (replaceState)', page.url().includes('q=hooks+react'), page.url());
+
+  await page.locator('.conversation').first().click();
+  await page.waitForSelector('.message');
+  check('opening a conversation sets a deep link', page.url().includes('#/c/claude/personal/conv-react'), page.url());
+  const roles = await page.locator('.message .role').allTextContents();
+  check('answer with "---" + "## Details" stays one message (#47)', roles.length === 2, JSON.stringify(roles));
+
+  await page.reload();
+  await page.waitForSelector('.message');
+  check('reload reopens the same conversation', (await page.locator('.message').count()) === 2);
+
+  await page.goBack();
+  await page.waitForSelector('.conversation');
+  check('Back returns to the list with the search kept', (await page.inputValue('.search')) === 'hooks react', await page.inputValue('.search'));
+
+  await page.goto(`${base}#/c/claude/personal/${encodeURIComponent('conv/rust?#1')}`);
+  await page.waitForSelector('.message');
+  check('deep link with an unusual ID opens it', (await page.locator('.message .content').first().textContent()).includes('borrow checker'));
+
+  await page.goto(`${base}#/c/claude/personal/does-not-exist`);
+  await page.waitForSelector('.error.banner');
+  check('a dead link shows a clear error over the list', (await page.locator('.error.banner').textContent()).includes('not in the archive index'));
+
+  check('no uncaught page errors', errors.length === 0, errors.join(' | '));
+  await browser.close();
+})().catch((e) => { console.error(e); process.exit(1); });
