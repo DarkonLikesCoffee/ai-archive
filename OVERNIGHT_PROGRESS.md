@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-27 07:00 UTC — post-roadmap product cycle (#57–#63).
+Last updated: 2026-10-27 07:10 UTC — post-roadmap product cycle (#57–#71).
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -29,6 +29,14 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | Test | Real-browser e2e of the extension (popup + content script + service worker) vs fake claude.ai/GitHub | ✅ 23/23 | #61 |
 | Viewer | "Open on GitHub" follows the default branch (main or master) | ✅ | #62 |
 | Viewer | Date groups + sort (updated / created / oldest / title) | ✅ real Chromium | #63 |
+| Viewer | Attachment cache by sha256 (no GitHub calls on revisit; cleared on Disconnect) | ✅ real Chromium | #64 |
+| Viewer | Copy buttons on code blocks; find bar ignores button labels | ✅ real Chromium | #65 |
+| Viewer | Print / Save as PDF (print stylesheet) | ✅ real Chromium PDF | #66 |
+| Viewer | Phone layout: sidebar drawer (was unreachable below 700px) | ✅ real Chromium | #67 |
+| Viewer | Keyboard shortcuts (/, j/k, Enter, Escape) | ✅ real Chromium | #68 |
+| Popup | Bug: finished sync reported as "fetching" for 5 min (Sync disabled) | ✅ fixed | #69 |
+| Popup | Sync from any tab: finds or opens a Claude tab | ✅ real Chromium e2e | #70 |
+| Viewer | Outline of your prompts in long conversations | ✅ real Chromium | #71 (open) |
 | Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
 | All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible here; the extension now runs end to end in headless Chromium against faithful fakes (#61), but real claude.ai responses and real GitHub remain unverified | — |
 
@@ -93,8 +101,14 @@ Secondary items left (none blocks the product):
   (old headless never starts the service worker); service-worker fetches are routable with
   `PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS=1`. Optional `VIEWER_URL` stage opens the synced archive.
 - #62 "Open on GitHub" link used blob/main (404 on master archives) → blob/HEAD
-- #63 date groups + sort (open at time of writing; CI pending)
-- Next candidates: asset cache by sha256 in the viewer (faster revisits), copy-code buttons, archive stats.
+- #63 date groups + sort · #64 attachment cache · #65 copy-code buttons · #66 print/PDF
+- #67 phone sidebar drawer · #68 keyboard shortcuts
+- #69 bug found by the extension e2e once it clicked the real Sync button: a reopened popup showed a finished
+  sync as still fetching (and disabled Sync) for 5 minutes after every sync — fixed
+- #70 Sync from any tab (find most recent Claude tab, or open one in the background)
+- #71 prompt outline (open; CI pending at time of writing)
+- Test totals on master + #71: extension 118/118, web 67/67, viewer e2e 41/41, extension e2e 24/24.
+- Next candidates: reader controls on phones (Print/Open on GitHub are hidden < 700px), archive overview.
 
 ## Process note
 - A merge-conflict resolution on #54 briefly pushed an unparsable test file because a `grep`-based check did not
