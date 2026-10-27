@@ -1,11 +1,13 @@
 // Hash routes for the viewer, so a conversation can be reloaded, bookmarked,
 // or linked, and the browser's Back button returns to the list:
 //   #/c/<provider>/<account>/<id>          an open conversation
+//   #/overview                              archive totals
 //   #/?q=<search>&provider=<p>&account=<a>&sort=<s>  the list (defaults omitted)
 
 const DEFAULT_LIST = Object.freeze({ view: 'list', provider: 'all', account: 'all', q: '', sort: 'auto' });
 
 export function formatRoute(route) {
+  if (route?.view === 'overview') return '#/overview';
   if (route?.view === 'conversation') {
     return `#/c/${[route.provider, route.account, route.id].map((part) => encodeURIComponent(String(part ?? ''))).join('/')}`;
   }
@@ -29,6 +31,7 @@ export function parseRoute(hash) {
       return { ...DEFAULT_LIST };
     }
   }
+  if (value === '/overview') return { view: 'overview' };
   if (value === '' || value === '/' || value.startsWith('/?')) {
     const params = new URLSearchParams(value.startsWith('/?') ? value.slice(2) : '');
     return {

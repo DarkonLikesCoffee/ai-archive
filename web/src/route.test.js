@@ -22,3 +22,8 @@ test('treats empty, unknown, and malformed hashes as the default list', () => {
     assert.deepEqual(parseRoute(hash), list, hash);
   }
 });
+
+test('round-trips the overview route', () => {
+  assert.equal(formatRoute({ view: 'overview' }), '#/overview');
+  assert.deepEqual(JSON.parse(JSON.stringify(parseRoute('#/overview'))), { view: 'overview' });
+});
