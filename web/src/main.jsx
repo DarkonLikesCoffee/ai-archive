@@ -6,6 +6,7 @@ import { assetPlaceholderPaths } from './assetPlaceholders.js';
 import { terminatedToolSectionEnd } from './toolSections.js';
 import { searchConversations } from './archiveSearch.js';
 import { formatRoute, parseRoute } from './route.js';
+import { clearAssetCache, readAssetCached } from './assetCache.js';
 import { effectiveSort, groupByDate, sortConversations, sortDate, sortOptions } from './listOrder.js';
 import './styles.css';
 
@@ -527,12 +528,13 @@ function Reader({ settings, selected, conversation, onBack, sidebar }) {
       if(baseDir){ const base=normalizePath(baseDir); if(!clean.startsWith(base+'/')) out.push(`${base}/${clean}`); }
       return [...new Set(out)];
     };
-    // At most four assets in flight: each image costs two GitHub API calls.
+    // At most four assets in flight: each image costs two GitHub API calls
+    // unless it is already in the browser's asset cache (assetCache.js).
     mapWithConcurrency(unique, 4, async raw=>{
       for(const candidate of candidates(raw)){
         try{
           const metadata=(selected.assets||[]).find(item=>item?.path===candidate) || null;
-          const asset=await readAsset(settings,candidate,metadata);
+          const asset=await readAssetCached(settings,candidate,metadata,{read:readAsset});
           return {raw, candidate, asset};
         }catch{}
       }
@@ -614,7 +616,7 @@ function App() {
   const sorted=useMemo(()=>sortConversations(items,activeSort),[items,activeSort]);
   const groups=useMemo(()=>groupByDate(sorted,activeSort),[sorted,activeSort]);
   async function open(c){setError('');try{setSelected(c);setConversation(await readConversation(settings,c.path));}catch(e){setSelected(null);setError(e.message)}}
-  function disconnect(){localStorage.removeItem(KEY);setSettings(null);setSelected(null);setConversation(null)}
+  function disconnect(){localStorage.removeItem(KEY);clearAssetCache();setSettings(null);setSelected(null);setConversation(null)}
   // The URL hash drives navigation (see route.js): opening a conversation or a
   // sidebar filter pushes a history entry, so Back returns to the list, and a
   // reloaded or shared link reopens the same view once the index is loaded.
