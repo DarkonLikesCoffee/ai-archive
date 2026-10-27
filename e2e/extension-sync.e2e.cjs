@@ -138,6 +138,7 @@ function createFakeGitHub() {
 // ---- Fake claude.ai: one organization and a mutable conversation list. ----
 const ORG = 'org-1';
 const BIG_FILES = [];
+const NO_SANDBOX = new Set();
 const ROOT = '00000000-0000-4000-8000-000000000000';
 const claudeConversations = new Map();
 function addConversation(id, title, updatedAt, turns, extra = {}) {
@@ -159,7 +160,9 @@ addConversation('conv-b', 'SQL question', '2026-10-21T10:00:00Z', [
   ['assistant', 'It keeps every row from the left table.'],
 ]);
 
+const claudeRequests = [];
 function handleClaude(url) {
+  claudeRequests.push(url.pathname);
   const json = (body) => ({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
   if (url.pathname === '/api/organizations') return json([{ uuid: ORG }]);
   if (url.pathname === `/api/organizations/${ORG}/chat_conversations`) {
@@ -169,7 +172,10 @@ function handleClaude(url) {
   }
   let m = url.pathname.match(new RegExp(`^/api/organizations/${ORG}/chat_conversations/([^/]+)$`));
   if (m) return claudeConversations.has(m[1]) ? json(claudeConversations.get(m[1])) : { status: 404, body: 'not found' };
-  if (/\/wiggle\/list-files$/.test(url.pathname)) return json({ files_metadata: [] });
+  // Like Claude for a conversation without a sandbox (seen on a real account).
+  const sandbox = url.pathname.match(/\/conversations\/([^/]+)\/wiggle\/list-files$/);
+  if (sandbox && NO_SANDBOX.has(sandbox[1])) return { status: 404, contentType: 'application/json', body: JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'Not found' } }) };
+  if (sandbox) return json({ files_metadata: [] });
   const big = url.pathname.match(/^\/api\/fake-assets\/big-(\d+)\.bin$/);
   if (big && BIG_FILES[Number(big[1])]) return { status: 200, contentType: 'application/octet-stream', body: BIG_FILES[Number(big[1])] };
   if (url.pathname === '/api/fake-assets/map.png') return { status: 200, contentType: 'image/png', body: PNG };
@@ -325,13 +331,45 @@ function handleClaude(url) {
     check('the inline image is archived in place, before the text that follows it', Boolean(imagePath && files[imagePath]?.equals(PNG))
       && richText.indexOf(imageLink[0]) < richText.indexOf('Above: the chart.') && richText.indexOf(imageLink[0]) > richText.indexOf('strong effect'), imageLink?.[0]);
 
+    // The failure shapes of the owner's first real sync: the sandbox file list
+    // answers 404, and an uploaded PDF comes without a download URL. Both
+    // conversations must be archived (one completely, one with a visible note
+    // for the PDF), reported as such, and the incomplete one retried later.
+    NO_SANDBOX.add('conv-no-sandbox').add('conv-pdf');
+    addConversation('conv-no-sandbox', 'Repaso de Information Science', '2026-10-27T10:00:00Z', [['human', 'Repasemos el tema 1'], ['assistant', 'Empecemos por la definición.']]);
+    addConversation('conv-pdf', 'Base de datos', '2026-10-27T10:05:00Z', [
+      ['human', 'Explica el modelo E/R del PDF', [{ file_uuid: 'pdf-1', file_name: 'BD-GICD-Tema2-MER+DC+UML.pdf', file_kind: 'document' }]],
+      ['assistant', 'El modelo entidad-relación describe…'],
+    ]);
+    const commitsBeforeReal = github.commitCount();
+    last = await syncAll();
+    files = github.files();
+    const realIndex = JSON.parse(files['archive/index.json']);
+    const noSandboxEntry = realIndex.conversations.find((entry) => entry.id === 'conv-no-sandbox');
+    const pdfEntry = realIndex.conversations.find((entry) => entry.id === 'conv-pdf');
+    check('a conversation whose sandbox list is HTTP 404 is archived completely', Boolean(noSandboxEntry) && !noSandboxEntry.incomplete && files[noSandboxEntry.path]?.toString().includes('Empecemos por la definición.'));
+    const pdfMarkdown = pdfEntry ? files[pdfEntry.path].toString() : '';
+    check('a PDF without a download URL leaves the conversation archived, with a visible note in its place',
+      pdfMarkdown.includes('Explica el modelo E/R del PDF') && /\*\*Attachment not archived: BD-GICD-Tema2-MER\+DC\+UML\.pdf\*\* \(Claude did not provide a download link for this file\)/.test(pdfMarkdown)
+      && pdfEntry.incomplete?.[0]?.name === 'BD-GICD-Tema2-MER+DC+UML.pdf');
+    check('the sync is reported as finished with problems, naming the incomplete conversation',
+      github.commitCount() === commitsBeforeReal + 1 && /^Last sync finished with problems just now: /.test(last)
+      && (await popup.locator('#syncReport li').allTextContents()).some((line) => line === 'Archived with files missing: Base de datos (conv-pdf) — BD-GICD-Tema2-MER+DC+UML.pdf'), last);
+    const requestsBeforeRetry = claudeRequests.length;
+    last = await syncAll();
+    const retryRequests = claudeRequests.slice(requestsBeforeRetry);
+    check('the next sync retries the incomplete conversation instead of treating it as unchanged',
+      retryRequests.filter((p) => p.endsWith('/chat_conversations/conv-pdf')).length === 1
+      && !retryRequests.some((p) => p.endsWith('/chat_conversations/conv-no-sandbox'))
+      && /5 unchanged conversations were not downloaded again\. 1 conversation was archived with files missing/.test(last), last);
+
     if (process.env.VIEWER_URL) {
       const viewer = await context.newPage();
       viewer.on('pageerror', (e) => errors.push(`viewer: ${e}`));
       await viewer.addInitScript(([owner, repo, token]) => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner, repo, token })), [OWNER, REPO, TOKEN]);
       await viewer.goto(process.env.VIEWER_URL);
       await viewer.waitForSelector('.conversation');
-      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 4);
+      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 6);
       await viewer.locator('.conversation', { hasText: 'Research with tools' }).click();
       await viewer.waitForSelector('.content img[src^="data:image/png"]');
       const richView = await viewer.evaluate(() => ({

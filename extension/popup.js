@@ -14,9 +14,40 @@ function describeLastSync(record, now = Date.now()) {
     : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago`
       : seconds < 86400 ? `${Math.floor(seconds / 3600)} h ago`
         : `on ${new Date(at).toISOString().slice(0, 10)}`;
-  const label = record.stage === 'error' ? 'Last sync failed' : record.stage === 'cancelled' ? 'Last sync cancelled' : 'Last sync';
+  const label = record.stage === 'error' ? 'Last sync failed'
+    : record.stage === 'cancelled' ? 'Last sync cancelled'
+      : record.partial ? 'Last sync finished with problems' : 'Last sync';
   const message = String(record.message || '').slice(0, 300);
   return message ? `${label} ${when}: ${message}` : `${label} ${when}.`;
+}
+
+// One line per conversation that was not archived completely, so a partial
+// sync can be checked conversation by conversation (titles plus IDs).
+function describeSyncReport(report) {
+  if (!report || typeof report !== 'object') return [];
+  const lines = [];
+  const name = (item) => `${item.title || item.id} (${item.id})`;
+  for (const item of Array.isArray(report.failed) ? report.failed : []) {
+    lines.push(`Not exported${item.archived ? ', archived copy kept' : ', not in the archive yet'}: ${name(item)} — ${item.error || 'unknown error'}`);
+  }
+  for (const item of Array.isArray(report.incomplete) ? report.incomplete : []) {
+    lines.push(`Archived with files missing: ${name(item)} — ${(item.missing || []).join(', ')}`);
+  }
+  for (const item of Array.isArray(report.keptPrevious) ? report.keptPrevious : []) {
+    lines.push(`Not updated, archived copy kept (new export is missing files): ${name(item)}`);
+  }
+  return lines;
+}
+
+function showSyncReport(report) {
+  const list = $('syncReport');
+  if (!list) return;
+  list.replaceChildren(...describeSyncReport(report).map((line) => {
+    const item = document.createElement('li');
+    item.textContent = line;
+    return item;
+  }));
+  list.classList.toggle('hidden', !list.children.length);
 }
 
 function setProgress(msg) {
@@ -68,6 +99,7 @@ async function refresh() {
   $('accountLogged').value = s.archive_account || 'personal';
   $('autoSync').checked = s.auto_sync === true;
   $('lastSync').textContent = describeLastSync(s.last_sync);
+  showSyncReport(s.last_sync?.report);
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
     $('accountText').textContent = `GitHub: ${s.github_owner}/${s.github_repo} · account: ${s.archive_account || 'personal'}`;
@@ -196,7 +228,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'syncProgress') return;
   setProgress(msg);
   if (['done', 'error', 'cancelled'].includes(msg.stage)) {
-    $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error });
+    $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error, partial: msg.partial === true });
+    showSyncReport(msg.report);
   }
 });
 chrome.runtime.sendMessage({ type: 'getSyncState' }, (state) => { if (!chrome.runtime.lastError && state?.running) setProgress(state); });
