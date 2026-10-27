@@ -2,7 +2,22 @@ const $ = (id) => document.getElementById(id);
 const status = $('status');
 let activeSync = false;
 
-async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync']); }
+async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'last_sync']); }
+
+// One line about the most recent finished sync (manual or automatic), so an
+// unattended automatic sync's success or failure is visible.
+function describeLastSync(record, now = Date.now()) {
+  const at = Date.parse(record?.at || '');
+  if (!record || !Number.isFinite(at)) return '';
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
+  const when = seconds < 60 ? 'just now'
+    : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago`
+      : seconds < 86400 ? `${Math.floor(seconds / 3600)} h ago`
+        : `on ${new Date(at).toISOString().slice(0, 10)}`;
+  const label = record.stage === 'error' ? 'Last sync failed' : record.stage === 'cancelled' ? 'Last sync cancelled' : 'Last sync';
+  const message = String(record.message || '').slice(0, 300);
+  return message ? `${label} ${when}: ${message}` : `${label} ${when}.`;
+}
 
 function setProgress(msg) {
   if (!msg || msg.stage === 'idle') return;
@@ -52,6 +67,7 @@ async function refresh() {
   $('accountSetup').value = s.archive_account || 'personal';
   $('accountLogged').value = s.archive_account || 'personal';
   $('autoSync').checked = s.auto_sync === true;
+  $('lastSync').textContent = describeLastSync(s.last_sync);
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
     $('accountText').textContent = `GitHub: ${s.github_owner}/${s.github_repo} · account: ${s.archive_account || 'personal'}`;
@@ -137,6 +153,12 @@ $('cancel').onclick = async () => {
 
 $('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'auto_sync_configured']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
 
-chrome.runtime.onMessage.addListener((msg) => { if (msg.type === 'syncProgress') setProgress(msg); });
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type !== 'syncProgress') return;
+  setProgress(msg);
+  if (['done', 'error', 'cancelled'].includes(msg.stage)) {
+    $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error });
+  }
+});
 chrome.runtime.sendMessage({ type: 'getSyncState' }, (state) => { if (!chrome.runtime.lastError && state?.running) setProgress(state); });
 refresh();
