@@ -1061,6 +1061,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
 
+    // The content script's fetching phase is over; from here the GitHub sync
+    // reports progress. Leaving its last "fetching" state behind would make a
+    // reopened popup show a finished sync as still running.
+    contentSyncState = null;
     sync(msg.conversations, broadcast, Array.isArray(msg.skipped) ? msg.skipped : [], {
       fullList: msg.fullList === true,
       unchangedIds: Array.isArray(msg.unchangedIds) ? msg.unchangedIds : [],

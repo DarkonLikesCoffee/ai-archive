@@ -1492,3 +1492,16 @@ test('persists a completed GitHub sync with its summary', async () => {
   assert.equal(record.commit, 'new-commit');
   assert.match(record.message, /^Sync complete: 1 conversation changed in 1 GitHub commit\./);
 });
+
+test('a finished sync is not reported as still fetching to a reopened popup', async () => {
+  const background = loadBackgroundForSyncState();
+  const tab = { tab: { id: 7 } };
+  background.send({ type: 'syncProgress', stage: 'fetching', current: 2, total: 2 }, tab);
+  // The content script hands the conversations to the background; its GitHub
+  // phase ends (here at once, with no GitHub settings configured).
+  background.send({ type: 'syncNormalized', conversations: [], skipped: [], unchangedIds: [], fullList: true }, tab);
+  for (let i = 0; i < 20 && background.send({ type: 'getSyncState' }).running; i++) await new Promise((resolve) => setImmediate(resolve));
+  const state = background.send({ type: 'getSyncState' });
+  assert.equal(state.running, false, JSON.stringify(state));
+  assert.notEqual(state.stage, 'fetching');
+});
