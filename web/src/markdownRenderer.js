@@ -67,7 +67,8 @@ export function renderMarkdownWithMarked(markdown, options = {}) {
   renderer.code = ({ text, lang }) => {
     const { html, language } = highlightCode(text, lang);
     const languageClass = language ? ` language-${escapeHtml(language)}` : '';
-    return `\n<div class="code-block"><pre><code class="hljs${languageClass}">${html}</code></pre></div>\n`;
+    // The button's label comes from CSS, so it adds no text to find or copy.
+    return `\n<div class="code-block"><button class="copy-code" type="button" aria-label="Copy code" title="Copy code" data-copy-code></button><pre><code class="hljs${languageClass}">${html}</code></pre></div>\n`;
   };
 
   // A regular function so Marked can bind `this.parser`. The raw `text` is
