@@ -107,3 +107,9 @@ test('passes raw link labels to custom link hooks unchanged', () => {
   });
   assert.equal(seen, 'a \\_b');
 });
+
+test('code blocks get a copy button that adds no text of its own', () => {
+  const html = renderMarkdownWithMarked('```js\nconst a = 1 < 2;\n```');
+  assert.match(html, /<div class="code-block"><button class="copy-code" type="button" aria-label="Copy code" title="Copy code" data-copy-code><\/button><pre><code class="hljs language-js">/);
+  assert.match(html, /&lt;/, 'code stays escaped');
+});

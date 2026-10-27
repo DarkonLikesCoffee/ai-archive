@@ -21,7 +21,7 @@ const conversations = [
     { external_id: 'a1', role: 'assistant', content: 'Intro.\n\n---\n\n## Details\n\nhooks let components keep state.', files: [], attachments: [] }], assets: [] },
   { external_id: 'conv/rust?#1', title: 'Rust ownership', source_updated_at: '2026-10-25T10:00:00Z', message_count: 2, messages: [
     { external_id: 'u2', role: 'user', content: 'Explain the borrow checker', files: [], attachments: [] },
-    { external_id: 'a2', role: 'assistant', content: 'The borrow checker enforces ownership.', files: [], attachments: [] }], assets: [] },
+    { external_id: 'a2', role: 'assistant', content: 'The borrow checker enforces ownership.\n\n```rust\nlet s = String::from("hi");\nlet t = &s;\n```', files: [], attachments: [] }], assets: [] },
 ];
 const files = {};
 const index = { version: 2, conversations: [] };
@@ -35,7 +35,7 @@ files['archive/index.json'] = JSON.stringify(index);
 
 (async () => {
   const browser = await chromium.launch();
-  const page = await browser.newPage();
+  const page = await (await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] })).newPage();
   // Date groups are relative to "now".
   await page.clock.setFixedTime(new Date('2026-10-27T12:00:00'));
   const errors = [];
@@ -80,6 +80,15 @@ files['archive/index.json'] = JSON.stringify(index);
   await page.goto(`${base}#/c/claude/personal/${encodeURIComponent('conv/rust?#1')}`);
   await page.waitForSelector('.message');
   check('deep link with an unusual ID opens it', (await page.locator('.message .content').first().textContent()).includes('borrow checker'));
+  await page.locator('.code-block').first().hover();
+  await page.locator('.copy-code').first().click();
+  await page.waitForSelector('.copy-code.copied');
+  const copiedCode = await page.evaluate(() => navigator.clipboard.readText());
+  check('the copy button copies exactly the code', copiedCode === 'let s = String::from("hi");\nlet t = &s;' || copiedCode === 'let s = String::from("hi");\nlet t = &s;\n', JSON.stringify(copiedCode));
+  await page.fill('.reader-search', 'copy');
+  await page.waitForSelector('.reader-find-count');
+  check('find ignores button labels', (await page.locator('.reader-find-count').textContent()) === 'No results', await page.locator('.reader-find-count').textContent());
+  await page.fill('.reader-search', '');
 
   await page.goto(`${base}#/c/claude/personal/does-not-exist`);
   await page.waitForSelector('.error.banner');
