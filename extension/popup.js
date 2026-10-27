@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 const status = $('status');
 let activeSync = false;
 
-async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'last_sync']); }
+async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'last_sync', 'last_sync_diagnostics']); }
 
 // One line about the most recent finished sync (manual or automatic), so an
 // unattended automatic sync's success or failure is visible.
@@ -48,6 +48,18 @@ function showSyncReport(report) {
     return item;
   }));
   list.classList.toggle('hidden', !list.children.length);
+}
+
+// The sanitized diagnostics the content script stored for the last sync (see
+// sanitizeShape in content.js), offered for copying when there are any.
+let lastDiagnostics = null;
+function showDiagnostics(diagnostics) {
+  lastDiagnostics = Array.isArray(diagnostics?.items) && diagnostics.items.length ? diagnostics : null;
+  $('copyDiagnostics')?.classList.toggle('hidden', !lastDiagnostics);
+}
+
+function diagnosticReportText(diagnostics, version) {
+  return JSON.stringify({ report: 'AI Archive sync diagnostics', extension_version: version || null, ...diagnostics }, null, 2);
 }
 
 function setProgress(msg) {
@@ -100,6 +112,7 @@ async function refresh() {
   $('autoSync').checked = s.auto_sync === true;
   $('lastSync').textContent = describeLastSync(s.last_sync);
   showSyncReport(s.last_sync?.report);
+  showDiagnostics(s.last_sync_diagnostics);
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
     $('accountText').textContent = `GitHub: ${s.github_owner}/${s.github_repo} · account: ${s.archive_account || 'personal'}`;
@@ -224,12 +237,25 @@ $('cancel').onclick = async () => {
 
 $('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'auto_sync_configured']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
 
+$('copyDiagnostics').onclick = async () => {
+  if (!lastDiagnostics) return;
+  try {
+    await navigator.clipboard.writeText(diagnosticReportText(lastDiagnostics, chrome.runtime.getManifest?.()?.version));
+    status.className = 'status ok';
+    status.textContent = 'Diagnostic report copied. It contains no message text, titles, file names, file contents or credentials.';
+  } catch (e) {
+    status.className = 'status err';
+    status.textContent = `Could not copy the diagnostic report: ${e.message}`;
+  }
+};
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'syncProgress') return;
   setProgress(msg);
   if (['done', 'error', 'cancelled'].includes(msg.stage)) {
     $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error, partial: msg.partial === true });
     showSyncReport(msg.report);
+    chrome.storage.local.get('last_sync_diagnostics').then((stored) => showDiagnostics(stored.last_sync_diagnostics)).catch(() => {});
   }
 });
 chrome.runtime.sendMessage({ type: 'getSyncState' }, (state) => { if (!chrome.runtime.lastError && state?.running) setProgress(state); });

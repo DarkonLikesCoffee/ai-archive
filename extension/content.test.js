@@ -2451,3 +2451,51 @@ test('an uploaded file whose download is HTTP 404 is still archived from the san
   assert.deepEqual(JSON.parse(JSON.stringify(exported.assets.map((a) => a.name))), ['BD-GICD-Tema2-MER-DC-UML.pdf']);
   harness.finishFirstHandoff({ ok: true });
 });
+
+test('a sync stores a sanitized diagnostic for each conversation not archived completely, with nothing private in it', async () => {
+  const secretText = 'Mi nota privada sobre el examen';
+  const conversation = plainConversation('11111111-2222-4333-8444-555555555555');
+  conversation.name = 'Base de datos (privado)';
+  conversation.chat_messages[0].content = [{ type: 'text', text: secretText }];
+  conversation.chat_messages[0].files = [{
+    file_uuid: '99999999-8888-4777-8666-555555555555',
+    file_name: 'BD-GICD-Tema2-MER+DC+UML.pdf',
+    file_kind: 'document',
+    document_asset: { page_count: 12 },
+    thumbnail_asset: { url: '/api/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/files/99999999-8888-4777-8666-555555555555/thumbnail?sig=SECRET-TOKEN' },
+  }];
+  const harness = createHarness(conversation, { storage: {} });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  await harness.firstHandoff;
+  const stored = harness.storageState.last_sync_diagnostics;
+  const text = JSON.stringify(stored);
+  for (const secret of [secretText, 'Base de datos', 'BD-GICD', 'SECRET-TOKEN', 'sig=', '99999999-8888', 'aaaaaaaa-bbbb']) {
+    assert.equal(text.includes(secret), false, `diagnostics must not contain ${secret}`);
+  }
+  assert.equal(stored.items.length, 1);
+  const [item] = stored.items;
+  assert.equal(item.conversation_id, '11111111-2222-4333-8444-555555555555', 'the conversation ID is kept so the owner can match it');
+  assert.equal(item.outcome, 'incomplete');
+  assert.deepEqual(JSON.parse(JSON.stringify(item.problems)), [{ kind: 'attachment', reason: 'Claude did not provide a download link for this file', message_id: 'u1', file_extension: 'pdf' }]);
+  assert.equal(item.sandbox_list_status, 200);
+  const [message] = item.messages_with_files;
+  assert.deepEqual(JSON.parse(JSON.stringify(message.files)), [{
+    document_asset: { page_count: 12 },
+    file_kind: 'document',
+    file_name: '<string:28>',
+    file_uuid: '{uuid}',
+    thumbnail_asset: { url: '/api/{uuid}/files/{uuid}/thumbnail?<query removed>' },
+  }], 'the structure of the file entry is visible: where a download link would be, and what kinds of assets exist');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('diagnostics record the sandbox list status and error shape of a failed conversation', async () => {
+  const harness = createHarness(plainConversation('22222222-2222-4333-8444-555555555555'), { storage: {}, sandboxListStatus: 503 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  await harness.errorProgress;
+  const [item] = harness.storageState.last_sync_diagnostics.items;
+  assert.equal(item.outcome, 'failed');
+  assert.equal(item.sandbox_list_status, 503);
+  assert.deepEqual(JSON.parse(JSON.stringify(item.sandbox_list_body)), { error: '<string:12>' });
+  assert.match(item.error, /^Could not list Claude sandbox files for conversation "22222222-2222-4333-8444-555555555555" \(HTTP 503\)\.$/);
+});

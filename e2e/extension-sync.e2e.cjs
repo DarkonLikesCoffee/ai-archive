@@ -355,6 +355,18 @@ function handleClaude(url) {
     check('the sync is reported as finished with problems, naming the incomplete conversation',
       github.commitCount() === commitsBeforeReal + 1 && /^Last sync finished with problems just now: /.test(last)
       && (await popup.locator('#syncReport li').allTextContents()).some((line) => line === 'Archived with files missing: Base de datos (conv-pdf) — BD-GICD-Tema2-MER+DC+UML.pdf'), last);
+    // Clipboard permission cannot be granted to an extension origin here, so
+    // record what the real button handler writes.
+    await popup.evaluate(() => { navigator.clipboard.writeText = async (text) => { window.__copied = text; }; });
+    await popup.waitForSelector('#copyDiagnostics:not(.hidden)');
+    await popup.click('#copyDiagnostics');
+    const copied = await popup.evaluate(() => window.__copied);
+    const diagnostics = JSON.parse(copied);
+    const pdfDiagnostic = diagnostics.items.find((item) => item.conversation_id === 'conv-pdf');
+    check('the diagnostic report describes the incomplete conversation and contains nothing private',
+      diagnostics.items.length === 1 && pdfDiagnostic?.outcome === 'incomplete' && pdfDiagnostic.sandbox_list_status === 404
+      && pdfDiagnostic.sandbox_list_body?.error?.type === 'not_found_error' && pdfDiagnostic.messages_with_files[0].files[0].file_kind === 'document'
+      && !/Explica el modelo|Base de datos|BD-GICD|Repaso/.test(copied), `${copied.length} characters`);
     const requestsBeforeRetry = claudeRequests.length;
     last = await syncAll();
     const retryRequests = claudeRequests.slice(requestsBeforeRetry);
