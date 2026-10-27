@@ -370,6 +370,8 @@ function handleClaude(url) {
       await viewer.goto(process.env.VIEWER_URL);
       await viewer.waitForSelector('.conversation');
       check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 6);
+      check('viewer marks the conversation archived with files missing', (await viewer.locator('.conversation', { hasText: 'Base de datos' }).locator('.incomplete-badge').count()) === 1
+        && (await viewer.locator('.incomplete-badge').count()) === 1);
       await viewer.locator('.conversation', { hasText: 'Research with tools' }).click();
       await viewer.waitForSelector('.content img[src^="data:image/png"]');
       const richView = await viewer.evaluate(() => ({

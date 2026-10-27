@@ -798,7 +798,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     report.failed = failedItems.map((item) => ({
       id: String(item.id),
       title: String(item.title || item.id),
-      error: String(item.error || 'unknown error'),
+      error: String(item.error || 'unknown error').slice(0, 300),
       archived: map.has(`${provider}:${account}:${item.id}`),
     }));
     if (fullList) {
