@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-27 07:22 UTC — post-roadmap product cycle (#57–#74).
+Last updated: 2026-10-27 07:35 UTC — post-roadmap product cycle (#57–#77).
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -40,6 +40,8 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | Viewer | Print / Open on GitHub reachable on phones | ✅ real Chromium | #72 |
 | Viewer | First run: clear "repository not found"; empty archive shows next steps | ✅ real Chromium | #73 |
 | Export | **Bug:** syncs over ~48 MB of attachments failed (Chrome 64 MiB message limit) → chunked handoff | ✅ reproduced + fixed in real Chromium | #74 |
+| Export | Attachment over GitHub's 100 MB limit no longer fails every sync (left out with a visible note) | ✅ unit + real Chromium (cap lowered in a test copy) | #75 |
+| Test | Rich content (tools, citations, inline image) end to end, extension → Markdown → viewer | ✅ 31/31, no bug found | #77 (open) |
 | Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
 | All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible here; the extension now runs end to end in headless Chromium against faithful fakes (#61), but real claude.ai responses and real GitHub remain unverified | — |
 
@@ -113,8 +115,11 @@ Secondary items left (none blocks the product):
 - #74 **serious bug**: the content→background handoff was one message; Chrome caps messages at 64 MiB, so any
   sync carrying > ~48 MB of base64 attachments failed and published nothing (a big first sync could never
   succeed). Reproduced with the real extension (3 × 25 MB) → chunked handoff; e2e checks bytes end to end.
-- Open finding (not fixed, needs GitHub limits I cannot test): one attachment over GitHub's 100 MB file limit
-  would fail the whole sync on every retry. Option: skip assets above a cap with a visible placeholder.
+- #75 attachments over GitHub's 100 MiB limit are left out with a note (they could never be archived; they
+  used to fail every sync). Playwright's DevTools pipe cannot carry a single >100 MB response, so the e2e runs
+  a copy of the extension with the cap lowered to 30 MiB; the real constant is unit-tested.
+- #76 ignore web/dist · #77 rich-content end-to-end fidelity check (no bug found)
+- Not verified: GitHub API behaviour for single files between 50 and 100 MB.
 - Test totals on master + #71: extension 118/118, web 67/67, viewer e2e 41/41, extension e2e 24/24.
 - Next candidates: reader controls on phones (Print/Open on GitHub are hidden < 700px), archive overview.
 
