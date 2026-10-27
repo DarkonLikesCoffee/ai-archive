@@ -10,13 +10,14 @@ test('round-trips conversation routes, including unusual IDs and account names',
 });
 
 test('round-trips list routes with search and filters, omitting defaults', () => {
-  assert.equal(formatRoute({ view: 'list', provider: 'all', account: 'all', q: '' }), '#/');
-  const hash = formatRoute({ view: 'list', provider: 'claude', account: 'personal', q: 'react "custom hooks"' });
-  assert.deepEqual(parseRoute(hash), { view: 'list', provider: 'claude', account: 'personal', q: 'react "custom hooks"' });
+  assert.equal(formatRoute({ view: 'list', provider: 'all', account: 'all', q: '', sort: 'auto' }), '#/');
+  const hash = formatRoute({ view: 'list', provider: 'claude', account: 'personal', q: 'react "custom hooks"', sort: 'oldest' });
+  assert.deepEqual(parseRoute(hash), { view: 'list', provider: 'claude', account: 'personal', q: 'react "custom hooks"', sort: 'oldest' });
+  assert.equal(parseRoute('#/?q=x').sort, 'auto', 'links from before sorting existed');
 });
 
 test('treats empty, unknown, and malformed hashes as the default list', () => {
-  const list = { view: 'list', provider: 'all', account: 'all', q: '' };
+  const list = { view: 'list', provider: 'all', account: 'all', q: '', sort: 'auto' };
   for (const hash of ['', '#', '#/', '#/unknown/path', '#/c/claude', '#/c/%E0%A4%A/x/y']) {
     assert.deepEqual(parseRoute(hash), list, hash);
   }
