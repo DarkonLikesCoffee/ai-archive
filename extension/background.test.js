@@ -1315,9 +1315,10 @@ function loadBackgroundForSyncState() {
     static now() { return now; }
   }
   const tabMessages = [];
+  const broadcasts = [];
   const chrome = {
     storage: { local: { get: async () => ({}) } },
-    runtime: { onMessage: { addListener(listener) { listeners.push(listener); } }, sendMessage() { return Promise.resolve(); } },
+    runtime: { onMessage: { addListener(listener) { listeners.push(listener); } }, sendMessage(message) { broadcasts.push(message); return Promise.resolve(); } },
     tabs: { sendMessage(tabId, message) { tabMessages.push({ tabId, message }); return Promise.resolve(); } },
   };
   vm.runInNewContext(backgroundSource, { chrome, AbortController, fetch: () => new Promise(() => {}), Date: FakeDate });
@@ -1326,7 +1327,7 @@ function loadBackgroundForSyncState() {
     listeners[0](message, sender, (value) => { response = value; });
     return response;
   };
-  return { send, tabMessages, advance(ms) { now += ms; } };
+  return { send, tabMessages, broadcasts, advance(ms) { now += ms; } };
 }
 
 test('reports the content script fetching phase to a reopened popup', () => {
@@ -1504,4 +1505,37 @@ test('a finished sync is not reported as still fetching to a reopened popup', as
   const state = background.send({ type: 'getSyncState' });
   assert.equal(state.running, false, JSON.stringify(state));
   assert.notEqual(state.stage, 'fetching');
+});
+
+test('reassembles a sync handed off in chunks before syncing', async () => {
+  const background = loadBackgroundForSyncState();
+  const text = JSON.stringify({ conversations: [], skipped: [], unchangedIds: [], fullList: true });
+  const chunks = text.match(/[\s\S]{1,7}/g);
+  for (const [index, data] of chunks.entries()) {
+    assert.equal(background.send({ type: 'syncTransferChunk', transferId: 't1', index, total: chunks.length, data }).ok, true);
+  }
+  background.send({ type: 'syncNormalized', transferId: 't1' }, { tab: { id: 7 } });
+  for (let i = 0; i < 20 && !background.broadcasts.some((m) => m.stage === 'error'); i++) await new Promise((resolve) => setImmediate(resolve));
+  // The reassembled payload reached sync(), which stops here only because no
+  // GitHub settings are configured in this harness.
+  const error = background.broadcasts.find((m) => m.stage === 'error');
+  assert.match(error.error, /Configure GitHub settings/);
+});
+
+test('an out-of-order or incomplete chunked handoff publishes nothing and says to sync again', () => {
+  const outOfOrder = loadBackgroundForSyncState();
+  outOfOrder.send({ type: 'syncTransferChunk', transferId: 't1', index: 0, total: 3, data: '{"a"' });
+  const skipped = outOfOrder.send({ type: 'syncTransferChunk', transferId: 't1', index: 2, total: 3, data: '}' });
+  assert.equal(skipped.ok, false);
+  assert.match(skipped.error, /out of order/);
+
+  const incomplete = loadBackgroundForSyncState();
+  incomplete.send({ type: 'syncTransferChunk', transferId: 't2', index: 0, total: 2, data: '{"conversations":' });
+  const response = incomplete.send({ type: 'syncNormalized', transferId: 't2' }, { tab: { id: 7 } });
+  assert.equal(response.ok, false);
+  assert.match(response.error, /did not fully reach the extension .*Nothing was published; sync again/);
+  assert.equal(incomplete.broadcasts.at(-1).stage, 'error');
+
+  const unknown = loadBackgroundForSyncState();
+  assert.equal(unknown.send({ type: 'syncNormalized', transferId: 'never-sent' }, { tab: { id: 7 } }).ok, false);
 });

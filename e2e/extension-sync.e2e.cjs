@@ -123,6 +123,7 @@ function createFakeGitHub() {
 
 // ---- Fake claude.ai: one organization and a mutable conversation list. ----
 const ORG = 'org-1';
+const BIG_FILES = [];
 const ROOT = '00000000-0000-4000-8000-000000000000';
 const claudeConversations = new Map();
 function addConversation(id, title, updatedAt, turns, extra = {}) {
@@ -155,6 +156,8 @@ function handleClaude(url) {
   let m = url.pathname.match(new RegExp(`^/api/organizations/${ORG}/chat_conversations/([^/]+)$`));
   if (m) return claudeConversations.has(m[1]) ? json(claudeConversations.get(m[1])) : { status: 404, body: 'not found' };
   if (/\/wiggle\/list-files$/.test(url.pathname)) return json({ files_metadata: [] });
+  const big = url.pathname.match(/^\/api\/fake-assets\/big-(\d+)\.bin$/);
+  if (big && BIG_FILES[Number(big[1])]) return { status: 200, contentType: 'application/octet-stream', body: BIG_FILES[Number(big[1])] };
   if (url.pathname === '/api/fake-assets/map.png') return { status: 200, contentType: 'image/png', body: PNG };
   if (url.pathname.startsWith('/api/')) return { status: 404, body: 'not found' };
   return { status: 200, contentType: 'text/html', body: '<!doctype html><title>Claude</title><p>Fake claude.ai</p>' };
@@ -211,7 +214,7 @@ function handleClaude(url) {
       await popup.evaluate(() => { document.querySelector('#lastSync').textContent = ''; });
       await popup.selectOption('#syncLimit', limit);
       await popup.click('#sync');
-      await popup.waitForFunction(() => /^Last sync/.test(document.querySelector('#lastSync').textContent), null, { timeout: 30000 });
+      await popup.waitForFunction(() => /^Last sync/.test(document.querySelector('#lastSync').textContent), null, { timeout: 120000 });
       return popup.locator('#lastSync').textContent();
     }
 
@@ -292,6 +295,25 @@ function handleClaude(url) {
       await viewer.waitForSelector('.message');
       check('viewer shows the synced turns', (await viewer.locator('.message').count()) === 4);
     }
+
+    // Chrome caps one extension message at 64 MiB; a sync carrying ~100 MB of
+    // base64 attachments must still go through, byte for byte.
+    for (let i = 0; i < 3; i++) {
+      const bytes = crypto.randomBytes(25 * 1024 * 1024);
+      BIG_FILES.push(bytes);
+      addConversation(`conv-big-${i}`, `Large file ${i}`, `2026-10-27T12:0${i}:00Z`, [
+        ['human', `Here is file ${i}`, [{ file_uuid: `big-${i}`, file_name: `big-${i}.bin`, preview_url: `/api/fake-assets/big-${i}.bin` }]],
+        ['assistant', 'Received.'],
+      ]);
+    }
+    const commitsBeforeBig = github.commitCount();
+    last = await syncAll();
+    files = github.files();
+    const bigPaths = Object.keys(files).filter((file) => /big-\d\.bin$/.test(file)).sort();
+    check('a sync larger than one extension message (3 × 25 MB) publishes in one commit',
+      github.commitCount() === commitsBeforeBig + 1 && /3 conversations changed in 1 GitHub commit/.test(last), last);
+    check('large attachments are archived byte for byte',
+      bigPaths.length === 3 && bigPaths.every((file) => BIG_FILES.some((bytes) => files[file].equals(bytes))), bigPaths.join(', '));
 
     check('no page errors', errors.length === 0, errors.join(' | '));
   } finally {
