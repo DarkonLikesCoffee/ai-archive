@@ -2,6 +2,8 @@
 
 A personal, portable archive for AI conversations. GitHub is the source of truth; conversations are stored as human-readable Markdown files. Claude is the first provider, but the data model is provider/account independent so ChatGPT, Gemini and other providers can be added later.
 
+> **Also in this repository:** [`autopilot/`](autopilot/README.md) — *ChatGPT Project Autopilot*, a separate Chrome extension that manages `AUTOPILOT.md`-driven continuation prompts for ChatGPT's website (copy/insert prompts, completion notifications, cycle tracking; you always press Send). It is independent of the archive extension below.
+
 ## What changed in this version
 
 ### Unreleased — export fidelity and reader fixes (#29–#45)

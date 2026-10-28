@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ChatGPT Project Autopilot</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="ui.js" defer></script>
+</head>
+<body data-mode="popup" class="popup">
+  <header class="app-header">
+    <div class="brand">
+      <img src="icons/icon32.png" alt="" width="20" height="20">
+      <h1>Project Autopilot</h1>
+    </div>
+    <button type="button" id="btn-open-panel" class="secondary small">Open side panel</button>
+  </header>
+  <p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
+  <p id="recovered-notice" class="banner" data-tone="warning" role="alert" hidden></p>
+  <main>
+    <p id="no-project" class="callout" hidden>No project yet. Open the side panel to create one.</p>
+    <div class="card">
+      <h2 id="project-name">—</h2>
+      <p class="muted"><span class="label">Milestone:</span> <span id="milestone">—</span></p>
+      <dl class="facts">
+        <dt>Response <span class="hint">(observed)</span></dt><dd><span id="obs-status" class="pill">Unknown</span></dd>
+        <dt>Monitoring</dt><dd><span id="wf-monitoring" class="pill">—</span></dd>
+        <dt>Cycle</dt><dd id="wf-cycle">—</dd>
+        <dt>Last continuation</dt><dd id="wf-last-continuation">—</dd>
+      </dl>
+      <p class="next-step"><span id="next-step"></span></p>
+    </div>
+    <div class="card">
+      <div class="row-between"><h3>Next prompt</h3><span id="prompt-cycle" class="muted"></span></div>
+      <label for="prompt-preview" class="visually-hidden">Next continuation prompt</label>
+      <textarea id="prompt-preview" readonly rows="5"></textarea>
+      <ul id="prompt-errors" class="issues danger" hidden></ul>
+      <div class="actions">
+        <button type="button" id="btn-copy">Copy prompt</button>
+        <button type="button" id="btn-insert">Insert</button>
+        <button type="button" id="btn-start" class="secondary">Start session</button>
+        <button type="button" id="btn-review" class="secondary">Mark reviewed…</button>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-pause" class="secondary small">Pause</button>
+        <button type="button" id="btn-resume" class="secondary small">Resume</button>
+        <button type="button" id="btn-stop" class="danger small">Stop</button>
+      </div>
+      <p class="hint">You always press Send in ChatGPT yourself.</p>
+    </div>
+  </main>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title">Please confirm</h2>
+      <p id="confirm-message"></p>
+      <div class="actions">
+        <button value="cancel" class="secondary">Cancel</button>
+        <button value="ok" id="confirm-ok">Continue</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="review-dialog" aria-labelledby="review-title">
+    <form method="dialog">
+      <h2 id="review-title">Mark cycle reviewed</h2>
+      <p>What did ChatGPT report? Recorded as <em>reported</em>, not verified.</p>
+      <fieldset>
+        <legend class="visually-hidden">Outcome</legend>
+        <label class="radio"><input type="radio" name="outcome" value="continue" checked> Continue</label>
+        <label class="radio"><input type="radio" name="outcome" value="milestone_reported"> Milestone met — stop</label>
+        <label class="radio"><input type="radio" name="outcome" value="blocker_reported"> Blocked — stop</label>
+      </fieldset>
+      <div class="actions">
+        <button value="cancel" class="secondary">Cancel</button>
+        <button value="ok">Record review</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

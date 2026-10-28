@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatGPT Project Autopilot</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="ui.js" defer></script>
+</head>
+<body data-mode="panel">
+  <header class="app-header">
+    <div class="brand">
+      <img src="icons/icon32.png" alt="" width="20" height="20">
+      <h1>Project Autopilot</h1>
+    </div>
+    <div class="project-picker">
+      <label for="project-select" class="visually-hidden">Active project</label>
+      <select id="project-select"></select>
+      <button type="button" id="btn-new-project" class="secondary small">New</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button type="button" role="tab" data-tab="dashboard" aria-selected="true" aria-controls="panel-dashboard" id="tab-dashboard">Dashboard</button>
+    <button type="button" role="tab" data-tab="project" aria-selected="false" aria-controls="panel-project" id="tab-project" tabindex="-1">Project</button>
+    <button type="button" role="tab" data-tab="prompt" aria-selected="false" aria-controls="panel-prompt" id="tab-prompt" tabindex="-1">Prompt &amp; rules</button>
+    <button type="button" role="tab" data-tab="help" aria-selected="false" aria-controls="panel-help" id="tab-help" tabindex="-1">Help</button>
+  </nav>
+
+  <p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
+  <p id="recovered-notice" class="banner" data-tone="warning" role="alert" hidden></p>
+
+  <main>
+    <section id="panel-dashboard" role="tabpanel" aria-labelledby="tab-dashboard">
+      <p id="no-project" class="callout" hidden>No project yet. Click <strong>New</strong> to create one.</p>
+
+      <div class="card">
+        <h2 id="project-name">—</h2>
+        <p class="muted"><span class="label">Milestone:</span> <span id="milestone">—</span></p>
+        <ul id="config-problems" class="issues danger" hidden></ul>
+        <p class="next-step"><span class="label">Next step:</span> <span id="next-step"></span></p>
+      </div>
+
+      <div class="card">
+        <h3>Observed by the extension <span class="hint">(from the ChatGPT page)</span></h3>
+        <dl class="facts">
+          <dt>ChatGPT response</dt><dd><span id="obs-status" class="pill">Unknown</span></dd>
+          <dt>Last observed</dt><dd id="obs-updated">—</dd>
+          <dt>Source</dt><dd id="obs-scope">—</dd>
+        </dl>
+        <button type="button" id="btn-refresh" class="secondary small">Check page now</button>
+      </div>
+
+      <div class="card">
+        <h3>Session <span class="hint">(recorded by the extension)</span></h3>
+        <dl class="facts">
+          <dt>Monitoring</dt><dd><span id="wf-monitoring" class="pill">—</span></dd>
+          <dt>Cycle</dt><dd id="wf-cycle">—</dd>
+          <dt>Phase</dt><dd id="wf-phase">—</dd>
+          <dt>Last continuation</dt><dd id="wf-last-continuation">—</dd>
+          <dt>Stop reason</dt><dd id="wf-stop-reason">—</dd>
+        </dl>
+        <h3>Reported by ChatGPT <span class="hint">(as you recorded it — not verified)</span></h3>
+        <dl class="facts">
+          <dt>Last review outcome</dt><dd id="rep-outcome">—</dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <div class="row-between">
+          <h3>Next prompt</h3>
+          <span id="prompt-cycle" class="muted"></span>
+        </div>
+        <label for="prompt-preview" class="visually-hidden">Next continuation prompt</label>
+        <textarea id="prompt-preview" readonly rows="9"></textarea>
+        <ul id="prompt-errors" class="issues danger" hidden></ul>
+        <ul id="prompt-warnings" class="issues warning" hidden></ul>
+        <div class="actions">
+          <button type="button" id="btn-copy">Copy prompt</button>
+          <button type="button" id="btn-insert">Insert into ChatGPT</button>
+        </div>
+        <p class="hint">The extension never presses Send. You review and submit every prompt.</p>
+      </div>
+
+      <div class="card">
+        <h3>Controls</h3>
+        <div class="actions">
+          <button type="button" id="btn-start">Start session</button>
+          <button type="button" id="btn-review">Mark cycle reviewed…</button>
+          <button type="button" id="btn-pause" class="secondary">Pause monitoring</button>
+          <button type="button" id="btn-resume" class="secondary">Resume monitoring</button>
+          <button type="button" id="btn-stop" class="danger">Stop</button>
+          <button type="button" id="btn-reset" class="secondary">Clear stopped session</button>
+        </div>
+        <div class="actions">
+          <button type="button" id="btn-edit-rules" class="link">Edit project rules</button>
+          <button type="button" id="btn-help" class="link">View workflow instructions</button>
+        </div>
+      </div>
+
+      <details class="card">
+        <summary>Recent events</summary>
+        <ul id="event-log" class="event-log"></ul>
+      </details>
+    </section>
+
+    <section id="panel-project" role="tabpanel" aria-labelledby="tab-project" hidden>
+      <form id="project-form" novalidate>
+        <fieldset id="project-fields">
+          <legend class="visually-hidden">Project settings</legend>
+          <div class="field">
+            <label for="field-projectName">Project name</label>
+            <input id="field-projectName" name="projectName" type="text" maxlength="100" autocomplete="off" aria-describedby="err-projectName">
+            <p id="err-projectName" class="field-error"></p>
+          </div>
+          <div class="field">
+            <label for="field-repositoryUrl">GitHub repository URL</label>
+            <input id="field-repositoryUrl" name="repositoryUrl" type="url" placeholder="https://github.com/owner/repo" autocomplete="off" aria-describedby="err-repositoryUrl">
+            <p id="err-repositoryUrl" class="field-error"></p>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="field-defaultBranch">Default branch</label>
+              <input id="field-defaultBranch" name="defaultBranch" type="text" autocomplete="off" aria-describedby="err-defaultBranch">
+              <p id="err-defaultBranch" class="field-error"></p>
+            </div>
+            <div class="field">
+              <label for="field-autopilotPath">Path to AUTOPILOT.md</label>
+              <input id="field-autopilotPath" name="autopilotPath" type="text" autocomplete="off" aria-describedby="err-autopilotPath">
+              <p id="err-autopilotPath" class="field-error"></p>
+            </div>
+          </div>
+          <div class="field">
+            <label for="field-milestone">Milestone description</label>
+            <textarea id="field-milestone" name="milestone" rows="3" aria-describedby="err-milestone"></textarea>
+            <p id="err-milestone" class="field-error"></p>
+          </div>
+          <div class="field">
+            <label for="field-maxCyclesPerSession">Maximum continuation cycles per session</label>
+            <input id="field-maxCyclesPerSession" name="maxCyclesPerSession" type="number" min="1" max="100" step="1" aria-describedby="err-maxCyclesPerSession">
+            <p id="err-maxCyclesPerSession" class="field-error"></p>
+          </div>
+          <div class="field checkbox">
+            <input id="field-showNotifications" name="showNotifications" type="checkbox">
+            <label for="field-showNotifications">Show desktop notifications</label>
+          </div>
+          <div class="field checkbox">
+            <input id="field-requireConfirmation" name="requireConfirmation" type="checkbox">
+            <label for="field-requireConfirmation">Ask me to confirm before each prompt hand-off</label>
+          </div>
+          <p class="hint">Submission is always manual. This option adds a confirmation step before a prompt is copied or inserted as a new cycle.</p>
+          <p class="hint">Never enter tokens, passwords or cookies here. The extension stores none and rejects values that look like credentials.</p>
+        </fieldset>
+        <div class="actions">
+          <button type="submit" id="btn-save">Save project</button>
+          <span id="form-state" class="muted" aria-live="polite"></span>
+        </div>
+        <div class="actions">
+          <button type="button" id="btn-delete-project" class="danger small">Delete project</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="panel-prompt" role="tabpanel" aria-labelledby="tab-prompt" hidden>
+      <div class="field">
+        <label for="field-promptTemplate">Continuation prompt template</label>
+        <textarea id="field-promptTemplate" name="promptTemplate" form="project-form" rows="14" spellcheck="false" aria-describedby="err-promptTemplate"></textarea>
+        <p id="err-promptTemplate" class="field-error"></p>
+        <button type="button" id="btn-default-template" class="secondary small">Restore default template</button>
+      </div>
+      <details>
+        <summary>Available variables</summary>
+        <ul id="template-variables" class="variables"></ul>
+        <p class="hint">Wrap text in <code>{{#projectRules}}…{{/projectRules}}</code> to include it only when the variable has a value.</p>
+      </details>
+      <div class="field">
+        <label for="field-projectRules">Project rules kept in the extension</label>
+        <textarea id="field-projectRules" name="projectRules" form="project-form" rows="6" aria-describedby="rules-help err-projectRules"></textarea>
+        <p id="rules-help" class="hint">Inserted into the prompt through <code>{{projectRules}}</code>. The authoritative rules belong in AUTOPILOT.md (section 4); use this for standing reminders.</p>
+        <p id="err-projectRules" class="field-error"></p>
+      </div>
+      <div class="actions">
+        <button type="submit" form="project-form">Save prompt &amp; rules</button>
+      </div>
+    </section>
+
+    <section id="panel-help" role="tabpanel" aria-labelledby="tab-help" hidden>
+      <div class="card prose">
+        <h2>How the workflow runs</h2>
+        <ol>
+          <li>Create a project and fill in the repository, branch, milestone and the AUTOPILOT.md path.</li>
+          <li>Add AUTOPILOT.md to the repository (copy the template below and ask ChatGPT to fill it in, or commit it yourself).</li>
+          <li>Open your ChatGPT conversation with the GitHub repository connected.</li>
+          <li>Click <strong>Start session</strong>. The first continuation prompt is prepared.</li>
+          <li><strong>Copy</strong> or <strong>Insert</strong> the prompt, read it, and press <strong>Send</strong> in ChatGPT yourself.</li>
+          <li>When the response appears complete you get a notification. Read the reply, then <strong>Mark cycle reviewed</strong> and pick what ChatGPT reported: continue, milestone met, or blocked.</li>
+          <li>The next prompt is prepared. Repeat until the milestone is met, a blocker needs you, the cycle limit is reached, or you stop.</li>
+        </ol>
+        <h2>What the extension can and cannot know</h2>
+        <ul>
+          <li><strong>Observed:</strong> whether the ChatGPT page shows a stop control, a streaming marker, an error or usage-limit notice, and whether a new assistant message appeared. If the page does not expose this, the status is <em>Unknown</em>.</li>
+          <li><strong>Reported:</strong> anything about the repository or AUTOPILOT.md. The extension has no access to GitHub and does not read ChatGPT's replies; it only records what you choose when reviewing.</li>
+          <li>A finished response is not proof that work succeeded, and a stopped response is not proof that the milestone is met.</li>
+          <li>On a usage-limit message, monitoring pauses. Nothing is reloaded or resent.</li>
+        </ul>
+        <h2>AUTOPILOT.md template</h2>
+        <button type="button" id="btn-copy-template">Copy AUTOPILOT.md template</button>
+        <details>
+          <summary>Show template</summary>
+          <pre id="template-preview" class="template-preview"></pre>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title">Please confirm</h2>
+      <p id="confirm-message"></p>
+      <div class="actions">
+        <button value="cancel" class="secondary">Cancel</button>
+        <button value="ok" id="confirm-ok">Continue</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="review-dialog" aria-labelledby="review-title">
+    <form method="dialog">
+      <h2 id="review-title">Mark cycle reviewed</h2>
+      <p>What did ChatGPT report in its reply? This is recorded as <em>reported</em>; the extension cannot verify it.</p>
+      <fieldset>
+        <legend class="visually-hidden">Outcome</legend>
+        <label class="radio"><input type="radio" name="outcome" value="continue" checked> Continue — more work remains (prepare the next prompt)</label>
+        <label class="radio"><input type="radio" name="outcome" value="milestone_reported"> Milestone met — stop the session</label>
+        <label class="radio"><input type="radio" name="outcome" value="blocker_reported"> Blocked — needs my input; stop the session</label>
+      </fieldset>
+      <div class="actions">
+        <button value="cancel" class="secondary">Cancel</button>
+        <button value="ok">Record review</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
