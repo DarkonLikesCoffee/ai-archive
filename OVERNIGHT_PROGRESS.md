@@ -1,7 +1,7 @@
 # Overnight progress — AI Conversation Archive
 
 Branch for this file: `claude/fervent-fermi-pljls6` (progress notes only; not meant to be merged).
-Last updated: 2026-10-27 16:50 UTC — real-account sync failures diagnosed and fixed in code (PR #79, merged as `00c4850`); real-account confirmation pending.
+Last updated: 2026-10-29 — real-account diagnostic report analysed; PR #80 (sandbox-path uploads, diagnostics v2).
 
 ## Product feature inventory (owner priority: finish the product)
 
@@ -45,6 +45,22 @@ Status key: ✅ complete + test-verified · 🟡 implemented, needs real-world v
 | Viewer | Archive overview (totals, per month, models, accounts) | ✅ real Chromium | #78 |
 | Docs | Install, token setup, sync, viewer, known limitations | ✅ | #51 |
 | All | Real claude.ai export + real Chrome + real GitHub end-to-end | 🟡 not possible here; the extension now runs end to end in headless Chromium against faithful fakes (#61), but real claude.ai responses and real GitHub remain unverified | — |
+
+## Real-account diagnostic report (2026-10-29) — follow-up PR #80
+
+**Verified on the real account:** after #79, all 7 previously missing conversations are `incomplete` (archived,
+some files missing), none `failed`. Conversation IDs: a49f8e6b, adb65a77, 664e6572, 96787f27, 2762616c,
+12384263, 5c21b5f7.
+
+Real file shapes (sanitized report):
+- `document` + `document_asset.url` (`/api/{org}/files/{id}/document_pdf`) and `image` + `preview_url` → archived.
+- `blob` + `path: /mnt/user-data/uploads/…` (no URL), sandbox list 200 → 3 PDFs (96787f27 ×2, 5c21b5f7) not
+  matched: matching was by name only. PR #80 matches by exact path or downloads by that path via
+  `wiggle/download-file`. **Unverified against claude.ai** (next report shows attempt statuses).
+- `blob` + `download_source: "<9 chars>"` (no URL, no path), sandbox list 404 → 14 files (uploads: zip, PDFs;
+  Claude-created: .md ×5, .tex ×4, .bib ×2) in a49f8e6b, adb65a77, 664e6572, 2762616c, 12384263. Download
+  mechanism unknown; not guessed. Needs the owner: the download URL pattern claude.ai uses for one such file.
+- Sandbox list 404 body: `{ type: "error", error: { type: "not_found_error", message, details } }`.
 
 ## Real-account sync investigation (2026-10-27, owner report) — PR #79, squash-merged as `00c4850` (branch head `8d25566`, CI green)
 
