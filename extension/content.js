@@ -427,6 +427,18 @@
   const UNAVAILABLE_STATUSES = new Set([404, 410]);
   const isUnavailable = (error) => UNAVAILABLE_STATUSES.has(error?.status);
 
+  // Claude gives some uploads only as a sandbox path ("file_kind": "blob",
+  // "path": "/mnt/user-data/uploads/…", no URL; seen on a real account). The
+  // sandbox file list and download endpoint may use the path with or without
+  // the "/mnt/user-data/" prefix, so paths are compared in both forms.
+  const SANDBOX_ROOT = /^\/?mnt\/user-data\//i;
+  const sandboxRelativePath = (path) => String(path || '').replace(/\\/g, '/').replace(SANDBOX_ROOT, '').replace(/^\/+/, '').toLowerCase();
+  function sandboxPathForms(path) {
+    const value = String(path || '').trim();
+    if (!value) return [];
+    return [...new Set([value, value.replace(SANDBOX_ROOT, '').replace(/^\/+/, '')])].filter(Boolean);
+  }
+
   // Signs that Claude's tools may have written files into the conversation's
   // sandbox: a file-oriented tool call or a sandbox path in the active lineage.
   function mayHaveSandboxFiles(messages) {
@@ -498,6 +510,8 @@
       throw new Error(`Claude returned an invalid sandbox file list for conversation "${conversationId}".`);
     }
 
+    sandboxInfo.sandbox_list_count = data.files_metadata.length;
+    sandboxInfo.sandbox_list_files = sanitizeShape(data.files_metadata);
     for (const file of data.files_metadata) {
       if (!file?.path) {
         throw new Error(`Claude returned sandbox file metadata without a path for conversation "${conversationId}".`);
@@ -819,6 +833,7 @@
     // matching asset, it is recorded as not archived: the conversation shows a
     // note in its place and is marked incomplete, so it is never mistaken for
     // a complete archive and later syncs retry it.
+    const byPathCache = new Map();
     for (const { message, file, name, reason } of filesWithoutDownloadUrl) {
       const messageId = message.uuid || message.id || null;
       const fileId = file.file_uuid || file.uuid || null;
@@ -848,10 +863,60 @@
         const sourcePath = String(asset.source_path || '').replace(/\\/g, '/').toLowerCase();
         return (sourcePath && messageData.includes(sourcePath)) || sandboxCandidates.length === 1;
       });
-
-      if (!scopedMatch && !sandboxMatch) {
-        incomplete.push({ kind: 'attachment', message_external_id: messageId, file_uuid: fileId, name, reason: reason || 'Claude did not provide a download link for this file' });
+      // The file entry names its sandbox path: a listed file with that exact
+      // path is this file, even when Claude stored it under another name.
+      const filePath = sandboxRelativePath(file?.path);
+      const pathAsset = filePath ? assets.find((asset) => asset.source === 'sandbox' && sandboxRelativePath(asset.source_path) === filePath) : null;
+      if (pathAsset) {
+        // Link it to this file, so it is shown where it was attached.
+        pathAsset.file_uuid ??= fileId;
+        pathAsset.message_external_ids = [...new Set([...(pathAsset.message_external_ids || []), ...(messageId ? [messageId] : [])])];
+        pathAsset.message_external_id ??= messageId;
+        continue;
       }
+      if (scopedMatch || sandboxMatch) continue;
+
+      // Not in the file list: download it by the path the file entry gives,
+      // through the same sandbox endpoint, when this conversation has a sandbox.
+      const attempts = [];
+      let downloaded = null;
+      if (filePath && listStatus !== 404) {
+        downloaded = byPathCache.get(filePath) || null;
+        for (const candidate of downloaded ? [] : sandboxPathForms(file.path)) {
+          const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(candidate)}`;
+          try {
+            downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || null, signal);
+            attempts.push({ via: 'sandbox-path', form: candidate.startsWith('/') ? 'absolute' : 'relative', status: 200 });
+            byPathCache.set(filePath, downloaded);
+            break;
+          } catch (e) {
+            if (e?.name === 'AbortError') throw e;
+            // A 4xx means this path form is not served; 5xx or network errors
+            // keep the conversation out of this sync, so a later sync retries.
+            if (!(e?.status >= 400 && e?.status < 500)) throw e;
+            attempts.push({ via: 'sandbox-path', form: candidate.startsWith('/') ? 'absolute' : 'relative', status: e.status });
+          }
+        }
+      }
+      if (downloaded) {
+        const existing = assets.find((asset) => asset.source === 'message-path' && asset.sha256 === downloaded.sha256 && asset.file_uuid === fileId);
+        if (existing) {
+          if (messageId && !existing.message_external_ids.includes(messageId)) existing.message_external_ids.push(messageId);
+        } else {
+          assets.push({
+            ...downloaded,
+            source: 'message-path',
+            source_path: file.path,
+            file_uuid: fileId,
+            message_external_id: messageId,
+            message_external_ids: messageId ? [messageId] : [],
+          });
+        }
+        continue;
+      }
+      sandboxInfo.unarchived_files ??= [];
+      sandboxInfo.unarchived_files.push({ message_id: messageId, file: sanitizeShape(file), attempts });
+      incomplete.push({ kind: 'attachment', message_external_id: messageId, file_uuid: fileId, name, reason: reason || 'Claude did not provide a download link for this file' });
     }
     return assets;
   }
@@ -1001,7 +1066,7 @@
   // values such as "type" or "file_kind". Message text, titles, file names,
   // file contents and URL query strings (where signed tokens could be) are
   // never recorded; IDs inside values become {uuid}.
-  const DIAGNOSTIC_VALUE_KEYS = new Set(['type', 'sender', 'kind', 'file_kind', 'mime_type', 'content_type', 'file_type', 'media_type', 'encoding', 'stop_reason']);
+  const DIAGNOSTIC_VALUE_KEYS = new Set(['type', 'sender', 'kind', 'file_kind', 'mime_type', 'content_type', 'file_type', 'media_type', 'encoding', 'stop_reason', 'download_source', 'file_variant', 'platform', 'input_mode', 'error_visibility']);
   const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
   function sanitizePathLike(value) {
@@ -1043,18 +1108,30 @@
   function diagnosticFor(conversationId, payload, outcome, details) {
     const messages = Array.isArray(payload?.chat_messages) ? payload.chat_messages : (Array.isArray(payload?.messages) ? payload.messages : []);
     const hasFiles = (m) => ['files', 'files_v2', 'attachments'].some((k) => Array.isArray(m?.[k]) && m[k].length);
+    // Messages named by a problem are always included, beyond the cap.
+    const problemIds = new Set([...(details.problems || []).map((p) => p.message_id), ...(details.unarchived_files || []).map((f) => f.message_id)].filter(Boolean));
+    const withFiles = messages.filter(hasFiles);
+    const shown = withFiles.filter((m, i) => i < 30 || problemIds.has(m?.uuid));
     return {
       conversation_id: conversationId,
       outcome,
       ...details,
       conversation_keys: payload && typeof payload === 'object' ? Object.keys(payload).sort() : null,
+      // Only true/false values (for example is_wiggle_enabled).
+      conversation_flags: payload && typeof payload === 'object'
+        ? Object.fromEntries(Object.keys(payload).sort().filter((k) => typeof payload[k] === 'boolean').map((k) => [k, payload[k]]))
+        : null,
       message_count: messages.length,
+      messages_with_files_total: withFiles.length,
       // Messages carrying files, where attachment problems come from.
-      messages_with_files: messages.filter(hasFiles).slice(0, 20).map((m) => ({
+      messages_with_files: shown.map((m) => ({
         message_id: typeof m?.uuid === 'string' ? m.uuid : null,
         sender: sanitizeShape(m?.sender, 'sender'),
         keys: Object.keys(m || {}).sort(),
         content_block_types: Array.isArray(m?.content) ? m.content.map((block) => sanitizeShape(block?.type, 'type')) : [],
+        tool_names: Array.isArray(m?.content)
+          ? [...new Set(m.content.filter((block) => block?.type === 'tool_use' && /^[a-z0-9_.-]{1,48}$/i.test(String(block.name || ''))).map((block) => block.name))]
+          : [],
         files: sanitizeShape(m?.files),
         files_v2: sanitizeShape(m?.files_v2),
         attachments: sanitizeShape(m?.attachments),

@@ -139,6 +139,7 @@ function createFakeGitHub() {
 const ORG = 'org-1';
 const BIG_FILES = [];
 const NO_SANDBOX = new Set();
+const SANDBOX_FILES = new Map();
 const ROOT = '00000000-0000-4000-8000-000000000000';
 const claudeConversations = new Map();
 function addConversation(id, title, updatedAt, turns, extra = {}) {
@@ -176,6 +177,11 @@ function handleClaude(url) {
   const sandbox = url.pathname.match(/\/conversations\/([^/]+)\/wiggle\/list-files$/);
   if (sandbox && NO_SANDBOX.has(sandbox[1])) return { status: 404, contentType: 'application/json', body: JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'Not found' } }) };
   if (sandbox) return json({ files_metadata: [] });
+  const download = url.pathname.match(/\/conversations\/([^/]+)\/wiggle\/download-file$/);
+  if (download) {
+    const body = SANDBOX_FILES.get(`${download[1]}:${url.searchParams.get('path')}`);
+    return body ? { status: 200, contentType: 'application/pdf', body } : { status: 404, contentType: 'application/json', body: JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'Not found' } }) };
+  }
   const big = url.pathname.match(/^\/api\/fake-assets\/big-(\d+)\.bin$/);
   if (big && BIG_FILES[Number(big[1])]) return { status: 200, contentType: 'application/octet-stream', body: BIG_FILES[Number(big[1])] };
   if (url.pathname === '/api/fake-assets/map.png') return { status: 200, contentType: 'image/png', body: PNG };
@@ -375,13 +381,31 @@ function handleClaude(url) {
       && !retryRequests.some((p) => p.endsWith('/chat_conversations/conv-no-sandbox'))
       && /5 unchanged conversations were not downloaded again\. 1 conversation was archived with files missing/.test(last), last);
 
+    // Real shape: an upload given only as a sandbox path ({ file_kind: 'blob',
+    // path: '/mnt/user-data/uploads/…' }, no URL), not in the file list. It is
+    // downloaded by that path and shown where it was attached.
+    const uploadBytes = Buffer.from('%PDF-1.4 apuntes del tema 2');
+    SANDBOX_FILES.set('conv-upload-path:/mnt/user-data/uploads/Tema 2 BD.pdf', uploadBytes);
+    addConversation('conv-upload-path', 'Apuntes BD', '2026-10-27T10:10:00Z', [
+      ['human', 'Resume el PDF', [{ file_kind: 'blob', file_name: 'Tema 2 BD.pdf', file_uuid: 'blob-1', uuid: 'blob-1', path: '/mnt/user-data/uploads/Tema 2 BD.pdf', size_bytes: uploadBytes.length, success: true }]],
+      ['assistant', 'El tema 2 trata del modelo relacional.'],
+    ]);
+    last = await syncAll();
+    files = github.files();
+    const uploadEntry = JSON.parse(files['archive/index.json']).conversations.find((entry) => entry.id === 'conv-upload-path');
+    const uploadMarkdown = uploadEntry ? files[uploadEntry.path].toString() : '';
+    const uploadAsset = uploadEntry?.assets?.[0];
+    check('an upload given only as a sandbox path is archived byte for byte and linked where it was attached',
+      Boolean(uploadAsset) && !uploadEntry.incomplete && files[uploadAsset.path]?.equals(uploadBytes)
+      && /## You\n\n\[Tema-2-BD\.pdf\]\(assets\/[^)]+\)\n\nResume el PDF/.test(uploadMarkdown), `${uploadMarkdown.length} chars`);
+
     if (process.env.VIEWER_URL) {
       const viewer = await context.newPage();
       viewer.on('pageerror', (e) => errors.push(`viewer: ${e}`));
       await viewer.addInitScript(([owner, repo, token]) => localStorage.setItem('ai_archive_github_v3', JSON.stringify({ owner, repo, token })), [OWNER, REPO, TOKEN]);
       await viewer.goto(process.env.VIEWER_URL);
       await viewer.waitForSelector('.conversation');
-      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 6);
+      check('viewer lists the synced conversations', (await viewer.locator('.conversation').count()) === 7);
       check('viewer marks the conversation archived with files missing', (await viewer.locator('.conversation', { hasText: 'Base de datos' }).locator('.incomplete-badge').count()) === 1
         && (await viewer.locator('.incomplete-badge').count()) === 1);
       await viewer.locator('.conversation', { hasText: 'Research with tools' }).click();

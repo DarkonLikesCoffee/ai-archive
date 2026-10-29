@@ -107,7 +107,7 @@ function createHarness(conversation, {
   const fetch = async (url) => {
     const requestUrl = String(url);
     requests.push(requestUrl);
-    if (/^https?:\/\//i.test(requestUrl)) {
+    if (/^https?:\/\//i.test(requestUrl) || requestUrl in assetResponses) {
       const configured = assetResponses[requestUrl] || {};
       const status = configured.status ?? 200;
       const bytes = new TextEncoder().encode(configured.content ?? 'asset bytes');
@@ -2498,4 +2498,111 @@ test('diagnostics record the sandbox list status and error shape of a failed con
   assert.equal(item.sandbox_list_status, 503);
   assert.deepEqual(JSON.parse(JSON.stringify(item.sandbox_list_body)), { error: '<string:12>' });
   assert.match(item.error, /^Could not list Claude sandbox files for conversation "22222222-2222-4333-8444-555555555555" \(HTTP 503\)\.$/);
+});
+
+// Shapes from the owner's sanitized diagnostic report (real claude.ai
+// responses, values replaced): files without a URL come as
+// { file_kind: 'blob', path: '/mnt/user-data/uploads/…' } in conversations
+// whose sandbox list answers 200, or as { file_kind: 'blob', download_source }
+// in conversations whose sandbox list answers 404.
+function realUploadConversation(uuid, file) {
+  const conversation = plainConversation(uuid);
+  conversation.is_wiggle_enabled = true;
+  conversation.chat_messages[0].files = [file];
+  return conversation;
+}
+const pathBlob = (path) => ({
+  created_at: '2026-10-20T10:00:00.000000+00:00', file_kind: 'blob', file_name: 'Tema 2 BD.pdf',
+  file_uuid: 'blob-1', path, size_bytes: 2099146, success: true, uuid: 'blob-1',
+});
+
+test('a blob upload is matched to the sandbox file with its exact path, even under a different name', async () => {
+  const harness = createHarness(realUploadConversation('conv-path-listed', pathBlob('/mnt/user-data/uploads/Tema_2_BD.pdf')), {
+    sandboxFiles: [{ path: '/mnt/user-data/uploads/Tema_2_BD.pdf', content_type: 'application/pdf' }],
+    sandboxContents: { '/mnt/user-data/uploads/Tema_2_BD.pdf': '%PDF real bytes' },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), []);
+  const [asset] = exported.assets;
+  assert.equal(asset.file_uuid, 'blob-1', 'linked to the file it belongs to');
+  assert.deepEqual(JSON.parse(JSON.stringify(asset.message_external_ids)), ['u1']);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a blob upload missing from the sandbox list is downloaded by the path Claude gives for it', async () => {
+  for (const [served, notServed, form] of [
+    ['/mnt/user-data/uploads/Tema 2 BD.pdf', null, 'absolute'],
+    ['uploads/Tema 2 BD.pdf', '/mnt/user-data/uploads/Tema 2 BD.pdf', 'relative'],
+  ]) {
+    const harness = createHarness(realUploadConversation(`conv-path-${form}`, pathBlob('/mnt/user-data/uploads/Tema 2 BD.pdf')), {
+      sandboxFiles: [],
+      sandboxContents: { [served]: '%PDF real bytes' },
+      sandboxDownloadStatuses: notServed ? { [notServed]: 404 } : {},
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [exported] = (await harness.firstHandoff).conversations;
+    assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), [], form);
+    assert.equal(exported.assets.length, 1, form);
+    assert.equal(exported.assets[0].file_uuid, 'blob-1');
+    assert.ok(harness.requests.some((url) => url.endsWith(`/wiggle/download-file?path=${encodeURIComponent(served)}`)), form);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('a blob upload no path form serves stays visibly not archived, and diagnostics record each attempt', async () => {
+  const path = '/mnt/user-data/uploads/Tema 2 BD.pdf';
+  const harness = createHarness(realUploadConversation('conv-path-gone', pathBlob(path)), {
+    sandboxFiles: [],
+    sandboxDownloadStatuses: { [path]: 404, 'uploads/Tema 2 BD.pdf': 404 },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.equal(exported.incomplete.length, 1);
+  const [item] = harness.storageState.last_sync_diagnostics.items;
+  assert.deepEqual(JSON.parse(JSON.stringify(item.unarchived_files[0].attempts)), [
+    { via: 'sandbox-path', form: 'absolute', status: 404 },
+    { via: 'sandbox-path', form: 'relative', status: 404 },
+  ]);
+  assert.equal(item.unarchived_files[0].file.path, '/mnt/user-data/uploads/<name>.pdf');
+  assert.equal(item.conversation_flags.is_wiggle_enabled, true);
+  assert.equal(JSON.stringify(item).includes('Tema'), false, 'no file names in diagnostics');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a download_source blob in a conversation without a sandbox is not guessed at, and diagnostics show its source', async () => {
+  const conversation = realUploadConversation('conv-download-source', {
+    created_at: '2026-10-20T10:00:00.000000+00:00', download_source: 'files_api', file_kind: 'blob',
+    file_name: 'proyecto.zip', file_uuid: 'blob-2', size_bytes: 71356, success: true, uuid: 'blob-2',
+  });
+  conversation.is_wiggle_enabled = false;
+  const harness = createHarness(conversation, { sandboxListStatus: 404, storage: {} });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete.map((item) => item.reason))), ['Claude did not provide a download link for this file']);
+  assert.equal(harness.requests.some((url) => url.includes('download-file')), false, 'no guessed download requests');
+  const [item] = harness.storageState.last_sync_diagnostics.items;
+  assert.equal(item.unarchived_files[0].file.download_source, 'files_api');
+  assert.deepEqual(JSON.parse(JSON.stringify(item.unarchived_files[0].attempts)), []);
+  assert.equal(item.conversation_flags.is_wiggle_enabled, false);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a real document entry downloads through its document_pdf URL', async () => {
+  const url = '/api/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/files/doc-1/document_pdf';
+  const conversation = realUploadConversation('conv-document', {
+    created_at: '2026-10-20T10:00:00.000000+00:00',
+    document_asset: { file_variant: 'document', page_count: 3, token_count: 4710, url },
+    file_kind: 'document', file_name: 'apuntes.pdf', file_uuid: 'doc-1', size_bytes: 474893, success: true,
+    thumbnail_asset: { file_variant: 'thumbnail', image_height: 400, image_width: 283, primary_color: 'ffffff', url: '/api/x/files/doc-1/thumbnail' },
+    uuid: 'doc-1',
+  });
+  const harness = createHarness(conversation, { assetResponses: { [url]: { content: '%PDF doc', contentType: 'application/pdf' } } });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), []);
+  assert.equal(exported.assets[0].name, 'apuntes.pdf');
+  harness.finishFirstHandoff({ ok: true });
 });
