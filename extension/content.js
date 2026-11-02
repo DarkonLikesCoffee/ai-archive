@@ -1465,16 +1465,94 @@
   }
 
   async function handOff(payload, signal) {
-    const text = JSON.stringify(payload);
-    if (text.length <= HANDOFF_CHUNK_CHARS) return sendRuntimeMessage({ type: 'syncNormalized', ...payload });
     const transferId = createInlineMarkerNonce();
-    const total = Math.ceil(text.length / HANDOFF_CHUNK_CHARS);
-    for (let index = 0; index < total; index++) {
-      if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-      const data = text.slice(index * HANDOFF_CHUNK_CHARS, (index + 1) * HANDOFF_CHUNK_CHARS);
-      const response = await sendRuntimeMessage({ type: 'syncTransferChunk', transferId, index, total, data });
-      if (!response?.ok) throw new Error(response?.error || 'The extension did not accept the sync data. Nothing was published; sync again.');
+    const metadata = {
+      skipped: payload.skipped,
+      unchangedIds: payload.unchangedIds,
+      fullList: payload.fullList,
+      listed: payload.listed,
+    };
+    const started = await sendRuntimeMessage({
+      type: 'syncTransferStart',
+      transferId,
+      conversationCount: payload.conversations.length,
+      metadata,
+    });
+    if (!started?.ok) {
+      throw new Error(started?.error || 'The extension could not prepare the sync transfer. Nothing was published; sync again.');
     }
+
+    // Never stringify the complete archive: hundreds of conversations and
+    // base64 attachments can exceed the JavaScript maximum string length.
+    // Build bounded JSON-array batches, each no larger than the messaging cap.
+    let batchParts = [];
+    let batchLength = 2; // '[' and ']'
+    let batchIndex = 0;
+
+    async function sendBatch(text) {
+      const totalChunks = Math.max(1, Math.ceil(text.length / HANDOFF_CHUNK_CHARS));
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        const data = text.slice(chunkIndex * HANDOFF_CHUNK_CHARS, (chunkIndex + 1) * HANDOFF_CHUNK_CHARS);
+        const response = await sendRuntimeMessage({
+          type: 'syncTransferBatchChunk',
+          transferId,
+          batchIndex,
+          chunkIndex,
+          totalChunks,
+          data,
+        });
+        if (!response?.ok) {
+          throw new Error(response?.error || 'The extension did not accept a sync batch. Nothing was published; sync again.');
+        }
+      }
+      batchIndex++;
+    }
+
+    async function flushBatch() {
+      if (!batchParts.length) return;
+      const text = '[' + batchParts.join(',') + ']';
+      batchParts = [];
+      batchLength = 2;
+      await sendBatch(text);
+    }
+
+    for (let i = 0; i < payload.conversations.length; i++) {
+      if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+      const conversation = payload.conversations[i];
+      const id = String(conversation?.external_id || conversation?.id || i + 1);
+      let serialized;
+      try {
+        serialized = JSON.stringify(conversation);
+      } catch (error) {
+        throw new Error('Could not serialize conversation "' + id + '" for transfer: '
+          + String(error?.message || error) + '. Nothing was published; retry this conversation separately.');
+      }
+      if (typeof serialized !== 'string') {
+        throw new Error('Could not serialize conversation "' + id + '" for transfer. Nothing was published; retry this conversation separately.');
+      }
+
+      const itemLength = serialized.length + (batchParts.length ? 1 : 0);
+      if (batchParts.length && batchLength + itemLength > HANDOFF_CHUNK_CHARS) {
+        await flushBatch();
+      }
+
+      if (serialized.length + 2 > HANDOFF_CHUNK_CHARS) {
+        // A single conversation can itself contain many attachments. Flush
+        // normal-sized batches first, then chunk this one-conversation array.
+        await flushBatch();
+        await sendBatch('[' + serialized + ']');
+      } else {
+        batchParts.push(serialized);
+        batchLength += serialized.length + (batchParts.length > 1 ? 1 : 0);
+      }
+
+      // The background worker now owns the serialized representation. Release
+      // the large object (especially base64 assets) to limit peak memory.
+      payload.conversations[i] = null;
+    }
+
+    await flushBatch();
     return sendRuntimeMessage({ type: 'syncNormalized', transferId });
   }
 
