@@ -1220,6 +1220,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       conversations: [],
       nextBatchIndex: 0,
       currentBatch: null,
+      currentAsset: null,
     };
     sendResponse({ ok: true });
     return false;
@@ -1273,6 +1274,65 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  if (msg.type === 'syncTransferAssetChunk') {
+    const transfer = pendingTransfer;
+    const validNumbers = Number.isSafeInteger(msg.conversationIndex) && msg.conversationIndex >= 0
+      && Number.isSafeInteger(msg.assetIndex) && msg.assetIndex >= 0
+      && Number.isSafeInteger(msg.chunkIndex) && msg.chunkIndex >= 0
+      && Number.isSafeInteger(msg.totalChunks) && msg.totalChunks > 0
+      && msg.chunkIndex < msg.totalChunks;
+    if (!transfer || transfer.mode !== 'batches' || transfer.id !== msg.transferId
+      || transfer.currentBatch || !validNumbers || typeof msg.data !== 'string') {
+      pendingTransfer = null;
+      sendResponse({ ok: false, error: 'The attachment chunks reached the extension out of order. Nothing was published; sync again.' });
+      return false;
+    }
+
+    if (msg.chunkIndex === 0) {
+      if (transfer.currentAsset) {
+        pendingTransfer = null;
+        sendResponse({ ok: false, error: 'An attachment transfer was interrupted. Nothing was published; sync again.' });
+        return false;
+      }
+      const conversation = transfer.conversations[msg.conversationIndex];
+      const asset = conversation?.assets?.[msg.assetIndex];
+      if (!asset || asset.base64) {
+        pendingTransfer = null;
+        sendResponse({ ok: false, error: 'The attachment metadata was missing or already populated. Nothing was published; sync again.' });
+        return false;
+      }
+      transfer.currentAsset = {
+        conversationIndex: msg.conversationIndex,
+        assetIndex: msg.assetIndex,
+        totalChunks: msg.totalChunks,
+        chunks: [],
+      };
+    }
+
+    const current = transfer.currentAsset;
+    if (!current || current.conversationIndex !== msg.conversationIndex
+      || current.assetIndex !== msg.assetIndex || current.totalChunks !== msg.totalChunks
+      || msg.chunkIndex !== current.chunks.length) {
+      pendingTransfer = null;
+      sendResponse({ ok: false, error: 'The attachment chunks were incomplete or out of order. Nothing was published; sync again.' });
+      return false;
+    }
+
+    current.chunks.push(msg.data);
+    if (current.chunks.length === current.totalChunks) {
+      const conversation = transfer.conversations[current.conversationIndex];
+      const asset = conversation?.assets?.[current.assetIndex];
+      if (!asset) {
+        pendingTransfer = null;
+        sendResponse({ ok: false, error: 'The attachment no longer matches its conversation. Nothing was published; sync again.' });
+        return false;
+      }
+      asset.base64 = current.chunks.join('');
+      transfer.currentAsset = null;
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg.type === 'syncTransferAbort') {
     if (pendingTransfer?.id === msg.transferId) pendingTransfer = null;
     sendResponse({ ok: true });
@@ -1308,7 +1368,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         if (!transfer || transfer.id !== msg.transferId) throw new Error('incomplete');
         if (transfer.mode === 'batches') {
-          if (transfer.currentBatch
+          if (transfer.currentBatch || transfer.currentAsset
             || transfer.conversations.length !== transfer.expectedConversations) throw new Error('incomplete');
           payload = { ...transfer.metadata, conversations: transfer.conversations };
         } else {
