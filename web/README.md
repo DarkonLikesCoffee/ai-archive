@@ -1,4 +1,4 @@
-# AI Archive Dashboard v0.6.10
+# AI Archive Dashboard v0.6.13
 
 Web dashboard for browsing the AI conversation archive stored in a private GitHub repository.
 
@@ -41,3 +41,10 @@ node e2e/viewer.e2e.cjs
 - Conversation search is scoped to the currently open conversation.
 - Ctrl/Cmd+F focuses the conversation search instead of the browser find UI.
 - Added previous/next result buttons and a live match count.
+
+
+## v0.6.13
+- Attachment MIME metadata is validated before it can be used for image previews.
+- Only known raster image formats are embedded; SVG and unsupported image types remain downloadable attachments.
+- Attachment links are restricted to official GitHub hosts and dynamic HTML attributes and labels are escaped.
+- Raw attachment downloads are restricted to `raw.githubusercontent.com` before the GitHub token is sent.
