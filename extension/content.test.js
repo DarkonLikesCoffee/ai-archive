@@ -2516,10 +2516,19 @@ test('attachment diagnostics preserve sanitized tool input structure without rec
     content: 'PRIVATE TOOL RESULT',
     is_error: false,
   });
-  const harness = createHarness(conversation, { sandboxListStatus: 404, storage: {} });
+  const harness = createHarness(conversation, {
+    sandboxListStatus: 404,
+    assetResponses: {
+      '/api/org-id/files/99999999-8888-4777-8666-555555555555/content': { status: 404 },
+    },
+    storage: {},
+  });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   await harness.firstHandoff;
   const [item] = harness.storageState.last_sync_diagnostics.items;
+  assert.deepEqual(JSON.parse(JSON.stringify(item.unarchived_files[0].attempts)), [
+    { via: 'files-api', status: 404 },
+  ], 'a files-api blob records the guarded content-route attempt');
   const [message] = item.messages_with_files;
   assert.equal(message.tool_names.includes('create_file'), true);
   assert.deepEqual(JSON.parse(JSON.stringify(message.tool_blocks)), [
