@@ -11,30 +11,101 @@
     return x[0].uuid;
   }
 
-  async function list(org, signal) {
-    const r = await fetch(`/api/organizations/${org}/chat_conversations`, { credentials: 'include', signal });
-    if (!r.ok) throw Error(`Claude conversations: ${r.status}`);
+  // Claude's web app exposes an undocumented offset-based list endpoint.
+  // Keep the page size at the observed 30-item default and verify the result
+  // against count_all whenever that endpoint is available.
+  const CONVERSATION_LIST_PAGE_SIZE = 30;
+  const MAX_CONVERSATION_LIST_PAGES = 10000;
+
+  async function conversationCount(org, signal) {
+    const r = await fetch('/api/organizations/' + org + '/chat_conversations/count_all', {
+      credentials: 'include',
+      signal,
+    });
+    // Some Claude deployments may not expose count_all. In that case the list
+    // is still paged until a short page is returned.
+    if (r.status === 404 || r.status === 405) return null;
+    if (!r.ok) throw Error('Claude conversation count: ' + r.status);
 
     let data;
     try {
       data = await r.json();
     } catch {
-      throw new Error('Claude returned an unreadable conversation list. No archive changes were submitted to GitHub; retry the sync.');
+      throw new Error('Claude returned an unreadable conversation count. No archive changes were submitted to GitHub; retry the sync.');
     }
-    if (!Array.isArray(data)) {
-      throw new Error('Claude returned an invalid conversation list (expected an array). No archive changes were submitted to GitHub; retry the sync.');
+    if (!data || typeof data !== 'object' || !Number.isSafeInteger(data.count) || data.count < 0) {
+      throw new Error('Claude returned an invalid conversation count. No archive changes were submitted to GitHub; retry the sync.');
+    }
+    return data.count;
+  }
+
+  async function list(org, signal) {
+    const expectedBefore = await conversationCount(org, signal);
+    const data = [];
+    const seenIds = new Set();
+    let offset = 0;
+    let finished = false;
+
+    for (let pageNumber = 0; pageNumber < MAX_CONVERSATION_LIST_PAGES; pageNumber++) {
+      const url = '/api/organizations/' + org + '/chat_conversations?limit='
+        + CONVERSATION_LIST_PAGE_SIZE + '&starred=false&offset=' + offset;
+      const r = await fetch(url, { credentials: 'include', signal });
+      if (!r.ok) throw Error('Claude conversations: ' + r.status);
+
+      let page;
+      try {
+        page = await r.json();
+      } catch {
+        throw new Error('Claude returned an unreadable conversation list. No archive changes were submitted to GitHub; retry the sync.');
+      }
+      if (!Array.isArray(page)) {
+        throw new Error('Claude returned an invalid conversation list (expected an array). No archive changes were submitted to GitHub; retry the sync.');
+      }
+
+      for (const conversation of page) {
+        if (!conversation || typeof conversation !== 'object' || typeof conversation.uuid !== 'string' || !conversation.uuid.trim()) {
+          throw new Error('Claude returned a conversation without a valid UUID. No archive changes were submitted to GitHub; retry the sync.');
+        }
+        if (seenIds.has(conversation.uuid)) {
+          throw new Error('Claude returned duplicate conversation UUID "' + conversation.uuid + '" across pages. No archive changes were submitted to GitHub; retry the sync.');
+        }
+        seenIds.add(conversation.uuid);
+        data.push(conversation);
+        if (expectedBefore !== null && data.length > expectedBefore) {
+          throw new Error('Claude returned more conversations than its count_all endpoint reported. No archive changes were submitted to GitHub; retry the sync.');
+        }
+      }
+
+      offset += page.length;
+      if (expectedBefore !== null) {
+        if (data.length === expectedBefore) {
+          finished = true;
+          break;
+        }
+        // A short or empty page is not proof of completion when Claude's count
+        // endpoint says there should still be more records.
+        if (!page.length) break;
+      } else if (page.length < CONVERSATION_LIST_PAGE_SIZE) {
+        finished = true;
+        break;
+      }
     }
 
-    const seenIds = new Set();
-    for (const conversation of data) {
-      if (!conversation || typeof conversation !== 'object' || typeof conversation.uuid !== 'string' || !conversation.uuid.trim()) {
-        throw new Error('Claude returned a conversation without a valid UUID. No archive changes were submitted to GitHub; retry the sync.');
-      }
-      if (seenIds.has(conversation.uuid)) {
-        throw new Error(`Claude returned duplicate conversation UUID "${conversation.uuid}". No archive changes were submitted to GitHub; retry the sync.`);
-      }
-      seenIds.add(conversation.uuid);
+    if (!finished) {
+      throw new Error('Claude conversation pagination did not reach a verifiable end. No archive changes were submitted to GitHub; retry the sync.');
     }
+    if (expectedBefore !== null && data.length !== expectedBefore) {
+      throw new Error('Claude returned ' + data.length + ' of ' + expectedBefore + ' conversations reported by count_all. No archive changes were submitted to GitHub; retry the sync.');
+    }
+
+    const expectedAfter = await conversationCount(org, signal);
+    if (expectedBefore !== null && expectedAfter !== null && expectedAfter !== expectedBefore) {
+      throw new Error('Claude conversation count changed during pagination (' + expectedBefore + ' to ' + expectedAfter + '). No archive changes were submitted to GitHub; retry the sync.');
+    }
+    if (expectedAfter !== null && expectedAfter !== data.length) {
+      throw new Error('Claude returned ' + data.length + ' conversations but count_all reported ' + expectedAfter + '. No archive changes were submitted to GitHub; retry the sync.');
+    }
+
     return data;
   }
 
