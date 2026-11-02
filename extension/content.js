@@ -1251,9 +1251,17 @@
 
   function storeDiagnostics(items) {
     try {
-      chrome.storage?.local?.set?.({ last_sync_diagnostics: { at: new Date().toISOString(), items: items.slice(0, 30) } })?.catch?.(() => {});
+      const version = chrome.runtime?.getManifest?.()?.version || null;
+      return chrome.storage?.local?.set?.({
+        last_sync_diagnostics: {
+          at: new Date().toISOString(),
+          extension_version: version,
+          items: items.slice(0, 30),
+        },
+      })?.catch?.(() => {}) || Promise.resolve();
     } catch {
       // Diagnostics are best effort and never affect the sync.
+      return Promise.resolve();
     }
   }
 
@@ -1263,6 +1271,9 @@
     currentAbortController = new AbortController();
     const signal = currentAbortController.signal;
     try {
+      // A report belongs to one sync attempt only. Clear the previous report
+      // before any network work, so early failures cannot leave stale details.
+      await storeDiagnostics([]);
       sendProgress({ stage: 'fetching', current: 0, total: 0, selected: limit });
       const org = await getOrg(signal);
       let listData = await list(org, signal);
@@ -1328,7 +1339,7 @@
         }
         sendProgress({ stage: 'fetching', current: i + 1, total, selected: limit });
       }
-      storeDiagnostics(diagnostics);
+      await storeDiagnostics(diagnostics);
       if (!conversations.length && firstExportError) throw firstExportError;
 
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
