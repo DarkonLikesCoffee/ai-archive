@@ -1513,9 +1513,9 @@
       throw new Error(started?.error || 'The extension could not prepare the sync transfer. Nothing was published; sync again.');
     }
 
-    // Never stringify the complete archive: hundreds of conversations and
-    // base64 attachments can exceed the JavaScript maximum string length.
-    // Build bounded JSON-array batches, each no larger than the messaging cap.
+    // Conversation transcripts are sent as bounded JSON batches. Asset bytes
+    // travel separately so one conversation containing many large attachments
+    // never needs to become one enormous JSON string.
     let batchParts = [];
     let batchLength = 2; // '[' and ']'
     let batchIndex = 0;
@@ -1548,39 +1548,74 @@
       await sendBatch(text);
     }
 
+    async function sendAsset(conversationIndex, assetIndex, base64) {
+      const totalChunks = Math.max(1, Math.ceil(base64.length / HANDOFF_CHUNK_CHARS));
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        const response = await sendRuntimeMessage({
+          type: 'syncTransferAssetChunk',
+          transferId,
+          conversationIndex,
+          assetIndex,
+          chunkIndex,
+          totalChunks,
+          data: base64.slice(chunkIndex * HANDOFF_CHUNK_CHARS, (chunkIndex + 1) * HANDOFF_CHUNK_CHARS),
+        });
+        if (!response?.ok) {
+          throw new Error(response?.error || 'The extension did not accept an attachment chunk. Nothing was published; sync again.');
+        }
+      }
+    }
+
     try {
       for (let i = 0; i < payload.conversations.length; i++) {
         if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
         const conversation = payload.conversations[i];
         const id = String(conversation?.external_id || conversation?.id || i + 1);
+        const assets = Array.isArray(conversation?.assets) ? conversation.assets : [];
+        const transferableAssets = assets
+          .map((asset, assetIndex) => ({ asset, assetIndex, base64: typeof asset?.base64 === 'string' ? asset.base64 : '' }))
+          .filter(({ asset, base64 }) => {
+            const size = Number(asset?.size) || Math.floor(base64.length * 3 / 4);
+            return base64.length > 0 && size <= MAX_ARCHIVED_FILE_BYTES;
+          });
+
+        // The receiver needs the metadata, not another copy of the base64
+        // payload. Preserve size/hash/name so oversized files can be noted.
+        const metadataConversation = {
+          ...conversation,
+          assets: assets.map(({ base64: _base64, ...asset }) => ({ ...asset, base64: '' })),
+        };
+
         let serialized;
         try {
-          serialized = JSON.stringify(conversation);
+          serialized = JSON.stringify(metadataConversation);
         } catch (error) {
-          throw new Error('Could not serialize conversation "' + id + '" for transfer: '
+          throw new Error('Could not serialize conversation metadata "' + id + '" for transfer: '
             + String(error?.message || error) + '. Nothing was published; retry this conversation separately.');
         }
         if (typeof serialized !== 'string') {
-          throw new Error('Could not serialize conversation "' + id + '" for transfer. Nothing was published; retry this conversation separately.');
+          throw new Error('Could not serialize conversation metadata "' + id + '" for transfer. Nothing was published; retry this conversation separately.');
         }
 
         const itemLength = serialized.length + (batchParts.length ? 1 : 0);
-        if (batchParts.length && batchLength + itemLength > HANDOFF_CHUNK_CHARS) {
-          await flushBatch();
-        }
-
-        if (serialized.length + 2 > HANDOFF_CHUNK_CHARS) {
-          // A single conversation can itself contain many attachments. Flush
-          // normal-sized batches first, then chunk this one-conversation array.
+        const needsSeparateAssetTransfer = transferableAssets.length > 0;
+        if (needsSeparateAssetTransfer || serialized.length + 2 > HANDOFF_CHUNK_CHARS
+          || (batchParts.length && batchLength + itemLength > HANDOFF_CHUNK_CHARS)) {
           await flushBatch();
           await sendBatch('[' + serialized + ']');
+
+          for (const { asset, assetIndex, base64 } of transferableAssets) {
+            await sendAsset(i, assetIndex, base64);
+            asset.base64 = '';
+          }
         } else {
           batchParts.push(serialized);
           batchLength += serialized.length + (batchParts.length > 1 ? 1 : 0);
         }
 
-        // The background worker now owns the serialized representation. Release
-        // the large object (especially base64 assets) to limit peak memory.
+        // Each conversation (and its attachment bytes) is now owned by the
+        // background worker. Release it before moving to the next one.
         payload.conversations[i] = null;
       }
 
