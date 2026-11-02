@@ -189,7 +189,7 @@ function setProgress(msg) {
   $('progressText').textContent = detail;
   $('cancel').disabled = !['fetching','preparing','checking','initializing-repo','uploading','creating-tree','creating-commit','finalizing'].includes(msg.stage);
   activeSync = !$('cancel').disabled;
-  $('sync').disabled = activeSync;
+  $('sync').disabled = activeSync || !selectedArchiveAccount;
   if (msg.stage === 'error') status.className = 'status err';
   else if (msg.stage === 'done' || msg.stage === 'cancelled') status.className = 'status ok';
 }
