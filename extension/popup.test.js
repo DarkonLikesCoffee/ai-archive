@@ -57,6 +57,7 @@ globalThis.__getLastDiagnostics = () => lastDiagnostics;`, context);
     loadDiagnostics: context.__loadDiagnostics,
     isCurrentDiagnosticReport: context.__isCurrentDiagnosticReport,
     getLastDiagnostics: context.__getLastDiagnostics,
+    refresh: context.refresh,
     element, chrome, storedSettings
   };
 }
@@ -110,7 +111,8 @@ test('creating a slug variant selects the existing account instead of creating a
 });
 
 test('clears a persisted diagnostic report created by an older extension version', async () => {
-  const { loadDiagnostics, getLastDiagnostics, element, storedSettings } = loadPopup();
+  const { loadDiagnostics, getLastDiagnostics, refresh, element, storedSettings } = loadPopup();
+  await refresh();
   const stale = { extension_version: '0.5.8', items: [{ outcome: 'failed' }] };
   storedSettings.last_sync_diagnostics = stale;
   await loadDiagnostics(stale);
@@ -120,7 +122,8 @@ test('clears a persisted diagnostic report created by an older extension version
 });
 
 test('keeps diagnostics from the current extension version visible', async () => {
-  const { loadDiagnostics, getLastDiagnostics } = loadPopup();
+  const { loadDiagnostics, getLastDiagnostics, refresh } = loadPopup();
+  await refresh();
   const current = { extension_version: '0.5.9', items: [{ outcome: 'incomplete' }] };
   await loadDiagnostics(current);
   assert.deepEqual(JSON.parse(JSON.stringify(getLastDiagnostics())), current);
