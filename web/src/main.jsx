@@ -11,6 +11,7 @@ import { moveFocusIndex, shortcutFor } from './shortcuts.js';
 import { promptOutline } from './outline.js';
 import { archiveStats, formatBytes } from './archiveStats.js';
 import { effectiveSort, groupByDate, sortConversations, sortDate, sortOptions } from './listOrder.js';
+import { isSafeImageDataUrl, renderInlineImageHtml, renderImageLinkHtml, renderAttachmentCardHtml } from './attachmentSecurity.js';
 import './styles.css';
 
 const KEY = 'ai_archive_github_v3';
@@ -261,12 +262,6 @@ function inlineMarkdown(s) {
   return x;
 }
 
-function isImageAsset(asset) {
-  if (!asset) return false;
-  if (/^image\//i.test(String(asset.mime || ''))) return true;
-  return /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|tiff?)$/i.test(String(asset.name || asset.path || ''));
-}
-
 function extractCopyMarkdown(source) {
   const lines = String(source || '').split('\n');
   const kept = [];
@@ -411,21 +406,28 @@ function Message({ message, assets, assetBusy, anchor }) {
       for(const {path, attribute} of placeholders){
         const cleanPath=decodeURIComponent(String(path||'')).replace(/^\.\//,'').split('#')[0].split('?')[0];
         const asset=assets[path] || assets[cleanPath] || assets[cleanPath.split('/').pop()] || assets[cleanPath.split('/').pop().toLowerCase()];
-        const escapedPath=attribute.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-        if(asset?.dataUrl && isImageAsset(asset)){
-          rendered=rendered.replace(new RegExp(`<span class=\"md-image-placeholder\" data-md-image=\"${escapedPath}\">[^<]*</span>`, 'g'), `<img class=\"md-image\" src=\"${asset.dataUrl}\" alt=\"${escapeHtml(asset.name)}\" />`);
-        }
+        const escapedPath=attribute.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');
         if(asset){
+          const dataUrl=isSafeImageDataUrl(asset.dataUrl) ? asset.dataUrl : '';
           const href=asset.htmlUrl || asset.downloadUrl || '#';
-          const name=escapeHtml(asset.name);
-          if(isImageAsset(asset)) {
-            const imageHtml=`<a class="md-image-link" href="${href}" target="_blank" rel="noreferrer"><img class="md-image" src="${asset.dataUrl}" alt="${name}" loading="lazy" /></a>`;
-            rendered=rendered.replace(new RegExp(`<span class="md-attachment-placeholder" data-md-attachment="${escapedPath}">[^<]*</span>`, 'g'), imageHtml);
-          } else {
-            const type=escapeHtml((asset.mime || 'file').replace(/^application\//,'').replace(/^text\//,''));
-            const card=`<a class="md-attachment-card" href="${href}" target="_blank" rel="noreferrer"><span class="attachment-icon">↗</span><span class="attachment-info"><strong>${name}</strong><small>${type}</small></span></a>`;
-            rendered=rendered.replace(new RegExp(`<span class="md-attachment-placeholder" data-md-attachment="${escapedPath}">[^<]*</span>`, 'g'), card);
+          if(dataUrl){
+            rendered=rendered.replace(
+              new RegExp(`<span class="md-image-placeholder" data-md-image="${escapedPath}">[^<]*</span>`, 'g'),
+              renderInlineImageHtml(dataUrl, asset.name),
+            );
           }
+          const replacement=dataUrl
+            ? renderImageLinkHtml({ href, dataUrl, name: asset.name })
+            : renderAttachmentCardHtml({ href, name: asset.name, mime: asset.mime });
+          // Unsafe or unsupported image formats become downloadable cards.
+          rendered=rendered.replace(
+            new RegExp(`<span class="md-image-placeholder" data-md-image="${escapedPath}">[^<]*</span>`, 'g'),
+            replacement,
+          );
+          rendered=rendered.replace(
+            new RegExp(`<span class="md-attachment-placeholder" data-md-attachment="${escapedPath}">[^<]*</span>`, 'g'),
+            replacement,
+          );
         }
       }
       if(!cancelled) setHtml({__html:rendered});
