@@ -344,3 +344,43 @@ test('explains a repository that cannot be found when connecting', () => {
   assert.match(describeConnectError(new Error('GitHub 404: {"message":"Not Found"}'), settings), /^Repository me\/archiv was not found, or the token cannot access it\./);
   assert.equal(describeConnectError(new Error('GitHub 401: GitHub rejected the access token.'), settings), 'GitHub 401: GitHub rejected the access token.');
 });
+
+
+test('rejects unsafe archived MIME metadata and never sends the GitHub token to its download URL', async (t) => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+    const value = String(url);
+    calls.push({ url: value, headers: options.headers || {} });
+    if (!value.endsWith('/contents/archive/conversations/claude/personal/assets/untrusted-file')) {
+      throw new Error(`Unexpected test request: ${value}`);
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        type: 'file',
+        content: '',
+        encoding: 'none',
+        sha: 'untrusted-blob-sha',
+        size: 10,
+        content_type: 'image/png" onerror="alert(1)',
+        html_url: 'https://evil.example/steal',
+        download_url: 'https://evil.example/steal?token=leak',
+      }),
+    };
+  });
+
+  const settings = { owner: 'example', repo: 'archive', token: 'private-test-token' };
+  const asset = await readAsset(settings, 'archive/conversations/claude/personal/assets/untrusted-file', {
+    name: 'untrusted-file',
+    mime: 'image/png" onerror="alert(1)',
+  });
+
+  assert.equal(asset.mime, 'application/octet-stream');
+  assert.equal(asset.dataUrl, '');
+  assert.equal(asset.htmlUrl, 'https://github.com/example/archive/blob/HEAD/archive/conversations/claude/personal/assets/untrusted-file');
+  assert.equal(asset.downloadUrl, null);
+  assert.equal(calls.length, 1, 'untrusted download URLs must not be fetched');
+  assert.ok(calls[0].url.startsWith('https://api.github.com/'));
+  assert.equal(calls[0].headers.Authorization, 'Bearer private-test-token');
+});
