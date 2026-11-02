@@ -2570,6 +2570,35 @@ function plainConversation(uuid, extraContent = []) {
   };
 }
 
+
+test('streams all 812 conversations through bounded batches without a monolithic archive string', async () => {
+  const list = Array.from({ length: 812 }, (_, index) => ({
+    uuid: 'large-account-' + index,
+    name: 'Conversation ' + index,
+    created_at: '2026-10-26T08:00:00.000Z',
+    updated_at: '2026-10-26T08:30:00.000Z',
+  }));
+  const harness = createHarness(plainConversation('large-account-0'), {
+    conversationListResponse: list,
+    conversationCountResponse: { count: 812 },
+    fullConversationResponse: (id) => plainConversation(id),
+    handoffChunkChars: 12 * 1024,
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.equal(handoff.listed, 812);
+  assert.equal(handoff.conversations.length, 812);
+  assert.equal(handoff.conversations[0].external_id, 'large-account-0');
+  assert.equal(handoff.conversations.at(-1).external_id, 'large-account-811');
+  assert.ok(new Set(harness.transferChunks.map((chunk) => chunk.batchIndex)).size > 1,
+    'the archive should be split into multiple independently decoded batches');
+  assert.ok(harness.transferChunks.every((chunk) => chunk.data.length <= 12 * 1024));
+  assert.equal(harness.transferChunks.every((chunk) => chunk.transferId === handoff.transferId), true);
+  harness.finishFirstHandoff({ ok: true });
+});
+
 test('a conversation whose sandbox file list is HTTP 404 is archived completely when no tool wrote files', async () => {
   const harness = createHarness(plainConversation('conv-404-plain'), { sandboxListStatus: 404 });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
