@@ -1549,7 +1549,10 @@ test('reassembles bounded conversation batches and rejects incomplete transfers'
     metadata,
   }).ok, true);
 
-  const data = JSON.stringify([{ external_id: 'new-1' }, { external_id: 'new-2' }]);
+  const data = JSON.stringify([
+    { external_id: 'new-1', assets: [{ name: 'image.png', size: 12, sha256: 'hash-image', base64: '' }] },
+    { external_id: 'new-2', assets: [] },
+  ]);
   const chunks = data.match(/[\s\S]{1,9}/g);
   for (const [chunkIndex, chunk] of chunks.entries()) {
     assert.equal(background.send({
@@ -1558,6 +1561,20 @@ test('reassembles bounded conversation batches and rejects incomplete transfers'
       batchIndex: 0,
       chunkIndex,
       totalChunks: chunks.length,
+      data: chunk,
+    }).ok, true);
+  }
+
+  const assetText = 'aGVsbG8gd29ybGQh';
+  const assetChunks = assetText.match(/[\\s\\S]{1,5}/g);
+  for (const [chunkIndex, chunk] of assetChunks.entries()) {
+    assert.equal(background.send({
+      type: 'syncTransferAssetChunk',
+      transferId: 'batches-1',
+      conversationIndex: 0,
+      assetIndex: 0,
+      chunkIndex,
+      totalChunks: assetChunks.length,
       data: chunk,
     }).ok, true);
   }
@@ -1581,6 +1598,39 @@ test('reassembles bounded conversation batches and rejects incomplete transfers'
   assert.equal(partial.ok, true);
   const response = incomplete.send({ type: 'syncNormalized', transferId: 'batches-2' }, { tab: { id: 7 } });
   assert.equal(response.ok, false, 'the finalizer must reject a missing conversation');
+  assert.match(response.error, /did not fully reach the extension/);
+});
+
+
+test('refuses to finalize a transfer while attachment chunks are incomplete', () => {
+  const background = loadBackgroundForSyncState();
+  const started = background.send({
+    type: 'syncTransferStart',
+    transferId: 'asset-incomplete',
+    conversationCount: 1,
+    metadata: {},
+  });
+  assert.equal(started.ok, true);
+  const conversation = JSON.stringify([{ external_id: 'with-asset', assets: [{ name: 'large.bin', size: 10, sha256: 'sha', base64: '' }] }]);
+  assert.equal(background.send({
+    type: 'syncTransferBatchChunk',
+    transferId: 'asset-incomplete',
+    batchIndex: 0,
+    chunkIndex: 0,
+    totalChunks: 1,
+    data: conversation,
+  }).ok, true);
+  assert.equal(background.send({
+    type: 'syncTransferAssetChunk',
+    transferId: 'asset-incomplete',
+    conversationIndex: 0,
+    assetIndex: 0,
+    chunkIndex: 0,
+    totalChunks: 2,
+    data: 'YWJj',
+  }).ok, true);
+  const response = background.send({ type: 'syncNormalized', transferId: 'asset-incomplete' }, { tab: { id: 7 } });
+  assert.equal(response.ok, false);
   assert.match(response.error, /did not fully reach the extension/);
 });
 
