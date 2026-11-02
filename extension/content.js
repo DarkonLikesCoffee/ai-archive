@@ -470,6 +470,37 @@
     return results;
   }
 
+  const MAX_ARCHIVED_FILE_BYTES = 100 * 1024 * 1024;
+
+  // Do not duplicate raw binary data in message metadata. The rendered message
+  // and the separately materialized asset already preserve the user-visible
+  // content; background asset matching only needs paths, names and tool inputs.
+  function metadataForAssetMatching(value, key = '') {
+    if (typeof value === 'string') {
+      if (/^(data|base64|bytes)$/i.test(key) && value.length > 256) {
+        return `[omitted binary payload: ${value.length} characters]`;
+      }
+      if (/^data:[^,]+;base64,/i.test(value)) {
+        return `[omitted inline binary payload: ${value.length} characters]`;
+      }
+      return value;
+    }
+    if (Array.isArray(value)) return value.map((item) => metadataForAssetMatching(item, key));
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [
+        childKey,
+        metadataForAssetMatching(child, childKey),
+      ]));
+    }
+    return value;
+  }
+
+  // Oversized assets are represented by metadata and a "Not archived" note in
+  // the GitHub worker; their base64 bytes are never built or transferred.
+  function archivedAssetBase64(buffer) {
+    return buffer.byteLength > MAX_ARCHIVED_FILE_BYTES ? '' : bytesToBase64(buffer);
+  }
+
   async function fetchAsset(url, name, mime, signal) {
     const label = safeAssetName(name);
     if (!url) {
@@ -483,7 +514,7 @@
       return {
         name: label,
         mime: mime || r.headers.get('content-type') || 'application/octet-stream',
-        base64: bytesToBase64(buffer),
+        base64: archivedAssetBase64(buffer),
         size: buffer.byteLength,
         sha256: await sha256Bytes(buffer),
       };
@@ -1129,7 +1160,7 @@
         role: m.sender === 'human' ? 'user' : m.sender || 'assistant',
         content: content || '',
         source_created_at: m.created_at || null,
-        metadata: m,
+        metadata: metadataForAssetMatching(m),
         files: Array.isArray(m.files) ? m.files : [],
         attachments: Array.isArray(m.attachments) ? m.attachments : [],
       };
