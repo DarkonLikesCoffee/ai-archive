@@ -1,5 +1,10 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.13 — bounded large-archive handoff
+- Large syncs no longer serialize all conversations into one giant JSON string. Conversations are serialized into bounded batches and transferred to the background worker incrementally.
+- The content script releases each normalized conversation after its batch has been accepted, reducing peak memory use when syncing large accounts.
+- The background worker validates batch order and the expected conversation count before starting the single GitHub commit.
+
 ## Extension v0.5.12 — tolerate count endpoint rate limits
 - If Claude returns HTTP 429 from the optional `count_all` verification endpoint, the exporter continues with paginated conversation listing. Pagination, duplicate-ID checks, and short-page termination still apply; errors from the actual conversation-list endpoint remain fatal.
 
