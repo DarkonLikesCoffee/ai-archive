@@ -166,10 +166,16 @@ function handleClaude(url) {
   claudeRequests.push(url.pathname);
   const json = (body) => ({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
   if (url.pathname === '/api/organizations') return json([{ uuid: ORG }]);
-  if (url.pathname === `/api/organizations/${ORG}/chat_conversations`) {
-    return json([...claudeConversations.values()]
+  if (url.pathname === '/api/organizations/' + ORG + '/chat_conversations/count_all') {
+    return json({ count: claudeConversations.size });
+  }
+  if (url.pathname === '/api/organizations/' + ORG + '/chat_conversations') {
+    const all = [...claudeConversations.values()]
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
-      .map(({ uuid, name, created_at, updated_at }) => ({ uuid, name, created_at, updated_at })));
+      .map(({ uuid, name, created_at, updated_at }) => ({ uuid, name, created_at, updated_at }));
+    const limit = Number(url.searchParams.get('limit')) || 30;
+    const offset = Number(url.searchParams.get('offset')) || 0;
+    return json(all.slice(offset, offset + limit));
   }
   let m = url.pathname.match(new RegExp(`^/api/organizations/${ORG}/chat_conversations/([^/]+)$`));
   if (m) return claudeConversations.has(m[1]) ? json(claudeConversations.get(m[1])) : { status: 404, body: 'not found' };
