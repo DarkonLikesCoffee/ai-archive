@@ -406,7 +406,7 @@ function Message({ message, assets, assetBusy, anchor }) {
       for(const {path, attribute} of placeholders){
         const cleanPath=decodeURIComponent(String(path||'')).replace(/^\.\//,'').split('#')[0].split('?')[0];
         const asset=assets[path] || assets[cleanPath] || assets[cleanPath.split('/').pop()] || assets[cleanPath.split('/').pop().toLowerCase()];
-        const escapedPath=attribute.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');
+        const escapedPath=attribute.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
         if(asset){
           const dataUrl=isSafeImageDataUrl(asset.dataUrl) ? asset.dataUrl : '';
           const href=asset.htmlUrl || asset.downloadUrl || '#';
