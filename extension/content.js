@@ -1124,7 +1124,15 @@
       message_count: messages.length,
       messages_with_files_total: withFiles.length,
       // Messages carrying files, where attachment problems come from.
-      messages_with_files: shown.map((m) => ({
+      messages_with_files: shown.map((m) => {
+        const toolRefs = new Map();
+        let toolRefNumber = 0;
+        for (const block of (Array.isArray(m?.content) ? m.content : [])) {
+          if (block?.type === 'tool_use' && typeof block.id === 'string') {
+            toolRefs.set(block.id, `tool-${++toolRefNumber}`);
+          }
+        }
+        return {
         message_id: typeof m?.uuid === 'string' ? m.uuid : null,
         sender: sanitizeShape(m?.sender, 'sender'),
         keys: Object.keys(m || {}).sort(),
@@ -1138,6 +1146,8 @@
         tool_blocks: Array.isArray(m?.content)
           ? m.content.filter((block) => block?.type === 'tool_use' || block?.type === 'tool_result').slice(0, 20).map((block) => ({
             type: sanitizeShape(block.type, 'type'),
+            ...(block.type === 'tool_use' && toolRefs.has(block.id) ? { tool_ref: toolRefs.get(block.id) } : {}),
+            ...(block.type === 'tool_result' && toolRefs.has(block.tool_use_id) ? { tool_ref: toolRefs.get(block.tool_use_id) } : {}),
             ...(typeof block.name === 'string' && /^[a-z0-9_.-]{1,48}$/i.test(block.name) ? { name: block.name } : {}),
             ...(block.input && typeof block.input === 'object' ? {
               input_keys: Object.keys(block.input).sort(),
@@ -1150,7 +1160,8 @@
         files: sanitizeShape(m?.files),
         files_v2: sanitizeShape(m?.files_v2),
         attachments: sanitizeShape(m?.attachments),
-      })),
+      };
+      }),
     };
   }
 
