@@ -13,7 +13,7 @@ function loadPopup({ tabs = {} } = {}) {
       elements.set(id, {
         id, value: '', checked: false, disabled: false, textContent: '', className: '', style: {},
         classList: { add() {}, remove() {}, toggle() {} },
-        children: [], replaceChildren(...nodes) { this.children = nodes; },
+        children: [], replaceChildren(...nodes) { this.children = nodes; }, focus() {},
       });
     }
     return elements.get(id);
@@ -25,15 +25,53 @@ function loadPopup({ tabs = {} } = {}) {
   };
   const context = {
     chrome,
-    document: { getElementById: element },
+    document: {
+      getElementById: element,
+      createElement(tag) { return { tagName: tag.toUpperCase(), value: '', textContent: '', disabled: false }; },
+    },
     GITHUB_OWNER: '',
     GITHUB_REPO: '',
     fetch: async () => { throw new Error('unexpected fetch'); },
     setTimeout: (fn) => setImmediate(fn),
   };
-  vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__describeSyncReport = describeSyncReport;\nglobalThis.__sendToClaude = sendToClaude;`, context);
-  return { describeRepoCheck: context.__describeRepoCheck, describeLastSync: context.__describeLastSync, describeSyncReport: context.__describeSyncReport, sendToClaude: context.__sendToClaude, element, chrome };
+  vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__describeSyncReport = describeSyncReport;\nglobalThis.__sendToClaude = sendToClaude;
+globalThis.__renderAccountOptions = renderAccountOptions;
+globalThis.__findExistingAccountName = findExistingAccountName;`, context);
+  return {
+    describeRepoCheck: context.__describeRepoCheck,
+    describeLastSync: context.__describeLastSync,
+    describeSyncReport: context.__describeSyncReport,
+    sendToClaude: context.__sendToClaude,
+    renderAccountOptions: context.__renderAccountOptions,
+    findExistingAccountName: context.__findExistingAccountName,
+    element, chrome
+  };
 }
+
+test('renders saved archive names as selectable options and keeps the selected name', () => {
+  const { renderAccountOptions, element } = loadPopup();
+  const names = JSON.parse(JSON.stringify(renderAccountOptions(['logan', 'work', 'logan'], 'work')));
+  assert.deepEqual(names, ['logan', 'work']);
+  assert.deepEqual(element('accountLogged').children.slice(1).map((option) => option.value), ['logan', 'work']);
+  assert.equal(element('accountLogged').value, 'work');
+  assert.equal(element('sync').disabled, false);
+  assert.equal(element('autoSync').disabled, false);
+});
+
+test('disables syncing until an account is selected', () => {
+  const { renderAccountOptions, element } = loadPopup();
+  renderAccountOptions(['logan', 'work'], '');
+  assert.equal(element('accountLogged').value, '');
+  assert.equal(element('sync').disabled, true);
+  assert.equal(element('autoSync').disabled, true);
+});
+
+test('account creation resolves slug variants to the existing account instead of creating a duplicate', () => {
+  const { findExistingAccountName } = loadPopup();
+  assert.equal(findExistingAccountName('LOGAN', ['logan', 'work']), 'logan');
+  assert.equal(findExistingAccountName('work account', ['work-account']), 'work-account');
+  assert.equal(findExistingAccountName('lohan', ['logan', 'work']), null);
+});
 
 test('explains repository check failures before saving GitHub settings', () => {
   const { describeRepoCheck } = loadPopup();
