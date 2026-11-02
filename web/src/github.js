@@ -1,3 +1,5 @@
+import { normalizeMimeType, isSafeImagePreviewMime, safeRawGitHubDownloadUrl } from './attachmentSecurity.js';
+
 const API = 'https://api.github.com';
 
 export function encodePath(path) { return path.split('/').map(encodeURIComponent).join('/'); }
@@ -191,17 +193,21 @@ export async function readIndex(settings) {
 export async function readAsset(settings, path, metadata = null) {
   const apiPath = `/contents/${encodePath(path)}`;
   const f = await githubRequest(settings, apiPath);
-  const storedMime = String(metadata?.mime || '').split(';')[0].trim();
-  const guessedMime = guessMime(path);
-  const mime = f.type === 'file'
+  const storedMime = normalizeMimeType(metadata?.mime, '');
+  const guessedMime = normalizeMimeType(guessMime(path), '');
+  const apiMime = normalizeMimeType(f?.content_type, '');
+  const mime = f?.type === 'file'
     ? (storedMime && storedMime !== 'application/octet-stream'
       ? storedMime
-      : guessedMime || f.content_type || storedMime || 'application/octet-stream')
+      : guessedMime || apiMime || storedMime || 'application/octet-stream')
     : 'application/octet-stream';
 
   let dataUrl = '';
 
-  const wantsImagePreview = /^image\//i.test(mime);
+  // Only known raster formats are embedded. SVG and unknown image types are
+  // left as downloadable files rather than being rendered as active content.
+  const wantsImagePreview = isSafeImagePreviewMime(mime);
+  const downloadUrl = safeRawGitHubDownloadUrl(f?.download_url);
 
   // For private repositories, do not depend on download_url redirects or on
   // the Contents endpoint deciding whether to include inline content. For an
@@ -224,9 +230,9 @@ export async function readAsset(settings, path, metadata = null) {
   // Last-resort raw fetch, used only for images. Keeping ZIP/PDF/etc. as
   // metadata prevents the dashboard from downloading large attachments just
   // to render a file card.
-  if (wantsImagePreview && !dataUrl && f.download_url) {
+  if (wantsImagePreview && !dataUrl && downloadUrl) {
     try {
-      const r = await fetch(f.download_url, {
+      const r = await fetch(downloadUrl, {
         headers: {
           Authorization: `Bearer ${settings.token}`,
           Accept: 'application/octet-stream',
@@ -250,8 +256,9 @@ export async function readAsset(settings, path, metadata = null) {
     mime,
     dataUrl,
     sha: f.sha,
-    htmlUrl: f.html_url,
-    downloadUrl: f.download_url,
+    // Construct this link locally; do not trust a URL from archive/API metadata.
+    htmlUrl: githubBlobUrl(settings, path),
+    downloadUrl,
     size: f.size,
   };
 }
