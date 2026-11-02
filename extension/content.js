@@ -101,7 +101,7 @@
       throw new Error('Claude returned ' + data.length + ' of ' + expectedBefore + ' conversations reported by count_all. No archive changes were submitted to GitHub; retry the sync.');
     }
 
-    const expectedAfter = await conversationCount(org, signal);
+    const expectedAfter = expectedBefore === null ? null : await conversationCount(org, signal);
     if (expectedBefore !== null && expectedAfter !== null && expectedAfter !== expectedBefore) {
       throw new Error('Claude conversation count changed during pagination (' + expectedBefore + ' to ' + expectedAfter + '). No archive changes were submitted to GitHub; retry the sync.');
     }
