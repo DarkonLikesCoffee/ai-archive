@@ -4,6 +4,97 @@ let activeSync = false;
 
 async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'last_sync', 'last_sync_diagnostics']); }
 
+let selectedArchiveAccount = '';
+let knownArchiveAccounts = [];
+
+function normalizeAccountName(value) {
+  return String(value ?? '').trim().replace(/\s+/g, ' ');
+}
+
+function accountSlug(value) {
+  return String(value || 'personal').trim().toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'personal';
+}
+
+function findExistingAccountName(value, accounts = knownArchiveAccounts) {
+  const slug = accountSlug(value);
+  return accounts.find((account) => accountSlug(account) === slug) || null;
+}
+
+function renderAccountOptions(accounts, selected) {
+  const current = normalizeAccountName(selected);
+  const names = [...new Set(
+    (Array.isArray(accounts) ? accounts : []).map(normalizeAccountName).filter(Boolean),
+  )].sort((a, b) => a.localeCompare(b));
+  if (current && !names.includes(current)) names.push(current);
+  knownArchiveAccounts = names;
+
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Choose an archive account…';
+  placeholder.disabled = true;
+  const options = names.map((name) => {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name;
+    return option;
+  });
+  $('accountLogged').replaceChildren(placeholder, ...options);
+  $('accountLogged').value = current;
+  selectedArchiveAccount = current;
+  $('sync').disabled = !current;
+  $('autoSync').disabled = !current;
+  return names;
+}
+
+function updateAccountText(stored, account) {
+  $('accountText').textContent = account
+    ? `GitHub: ${stored.github_owner}/${stored.github_repo} · account: ${account}`
+    : `GitHub: ${stored.github_owner}/${stored.github_repo} · select an archive account`;
+}
+
+async function chooseArchiveAccount(value) {
+  const account = normalizeAccountName(value);
+  if (!account || !knownArchiveAccounts.includes(account)) {
+    throw new Error('Choose an account from the saved account list, or create a new one.');
+  }
+  await chrome.storage.local.set({ archive_account: account });
+  const stored = await settings();
+  $('accountLogged').value = account;
+  selectedArchiveAccount = account;
+  $('sync').disabled = activeSync || !selectedArchiveAccount;
+  $('autoSync').disabled = false;
+  updateAccountText(stored, account);
+  return account;
+}
+
+async function createArchiveAccount() {
+  const requested = normalizeAccountName($('newAccountName').value);
+  if (!requested) throw new Error('Enter a name for the new archive account.');
+  if (requested.length > 80 || /[\u0000-\u001f\u007f]/.test(requested)) {
+    throw new Error('Use an account name of at most 80 characters without control characters.');
+  }
+
+  const existing = findExistingAccountName(requested);
+  if (existing) {
+    await chooseArchiveAccount(existing);
+    $('newAccountSection').classList.add('hidden');
+    $('newAccountName').value = '';
+    status.className = 'status ok';
+    status.textContent = `"${requested}" already maps to the existing account "${existing}". That account was selected; no duplicate was created.`;
+    return existing;
+  }
+
+  const accounts = [...knownArchiveAccounts, requested];
+  renderAccountOptions(accounts, requested);
+  await chooseArchiveAccount(requested);
+  $('newAccountSection').classList.add('hidden');
+  $('newAccountName').value = '';
+  status.className = 'status ok';
+  status.textContent = `New archive account "${requested}" created and selected. Its conversations will be kept separate.`;
+  return requested;
+}
+
 // One line about the most recent finished sync (manual or automatic), so an
 // unattended automatic sync's success or failure is visible.
 function describeLastSync(record, now = Date.now()) {
@@ -107,16 +198,43 @@ async function refresh() {
   const s = await settings();
   $('owner').value = s.github_owner || GITHUB_OWNER || '';
   $('repo').value = s.github_repo || GITHUB_REPO || '';
-  $('accountSetup').value = s.archive_account || 'personal';
-  $('accountLogged').value = s.archive_account || 'personal';
   $('autoSync').checked = s.auto_sync === true;
   $('lastSync').textContent = describeLastSync(s.last_sync);
   showSyncReport(s.last_sync?.report);
   showDiagnostics(s.last_sync_diagnostics);
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
-    $('accountText').textContent = `GitHub: ${s.github_owner}/${s.github_repo} · account: ${s.archive_account || 'personal'}`;
+    const storedAccount = normalizeAccountName(s.archive_account);
+    let accounts = [];
+    let accountError = '';
+    try {
+      const response = await chrome.runtime.sendMessage({ type: 'getArchiveAccounts' });
+      if (response?.ok && Array.isArray(response.accounts)) accounts = response.accounts;
+      else accountError = response?.error || 'Could not load saved archive accounts.';
+    } catch (error) {
+      accountError = error?.message || 'Could not load saved archive accounts.';
+    }
+
+    let selected = storedAccount;
+    if (!selected && !accountError) {
+      if (accounts.length === 1) selected = accounts[0];
+      else if (accounts.length === 0) selected = 'personal';
+    }
+    renderAccountOptions(accounts, selected);
+    if (selected && selected !== storedAccount) {
+      await chrome.storage.local.set({ archive_account: selected });
+    }
+    $('accountHelp').textContent = accountError
+      ? `Could not refresh saved account names. Your saved selection is unchanged. ${accountError}`
+      : accounts.length > 1 && !selected
+        ? 'Several accounts already exist. Select the correct one before syncing; or create a new account intentionally.'
+        : 'Select an existing account, or create a new one. The selected account is remembered for future syncs.';
+    updateAccountText(s, selected);
   } else {
+    selectedArchiveAccount = '';
+    knownArchiveAccounts = [];
+    $('sync').disabled = true;
+    $('autoSync').disabled = true;
     $('setup').classList.remove('hidden'); $('logged').classList.add('hidden');
   }
 }
@@ -187,7 +305,7 @@ function describeRepoCheck(status, data, owner, repo) {
 
 $('save').onclick = async () => {
   try {
-    const owner = $('owner').value.trim(), repo = $('repo').value.trim(), token = $('token').value.trim(), account = $('accountSetup').value.trim() || 'personal';
+    const owner = $('owner').value.trim(), repo = $('repo').value.trim(), token = $('token').value.trim();
     if (!owner || !repo || !token) throw Error('Owner, repository and token are required.');
     status.className = 'status'; status.textContent = 'Checking GitHub…';
     const r = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } });
@@ -195,18 +313,51 @@ $('save').onclick = async () => {
     try { data = await r.json(); } catch {}
     const problem = describeRepoCheck(r.status, data, owner, repo);
     if (problem) throw Error(problem);
-    await chrome.storage.local.set({ github_owner: owner, github_repo: repo, github_token: token, archive_account: account, auto_sync: false, auto_sync_configured: true });
+    await chrome.storage.local.remove('archive_account');
+    await chrome.storage.local.set({ github_owner: owner, github_repo: repo, github_token: token, auto_sync: false, auto_sync_configured: true });
     status.className = 'status ok'; status.textContent = 'GitHub settings saved. Automatic sync is OFF.'; await refresh();
   } catch (e) { status.className = 'status err'; status.textContent = e.message; }
 };
 
 $('accountLogged').onchange = async () => {
-  const account = $('accountLogged').value.trim() || 'personal';
-  await chrome.storage.local.set({ archive_account: account });
-  $('accountText').textContent = `GitHub: ${(await settings()).github_owner}/${(await settings()).github_repo} · account: ${account}`;
+  try {
+    await chooseArchiveAccount($('accountLogged').value);
+    status.className = 'status ok';
+    status.textContent = 'Archive account selected.';
+  } catch (error) {
+    status.className = 'status err';
+    status.textContent = error.message;
+    await refresh();
+  }
+};
+
+$('addAccount').onclick = () => {
+  $('newAccountName').value = '';
+  $('newAccountSection').classList.remove('hidden');
+  $('newAccountName').focus();
+};
+
+$('cancelAddAccount').onclick = () => {
+  $('newAccountSection').classList.add('hidden');
+  $('newAccountName').value = '';
+};
+
+$('createAccount').onclick = async () => {
+  try {
+    await createArchiveAccount();
+  } catch (error) {
+    status.className = 'status err';
+    status.textContent = error.message;
+  }
 };
 
 $('autoSync').onchange = async () => {
+  if (!selectedArchiveAccount) {
+    $('autoSync').checked = false;
+    status.className = 'status err';
+    status.textContent = 'Select an archive account before enabling automatic sync.';
+    return;
+  }
   await chrome.storage.local.set({ auto_sync: $('autoSync').checked, auto_sync_configured: true });
   status.className = 'status ok';
   status.textContent = $('autoSync').checked
@@ -216,6 +367,7 @@ $('autoSync').onchange = async () => {
 
 $('sync').onclick = async () => {
   try {
+    if (!selectedArchiveAccount) throw new Error('Select an archive account before syncing.');
     const limit = $('syncLimit').value;
     status.className = 'status'; status.textContent = `Starting sync (${limit === 'all' ? 'all conversations' : `latest ${limit}`})…`;
     setProgress({ stage: 'fetching', current: 0, total: 0 });
