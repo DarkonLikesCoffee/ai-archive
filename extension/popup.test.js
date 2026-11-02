@@ -25,7 +25,7 @@ function loadPopup({ tabs = {} } = {}) {
       set: async (values) => { Object.assign(storedSettings, values); },
       remove: async (keys) => { for (const key of (Array.isArray(keys) ? keys : [keys])) delete storedSettings[key]; },
     } },
-    runtime: { lastError: null, onMessage: { addListener() {} }, sendMessage() { return Promise.resolve(); } },
+    runtime: { lastError: null, getManifest() { return { version: '0.5.9' }; }, onMessage: { addListener() {} }, sendMessage() { return Promise.resolve(); } },
     tabs: { query: async () => [], ...tabs },
   };
   const context = {
@@ -42,7 +42,10 @@ function loadPopup({ tabs = {} } = {}) {
   vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__describeSyncReport = describeSyncReport;\nglobalThis.__sendToClaude = sendToClaude;
 globalThis.__renderAccountOptions = renderAccountOptions;
 globalThis.__findExistingAccountName = findExistingAccountName;
-globalThis.__createArchiveAccount = createArchiveAccount;`, context);
+globalThis.__createArchiveAccount = createArchiveAccount;
+globalThis.__loadDiagnostics = loadDiagnostics;
+globalThis.__isCurrentDiagnosticReport = isCurrentDiagnosticReport;
+globalThis.__getLastDiagnostics = () => lastDiagnostics;`, context);
   return {
     describeRepoCheck: context.__describeRepoCheck,
     describeLastSync: context.__describeLastSync,
@@ -51,6 +54,9 @@ globalThis.__createArchiveAccount = createArchiveAccount;`, context);
     renderAccountOptions: context.__renderAccountOptions,
     findExistingAccountName: context.__findExistingAccountName,
     createArchiveAccount: context.__createArchiveAccount,
+    loadDiagnostics: context.__loadDiagnostics,
+    isCurrentDiagnosticReport: context.__isCurrentDiagnosticReport,
+    getLastDiagnostics: context.__getLastDiagnostics,
     element, chrome, storedSettings
   };
 }
@@ -101,6 +107,30 @@ test('creating a slug variant selects the existing account instead of creating a
   assert.equal(storedSettings.archive_account, 'work-account');
   assert.equal(storedSettings.archive_account_pending, false);
   assert.match(element('status').textContent, /no duplicate was created/);
+});
+
+test('clears a persisted diagnostic report created by an older extension version', async () => {
+  const { loadDiagnostics, getLastDiagnostics, element, storedSettings } = loadPopup();
+  const stale = { extension_version: '0.5.8', items: [{ outcome: 'failed' }] };
+  storedSettings.last_sync_diagnostics = stale;
+  await loadDiagnostics(stale);
+  assert.equal('last_sync_diagnostics' in storedSettings, false,
+    'the obsolete persistent record should be removed from extension storage');
+  assert.equal(getLastDiagnostics(), null, 'an older report should not be offered for copying');
+});
+
+test('keeps diagnostics from the current extension version visible', async () => {
+  const { loadDiagnostics, getLastDiagnostics } = loadPopup();
+  const current = { extension_version: '0.5.9', items: [{ outcome: 'incomplete' }] };
+  await loadDiagnostics(current);
+  assert.deepEqual(JSON.parse(JSON.stringify(getLastDiagnostics())), current);
+});
+
+test('does not consider a legacy diagnostic report without a version current', () => {
+  const { isCurrentDiagnosticReport } = loadPopup();
+  assert.equal(isCurrentDiagnosticReport({ items: [{ outcome: 'failed' }] }), false);
+  assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.8', items: [{ outcome: 'failed' }] }), false);
+  assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.9', items: [{ outcome: 'failed' }] }), true);
 });
 
 test('explains repository check failures before saving GitHub settings', () => {
