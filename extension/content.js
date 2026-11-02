@@ -1132,6 +1132,21 @@
         tool_names: Array.isArray(m?.content)
           ? [...new Set(m.content.filter((block) => block?.type === 'tool_use' && /^[a-z0-9_.-]{1,48}$/i.test(String(block.name || ''))).map((block) => block.name))]
           : [],
+        // Preserve only the structure of tool activity on messages with files.
+        // This can reveal whether a file path/identifier is passed to a tool,
+        // without recording prompts, command text, file contents, or credentials.
+        tool_blocks: Array.isArray(m?.content)
+          ? m.content.filter((block) => block?.type === 'tool_use' || block?.type === 'tool_result').slice(0, 20).map((block) => ({
+            type: sanitizeShape(block.type, 'type'),
+            ...(typeof block.name === 'string' && /^[a-z0-9_.-]{1,48}$/i.test(block.name) ? { name: block.name } : {}),
+            ...(block.input && typeof block.input === 'object' ? {
+              input_keys: Object.keys(block.input).sort(),
+              input_shape: sanitizeShape(block.input),
+            } : {}),
+            ...(block.content !== undefined ? { content_shape: sanitizeShape(block.content) } : {}),
+            ...(typeof block.is_error === 'boolean' ? { is_error: block.is_error } : {}),
+          }))
+          : [],
         files: sanitizeShape(m?.files),
         files_v2: sanitizeShape(m?.files_v2),
         attachments: sanitizeShape(m?.attachments),
