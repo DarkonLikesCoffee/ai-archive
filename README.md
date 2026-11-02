@@ -1,5 +1,9 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.11 — paginated conversation discovery
+- **All conversations** now loads Claude's conversation list in 30-item pages using the observed `limit`/`offset` parameters.
+- The exporter checks the returned total against Claude's `count_all` endpoint before and after pagination. Malformed, overlapping, incomplete, or changing lists abort before the GitHub handoff, so a partial list cannot be mistaken for a complete sync.
+
 ## Extension v0.5.10 — disconnect cleanup
 - Disconnect now removes GitHub credentials, account selection, the last sync summary, and the stored diagnostic report.
 - The popup clears the visible sync status and diagnostic controls immediately, preventing stale information from carrying into a later connection.
@@ -103,7 +107,7 @@ Enter the owner, repository, and the read-only token. Before the first sync, the
 
 - Claude.ai is the only provider so far.
 - The extension reads Claude.ai's internal web API, which can change without notice.
-- **All conversations** relies on Claude.ai returning the full conversation list in one response, which is how it is read today. This has not been verified against very large accounts. If an **All conversations** sync does not receive a conversation that is already archived for that account (deleted in Claude, or a truncated list), the completion message reports how many; their archived copies are always kept.
+- Claude's conversation-list and `count_all` endpoints are undocumented internal web APIs and may change. Pagination is cross-checked against `count_all` when available; if the count endpoint is unavailable, the exporter falls back to stopping at a short page, which cannot independently prove that Claude did not truncate that page. Very large accounts should still be verified with a real-account sync.
 
 ## Testing
 
