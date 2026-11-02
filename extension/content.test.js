@@ -2596,7 +2596,7 @@ function plainConversation(uuid, extraContent = []) {
 
 
 test('transfers asset bytes separately and strips duplicated inline base64 from raw message metadata', async () => {
-  const base64 = Buffer.from('large-ish inline attachment payload for transfer', 'utf8').toString('base64');
+  const base64 = Buffer.alloc(512, 97).toString('base64');
   const conversation = {
     uuid: 'conversation-with-inline-asset',
     name: 'Inline asset transfer',
