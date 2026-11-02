@@ -860,6 +860,24 @@ test('does not hand off a truncated multi-page list when it disagrees with count
   assert.equal(harness.handoffs.length, 0, 'an incomplete list must never reach the GitHub sync');
 });
 
+test('aborts when Claude conversation count changes while pages are being read', async () => {
+  const list = [{
+    uuid: 'conversation-0',
+    name: 'Conversation 0',
+    updated_at: '2026-10-26T08:30:00.000Z',
+  }];
+  const harness = createHarness(plainConversation('conversation-0'), {
+    conversationListResponse: list,
+    conversationCountResponse: (_url, requestIndex) => ({ count: requestIndex === 0 ? 1 : 2 }),
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+  assert.match(error.error, /count changed during pagination/);
+  assert.equal(harness.handoffs.length, 0, 'a moving list must never reach the GitHub sync');
+  assert.equal(harness.requests.filter((url) => url.includes('/chat_conversations/count_all')).length, 2);
+});
+
 test('rejects duplicate conversation IDs that appear on separate pages', async () => {
   const list = Array.from({ length: 31 }, (_, index) => ({
     uuid: index === 30 ? 'conversation-0' : 'conversation-' + index,
