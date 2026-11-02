@@ -2519,7 +2519,7 @@ test('attachment diagnostics preserve sanitized tool input structure without rec
   const harness = createHarness(conversation, {
     sandboxListStatus: 404,
     assetResponses: {
-      '/api/org-id/files/99999999-8888-4777-8666-555555555555/content': { status: 404 },
+      '/api/organizations/org-id/files/99999999-8888-4777-8666-555555555555/contents': { status: 404 },
     },
     storage: {},
   });
@@ -2640,13 +2640,13 @@ test('a blob upload no path form serves stays visibly not archived, and diagnost
   harness.finishFirstHandoff({ ok: true });
 });
 
-test('downloads a files-api blob through the same-origin content route', async () => {
+test('downloads a files-api blob through the same-origin contents route', async () => {
   const conversation = realUploadConversation('conv-download-source', {
     created_at: '2026-10-20T10:00:00.000000+00:00', download_source: 'files-api', file_kind: 'blob',
     file_name: 'proyecto.zip', file_uuid: 'blob-2', size_bytes: 71356, success: true, uuid: 'blob-2',
   });
   conversation.is_wiggle_enabled = false;
-  const url = '/api/org-id/files/blob-2/content';
+  const url = '/api/organizations/org-id/files/blob-2/contents';
   const harness = createHarness(conversation, {
     sandboxListStatus: 404,
     assetResponses: { [url]: { content: 'real zip bytes', contentType: 'application/zip' } },
@@ -2659,7 +2659,7 @@ test('downloads a files-api blob through the same-origin content route', async (
   assert.equal(exported.assets[0].source, 'message');
   assert.equal(exported.assets[0].file_uuid, 'blob-2');
   assert.equal(Buffer.from(exported.assets[0].base64, 'base64').toString('utf8'), 'real zip bytes');
-  assert.ok(harness.requests.includes(url), 'the file UUID is fetched from Claude’s same-origin content route');
+  assert.ok(harness.requests.includes(url), 'the file UUID is fetched from Claude’s same-origin contents route');
   assert.equal(harness.requests.some((request) => request.includes('download-file')), false);
   harness.finishFirstHandoff({ ok: true });
 });
@@ -2670,7 +2670,7 @@ test('a files-api blob that returns 404 stays incomplete and records the attempt
     file_name: 'proyecto.zip', file_uuid: 'blob-2', size_bytes: 71356, success: true, uuid: 'blob-2',
   });
   conversation.is_wiggle_enabled = false;
-  const url = '/api/org-id/files/blob-2/content';
+  const url = '/api/organizations/org-id/files/blob-2/contents';
   const harness = createHarness(conversation, {
     sandboxListStatus: 404,
     assetResponses: { [url]: { status: 404 } },
@@ -2695,7 +2695,7 @@ test('does not try the files-api route for entries that are not marked as files-
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   const [exported] = (await harness.firstHandoff).conversations;
   assert.equal(exported.incomplete.length, 1);
-  assert.equal(harness.requests.some((url) => url.includes('/files/blob-3/content')), false,
+  assert.equal(harness.requests.some((url) => url.includes('/files/blob-3/contents')), false,
     'unknown file shapes must not trigger guessed downloads');
   harness.finishFirstHandoff({ ok: true });
 });
