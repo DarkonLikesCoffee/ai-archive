@@ -1,5 +1,10 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.14 — isolate attachment payloads
+- Raw Claude message metadata no longer duplicates inline base64 binary content already extracted into assets.
+- Attachment bytes are transferred separately from conversation JSON in bounded chunks, so a single conversation with many large attachments does not need one enormous JSON string.
+- Files over GitHub's 100 MiB limit keep their size/hash metadata and visible "Not archived" note without generating or transferring their base64 data.
+
 ## Extension v0.5.13 — bounded large-archive handoff
 - Large syncs no longer serialize all conversations into one giant JSON string. Conversations are serialized into bounded batches and transferred to the background worker incrementally.
 - The content script releases each normalized conversation after its batch has been accepted, reducing peak memory use when syncing large accounts.
