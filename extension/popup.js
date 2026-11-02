@@ -144,9 +144,35 @@ function showSyncReport(report) {
 // The sanitized diagnostics the content script stored for the last sync (see
 // sanitizeShape in content.js), offered for copying when there are any.
 let lastDiagnostics = null;
+
+function currentExtensionVersion() {
+  try { return chrome.runtime?.getManifest?.()?.version || null; }
+  catch { return null; }
+}
+
+function isCurrentDiagnosticReport(diagnostics) {
+  const version = currentExtensionVersion();
+  return Boolean(version
+    && diagnostics?.extension_version === version
+    && Array.isArray(diagnostics.items)
+    && diagnostics.items.length);
+}
+
 function showDiagnostics(diagnostics) {
-  lastDiagnostics = Array.isArray(diagnostics?.items) && diagnostics.items.length ? diagnostics : null;
+  lastDiagnostics = isCurrentDiagnosticReport(diagnostics) ? diagnostics : null;
   $('copyDiagnostics')?.classList.toggle('hidden', !lastDiagnostics);
+}
+
+// Old extension versions wrote diagnostics without a version. Clear those
+// records on upgrade instead of surfacing an unrelated report indefinitely.
+async function loadDiagnostics(diagnostics) {
+  const version = currentExtensionVersion();
+  if (diagnostics && version && diagnostics.extension_version !== version) {
+    try { await chrome.storage.local.remove('last_sync_diagnostics'); } catch {}
+    showDiagnostics(null);
+    return;
+  }
+  showDiagnostics(diagnostics);
 }
 
 function diagnosticReportText(diagnostics, version) {
@@ -201,7 +227,7 @@ async function refresh() {
   $('autoSync').checked = s.auto_sync === true;
   $('lastSync').textContent = describeLastSync(s.last_sync);
   showSyncReport(s.last_sync?.report);
-  showDiagnostics(s.last_sync_diagnostics);
+  await loadDiagnostics(s.last_sync_diagnostics);
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
     const storedAccount = normalizeAccountName(s.archive_account);
@@ -409,7 +435,7 @@ $('cancel').onclick = async () => {
   chrome.runtime.sendMessage({ type: 'cancelSync' }).catch(() => {});
 };
 
-$('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'archive_account_pending', 'auto_sync', 'auto_sync_configured']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
+$('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'archive_account_pending', 'auto_sync', 'auto_sync_configured', 'last_sync_diagnostics']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
 
 $('copyDiagnostics').onclick = async () => {
   if (!lastDiagnostics) return;
@@ -426,10 +452,13 @@ $('copyDiagnostics').onclick = async () => {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'syncProgress') return;
   setProgress(msg);
+  if (msg.stage === 'fetching' && Number(msg.current) === 0) {
+    showDiagnostics(null);
+  }
   if (['done', 'error', 'cancelled'].includes(msg.stage)) {
     $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error, partial: msg.partial === true });
     showSyncReport(msg.report);
-    chrome.storage.local.get('last_sync_diagnostics').then((stored) => showDiagnostics(stored.last_sync_diagnostics)).catch(() => {});
+    chrome.storage.local.get('last_sync_diagnostics').then((stored) => loadDiagnostics(stored.last_sync_diagnostics)).catch(() => showDiagnostics(null));
   }
 });
 chrome.runtime.sendMessage({ type: 'getSyncState' }, (state) => { if (!chrome.runtime.lastError && state?.running) setProgress(state); });
