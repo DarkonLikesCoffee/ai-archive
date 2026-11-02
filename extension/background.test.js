@@ -1414,7 +1414,7 @@ function archivedEntry(id, extra = {}) {
   };
 }
 
-test('archive account picker lists unique Claude account names and the current account', async () => {
+test('archive account picker lists unique Claude account names from the archive index', async () => {
   const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [
     { provider: 'claude', account: 'logan' },
     { provider: 'claude', account: 'work' },
@@ -1423,7 +1423,7 @@ test('archive account picker lists unique Claude account names and the current a
   ] });
   const harness = makeBackgroundSyncHarness({ indexText });
   const accounts = JSON.parse(JSON.stringify(await harness.archiveAccounts()));
-  assert.deepEqual(accounts, ['logan', 'personal', 'work']);
+  assert.deepEqual(accounts, ['logan', 'work']);
   assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/trees/base-tree')), false,
     'account discovery should read the index without downloading the full repository tree');
 });
@@ -1434,7 +1434,7 @@ test('archive account picker reads account names when a large index needs blob f
   ] });
   const harness = makeBackgroundSyncHarness({ indexText, indexEncoding: 'none' });
   const accounts = JSON.parse(JSON.stringify(await harness.archiveAccounts()));
-  assert.deepEqual(accounts, ['personal', 'work']);
+  assert.deepEqual(accounts, ['work']);
   assert.ok(harness.requests.some((request) => request.pathname.endsWith('/git/blobs/large-index-blob')));
 });
 
