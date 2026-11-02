@@ -26,6 +26,7 @@ function createHarness(conversation, {
   sandboxDownloadDelays = {},
   sandboxListStatus = 200,
   conversationListResponse = null,
+  conversationCountResponse = null,
   fullConversationResponse = null,
   assetResponses = {},
   downloadDelayMs = 0,
@@ -68,7 +69,7 @@ function createHarness(conversation, {
     } : {}),
     runtime: {
       lastError: null,
-      getManifest() { return { version: '0.5.9' }; },
+      getManifest() { return { version: '0.5.11' }; },
       onMessage: {
         addListener(listener) {
           listeners.push(listener);
@@ -105,8 +106,10 @@ function createHarness(conversation, {
     },
   };
 
+  let conversationCountRequestIndex = 0;
   const fetch = async (url) => {
     const requestUrl = String(url);
+    const parsedUrl = new URL(requestUrl, 'https://claude.ai');
     requests.push(requestUrl);
     if (/^https?:\/\//i.test(requestUrl) || requestUrl in assetResponses) {
       const configured = assetResponses[requestUrl] || {};
@@ -129,13 +132,30 @@ function createHarness(conversation, {
       }
     }
     if (url === '/api/organizations') return jsonResponse([{ uuid: 'org-id' }]);
-    if (url === '/api/organizations/org-id/chat_conversations') {
-      return jsonResponse(conversationListResponse ?? [{
+    if (parsedUrl.pathname === '/api/organizations/org-id/chat_conversations/count_all') {
+      const configured = typeof conversationCountResponse === 'function'
+        ? conversationCountResponse(parsedUrl, conversationCountRequestIndex++)
+        : conversationCountResponse;
+      const defaultList = conversationListResponse ?? [{
         uuid: conversation?.uuid || 'conversation-1',
         name: 'Exporter regression test',
         created_at: '2026-10-26T08:00:00.000Z',
         updated_at: '2026-10-26T08:30:00.000Z',
-      }]);
+      }];
+      const countPayload = configured ?? { count: Array.isArray(defaultList) ? defaultList.length : 0 };
+      return jsonResponse(Number.isSafeInteger(countPayload) ? { count: countPayload } : countPayload);
+    }
+    if (parsedUrl.pathname === '/api/organizations/org-id/chat_conversations') {
+      const listPayload = conversationListResponse ?? [{
+        uuid: conversation?.uuid || 'conversation-1',
+        name: 'Exporter regression test',
+        created_at: '2026-10-26T08:00:00.000Z',
+        updated_at: '2026-10-26T08:30:00.000Z',
+      }];
+      if (!Array.isArray(listPayload)) return jsonResponse(listPayload);
+      const pageSize = Number(parsedUrl.searchParams.get('limit')) || 30;
+      const offset = Number(parsedUrl.searchParams.get('offset')) || 0;
+      return jsonResponse(listPayload.slice(offset, offset + pageSize));
     }
     if (/\/chat_conversations\/[^/?]+\?/.test(String(url))) {
       if (typeof fullConversationResponse === 'function') {
@@ -794,6 +814,67 @@ test('refuses malformed Claude conversation-list payloads before fetching conver
     );
     assert.equal(harness.handoffs.length, 0, 'invalid list data must never reach GitHub');
   }
+});
+
+
+
+test('paginates the full Claude conversation list and verifies the count before and after', async () => {
+  const list = Array.from({ length: 65 }, (_, index) => ({
+    uuid: 'conversation-' + index,
+    name: 'Conversation ' + index,
+    created_at: '2026-10-26T08:00:00.000Z',
+    updated_at: '2026-10-26T08:30:00.000Z',
+  }));
+  const archiveState = list.map((item) => ({ id: item.uuid, updated_at: item.updated_at }));
+  const harness = createHarness(plainConversation('conversation-0'), { conversationListResponse: list, archiveState });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.equal(handoff.listed, 65);
+  assert.equal(handoff.conversations.length, 0, 'all already archived conversations should remain incremental');
+  assert.deepEqual(Array.from(handoff.unchangedIds), list.map((item) => item.uuid));
+  const pages = harness.requests.filter((url) => url.includes('/chat_conversations?'));
+  assert.equal(pages.length, 3);
+  assert.ok(pages[0].includes('limit=30') && pages[0].includes('offset=0'));
+  assert.ok(pages[1].includes('limit=30') && pages[1].includes('offset=30'));
+  assert.ok(pages[2].includes('limit=30') && pages[2].includes('offset=60'));
+  assert.equal(harness.requests.filter((url) => url.includes('/chat_conversations/count_all')).length, 2);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('does not hand off a truncated multi-page list when it disagrees with count_all', async () => {
+  const list = Array.from({ length: 35 }, (_, index) => ({
+    uuid: 'conversation-' + index,
+    name: 'Conversation ' + index,
+    updated_at: '2026-10-26T08:30:00.000Z',
+  }));
+  const harness = createHarness(plainConversation('conversation-0'), {
+    conversationListResponse: list,
+    conversationCountResponse: { count: 40 },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+  assert.match(error.error, /returned 35 of 40 conversations/);
+  assert.equal(harness.handoffs.length, 0, 'an incomplete list must never reach the GitHub sync');
+});
+
+test('rejects duplicate conversation IDs that appear on separate pages', async () => {
+  const list = Array.from({ length: 31 }, (_, index) => ({
+    uuid: index === 30 ? 'conversation-0' : 'conversation-' + index,
+    name: 'Conversation ' + index,
+    updated_at: '2026-10-26T08:30:00.000Z',
+  }));
+  const harness = createHarness(plainConversation('conversation-0'), {
+    conversationListResponse: list,
+    conversationCountResponse: { count: 31 },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+  assert.match(error.error, /duplicate conversation UUID .* across pages/);
+  assert.equal(harness.handoffs.length, 0, 'overlapping pages must never reach the GitHub sync');
 });
 
 test('refuses a full-conversation response whose UUID differs from the requested conversation', async () => {
@@ -2468,7 +2549,7 @@ test('a new sync clears the previous diagnostic report before work begins, inclu
   assert.equal(failure.stage, 'error', 'the malformed Claude list should fail before export');
   assert.deepEqual(JSON.parse(JSON.stringify(harness.storageState.last_sync_diagnostics.items)), [],
     'diagnostics from the previous sync must be removed even when the new sync fails before collecting conversations');
-  assert.equal(harness.storageState.last_sync_diagnostics.extension_version, '0.5.9');
+  assert.equal(harness.storageState.last_sync_diagnostics.extension_version, '0.5.11');
 });
 
 test('a sync stores a sanitized diagnostic for each conversation not archived completely, with nothing private in it', async () => {
@@ -2491,7 +2572,7 @@ test('a sync stores a sanitized diagnostic for each conversation not archived co
   for (const secret of [secretText, 'Base de datos', 'BD-GICD', 'SECRET-TOKEN', 'sig=', '99999999-8888', 'aaaaaaaa-bbbb']) {
     assert.equal(text.includes(secret), false, `diagnostics must not contain ${secret}`);
   }
-  assert.equal(stored.extension_version, '0.5.9');
+  assert.equal(stored.extension_version, '0.5.11');
   assert.equal(stored.items.length, 1);
   const [item] = stored.items;
   assert.equal(item.conversation_id, '11111111-2222-4333-8444-555555555555', 'the conversation ID is kept so the owner can match it');
