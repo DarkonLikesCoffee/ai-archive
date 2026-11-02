@@ -1,4 +1,4 @@
-# AI Archive Dashboard v0.6.13
+# AI Archive Dashboard v0.6.14
 
 Web dashboard for browsing the AI conversation archive stored in a private GitHub repository.
 
@@ -48,3 +48,8 @@ node e2e/viewer.e2e.cjs
 - Only known raster image formats are embedded; SVG and unsupported image types remain downloadable attachments.
 - Attachment links are restricted to official GitHub hosts and dynamic HTML attributes and labels are escaped.
 - Raw attachment downloads are restricted to `raw.githubusercontent.com` before the GitHub token is sent.
+
+
+## v0.6.14
+- Fixed the conversation prompt outline so entries no longer shrink when there are many prompts.
+- Added a themed scrollbar to the prompt outline, allowing long lists to scroll independently.
