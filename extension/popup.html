@@ -23,7 +23,14 @@
 </section>
 <section id="logged" class="section hidden">
   <div id="accountText" class="muted"></div>
-  <label>Archive account name</label><input id="accountLogged" placeholder="personal">
+  <label>Archive account</label><select id="accountLogged"></select>
+  <p id="accountHelp" class="hint">Choose an existing account, or create a new one.</p>
+  <button id="addAccount" class="secondary" type="button">+ Create new account</button>
+  <div id="newAccountSection" class="hidden">
+    <label for="newAccountName">New account name</label><input id="newAccountName" placeholder="e.g. work">
+    <button id="createAccount" type="button">Create and use account</button>
+    <button id="cancelAddAccount" class="secondary" type="button">Cancel</button>
+  </div>
   <label>Conversations to save</label>
   <select id="syncLimit">
     <option value="10">Latest 10</option>
