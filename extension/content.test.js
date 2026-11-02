@@ -2647,7 +2647,7 @@ test('downloads a files-api blob through the same-origin content route', async (
   const [exported] = (await harness.firstHandoff).conversations;
   assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), []);
   assert.equal(exported.assets.length, 1);
-  assert.equal(exported.assets[0].source, 'message-files-api');
+  assert.equal(exported.assets[0].source, 'message');
   assert.equal(exported.assets[0].file_uuid, 'blob-2');
   assert.equal(Buffer.from(exported.assets[0].base64, 'base64').toString('utf8'), 'real zip bytes');
   assert.ok(harness.requests.includes(url), 'the file UUID is fetched from Claude’s same-origin content route');
