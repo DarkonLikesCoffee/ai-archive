@@ -68,6 +68,7 @@ function createHarness(conversation, {
     } : {}),
     runtime: {
       lastError: null,
+      getManifest() { return { version: '0.5.9' }; },
       onMessage: {
         addListener(listener) {
           listeners.push(listener);
@@ -2452,6 +2453,24 @@ test('an uploaded file whose download is HTTP 404 is still archived from the san
   harness.finishFirstHandoff({ ok: true });
 });
 
+test('a new sync clears the previous diagnostic report before work begins, including when fetching fails early', async () => {
+  const stale = {
+    at: '2026-11-01T12:00:00.000Z',
+    extension_version: '0.5.8',
+    items: [{ outcome: 'failed', error: 'previous sync failure' }],
+  };
+  const harness = createHarness(plainConversation('conv-clears-stale-diagnostics'), {
+    storage: { last_sync_diagnostics: stale },
+    conversationListResponse: { conversations: [] },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const failure = await harness.errorProgress;
+  assert.equal(failure.stage, 'error', 'the malformed Claude list should fail before export');
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.storageState.last_sync_diagnostics.items)), [],
+    'diagnostics from the previous sync must be removed even when the new sync fails before collecting conversations');
+  assert.equal(harness.storageState.last_sync_diagnostics.extension_version, '0.5.9');
+});
+
 test('a sync stores a sanitized diagnostic for each conversation not archived completely, with nothing private in it', async () => {
   const secretText = 'Mi nota privada sobre el examen';
   const conversation = plainConversation('11111111-2222-4333-8444-555555555555');
@@ -2472,6 +2491,7 @@ test('a sync stores a sanitized diagnostic for each conversation not archived co
   for (const secret of [secretText, 'Base de datos', 'BD-GICD', 'SECRET-TOKEN', 'sig=', '99999999-8888', 'aaaaaaaa-bbbb']) {
     assert.equal(text.includes(secret), false, `diagnostics must not contain ${secret}`);
   }
+  assert.equal(stored.extension_version, '0.5.9');
   assert.equal(stored.items.length, 1);
   const [item] = stored.items;
   assert.equal(item.conversation_id, '11111111-2222-4333-8444-555555555555', 'the conversation ID is kept so the owner can match it');
