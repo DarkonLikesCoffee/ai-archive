@@ -1579,8 +1579,7 @@ test('reassembles bounded conversation batches and rejects incomplete transfers'
   const partial = incomplete.send({ type: 'syncTransferBatchChunk', transferId: 'batches-2',
     batchIndex: 0, chunkIndex: 0, totalChunks: 1, data: '[{"external_id":"only-one"}]' });
   assert.equal(partial.ok, true);
-  let response;
-  incomplete.send({ type: 'syncNormalized', transferId: 'batches-2' }, { tab: { id: 7 } }, (value) => { response = value; });
+  const response = incomplete.send({ type: 'syncNormalized', transferId: 'batches-2' }, { tab: { id: 7 } });
   assert.equal(response.ok, false, 'the finalizer must reject a missing conversation');
   assert.match(response.error, /did not fully reach the extension/);
 });
