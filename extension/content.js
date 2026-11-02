@@ -881,10 +881,12 @@
       let downloaded = null;
 
       // Some Claude uploads are marked as Files API blobs and have neither a
-      // preview/document URL nor a sandbox path. For those entries only, try
-      // the same-origin file-content route used by Claude's file UI. This is a
-      // read-only GET; 404/410 means this route does not serve that file, so
-      // preserve the existing incomplete-attachment behavior.
+      // preview/document URL nor a sandbox path. Independent Claude.ai exporters
+      // report this same-origin download route for those blobs:
+      // /api/organizations/{org}/files/{file_uuid}/contents.
+      // Keep this as a guarded read-only GET; 404/410 preserves the existing
+      // incomplete-attachment behavior. The endpoint is undocumented and must
+      // still be validated against a live account.
       const downloadSource = String(file?.download_source || '').toLowerCase().replace(/-/g, '_');
       const fileApiId = file.file_uuid || file.uuid || null;
       if (file?.file_kind === 'blob' && downloadSource === 'files_api' && fileApiId) {
@@ -900,7 +902,7 @@
           continue;
         }
 
-        const url = `/api/${encodeURIComponent(org)}/files/${encodeURIComponent(fileApiId)}/content`;
+        const url = `/api/organizations/${encodeURIComponent(org)}/files/${encodeURIComponent(fileApiId)}/contents`;
         try {
           downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal);
           const linked = {
