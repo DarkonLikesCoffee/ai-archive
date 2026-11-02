@@ -1,4 +1,4 @@
-# AI Archive Dashboard v0.6.14
+# AI Archive Dashboard v0.6.15
 
 Web dashboard for browsing the AI conversation archive stored in a private GitHub repository.
 
@@ -53,3 +53,8 @@ node e2e/viewer.e2e.cjs
 ## v0.6.14
 - Fixed the conversation prompt outline so entries no longer shrink when there are many prompts.
 - Added a themed scrollbar to the prompt outline, allowing long lists to scroll independently.
+
+
+## v0.6.15
+- Added a mobile navigation menu to the conversation reader, matching the existing list-view sidebar drawer.
+- The reader drawer closes when a navigation item is selected, the backdrop is tapped, or Escape is pressed.
