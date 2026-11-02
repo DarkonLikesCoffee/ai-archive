@@ -435,7 +435,33 @@ $('cancel').onclick = async () => {
   chrome.runtime.sendMessage({ type: 'cancelSync' }).catch(() => {});
 };
 
-$('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'archive_account_pending', 'auto_sync', 'auto_sync_configured', 'last_sync_diagnostics']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
+async function disconnectGithubSettings() {
+  await chrome.storage.local.remove([
+    'github_owner', 'github_repo', 'github_token',
+    'archive_account', 'archive_account_pending',
+    'auto_sync', 'auto_sync_configured',
+    'last_sync', 'last_sync_diagnostics',
+  ]);
+  selectedArchiveAccount = '';
+  knownArchiveAccounts = [];
+  lastDiagnostics = null;
+  showSyncReport(null);
+  showDiagnostics(null);
+  $('lastSync').textContent = '';
+  $('accountText').textContent = '';
+  status.className = 'status ok';
+  status.textContent = 'GitHub settings and previous sync reports removed from this extension.';
+  await refresh();
+}
+
+$('clear').onclick = async () => {
+  try {
+    await disconnectGithubSettings();
+  } catch (error) {
+    status.className = 'status err';
+    status.textContent = `Could not disconnect GitHub settings: ${error?.message || String(error)}`;
+  }
+};
 
 $('copyDiagnostics').onclick = async () => {
   if (!lastDiagnostics) return;
