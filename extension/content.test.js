@@ -2631,21 +2631,63 @@ test('a blob upload no path form serves stays visibly not archived, and diagnost
   harness.finishFirstHandoff({ ok: true });
 });
 
-test('a download_source blob in a conversation without a sandbox is not guessed at, and diagnostics show its source', async () => {
+test('downloads a files-api blob through the same-origin content route', async () => {
   const conversation = realUploadConversation('conv-download-source', {
+    created_at: '2026-10-20T10:00:00.000000+00:00', download_source: 'files-api', file_kind: 'blob',
+    file_name: 'proyecto.zip', file_uuid: 'blob-2', size_bytes: 71356, success: true, uuid: 'blob-2',
+  });
+  conversation.is_wiggle_enabled = false;
+  const url = '/api/org-id/files/blob-2/content';
+  const harness = createHarness(conversation, {
+    sandboxListStatus: 404,
+    assetResponses: { [url]: { content: 'real zip bytes', contentType: 'application/zip' } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), []);
+  assert.equal(exported.assets.length, 1);
+  assert.equal(exported.assets[0].source, 'message-files-api');
+  assert.equal(exported.assets[0].file_uuid, 'blob-2');
+  assert.equal(Buffer.from(exported.assets[0].base64, 'base64').toString('utf8'), 'real zip bytes');
+  assert.ok(harness.requests.includes(url), 'the file UUID is fetched from Claude’s same-origin content route');
+  assert.equal(harness.requests.some((request) => request.includes('download-file')), false);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a files-api blob that returns 404 stays incomplete and records the attempted route', async () => {
+  const conversation = realUploadConversation('conv-download-source-404', {
     created_at: '2026-10-20T10:00:00.000000+00:00', download_source: 'files_api', file_kind: 'blob',
     file_name: 'proyecto.zip', file_uuid: 'blob-2', size_bytes: 71356, success: true, uuid: 'blob-2',
+  });
+  conversation.is_wiggle_enabled = false;
+  const url = '/api/org-id/files/blob-2/content';
+  const harness = createHarness(conversation, {
+    sandboxListStatus: 404,
+    assetResponses: { [url]: { status: 404 } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete.map((item) => item.reason))), ['Claude did not provide a download link for this file']);
+  const [item] = harness.storageState.last_sync_diagnostics.items;
+  assert.equal(item.unarchived_files[0].file.download_source, 'files_api');
+  assert.deepEqual(JSON.parse(JSON.stringify(item.unarchived_files[0].attempts)), [{ via: 'files-api', status: 404 }]);
+  assert.equal(item.conversation_flags.is_wiggle_enabled, false);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('does not try the files-api route for entries that are not marked as files-api blobs', async () => {
+  const conversation = realUploadConversation('conv-not-files-api', {
+    file_kind: 'blob', file_name: 'ordinary.bin', file_uuid: 'blob-3', size_bytes: 10, success: true, uuid: 'blob-3',
   });
   conversation.is_wiggle_enabled = false;
   const harness = createHarness(conversation, { sandboxListStatus: 404, storage: {} });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   const [exported] = (await harness.firstHandoff).conversations;
-  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete.map((item) => item.reason))), ['Claude did not provide a download link for this file']);
-  assert.equal(harness.requests.some((url) => url.includes('download-file')), false, 'no guessed download requests');
-  const [item] = harness.storageState.last_sync_diagnostics.items;
-  assert.equal(item.unarchived_files[0].file.download_source, 'files_api');
-  assert.deepEqual(JSON.parse(JSON.stringify(item.unarchived_files[0].attempts)), []);
-  assert.equal(item.conversation_flags.is_wiggle_enabled, false);
+  assert.equal(exported.incomplete.length, 1);
+  assert.equal(harness.requests.some((url) => url.includes('/files/blob-3/content')), false,
+    'unknown file shapes must not trigger guessed downloads');
   harness.finishFirstHandoff({ ok: true });
 });
 
