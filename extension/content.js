@@ -893,6 +893,10 @@
           if (messageId && !cached.message_external_ids.includes(messageId)) {
             cached.message_external_ids.push(messageId);
           }
+          const fingerprint = `${String(cached.name || '').toLowerCase()}|${cached.sha256}`;
+          messageAssetFingerprints.add(fingerprint);
+          fingerprintsForMessage(message).add(fingerprint);
+          hashesForMessage(message).add(cached.sha256);
           continue;
         }
 
@@ -901,13 +905,17 @@
           downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal);
           const linked = {
             ...downloaded,
-            source: 'message-files-api',
+            source: 'message',
             file_uuid: fileApiId,
             message_external_id: messageId,
             message_external_ids: messageId ? [messageId] : [],
           };
           filesApiAssetCache.set(String(fileApiId), linked);
           assets.push(linked);
+          const fingerprint = `${String(linked.name || '').toLowerCase()}|${linked.sha256}`;
+          messageAssetFingerprints.add(fingerprint);
+          fingerprintsForMessage(message).add(fingerprint);
+          hashesForMessage(message).add(linked.sha256);
           continue;
         } catch (e) {
           if (e?.name === 'AbortError') throw e;
