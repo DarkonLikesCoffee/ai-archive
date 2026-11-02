@@ -43,6 +43,9 @@ function createHarness(conversation, {
   const requests = [];
   const handoffs = [];
   const transferChunks = [];
+  const transferStarts = new Map();
+  const transferPayloads = new Map();
+  const transferBatchStates = new Map();
   const progressMessages = [];
   let resolveFirstHandoff;
   const firstHandoff = new Promise((resolve) => { resolveFirstHandoff = resolve; });
@@ -86,14 +89,47 @@ function createHarness(conversation, {
           callback?.(archiveState ? { ok: true, conversations: archiveState } : { ok: false, error: 'not configured in test' });
           return Promise.resolve();
         }
-        if (message.type === 'syncTransferChunk') {
+        if (message.type === 'syncTransferStart') {
+          transferStarts.set(message.transferId, message);
+          transferPayloads.set(message.transferId, { ...message.metadata, conversations: [] });
+          callback?.({ ok: true });
+          return Promise.resolve();
+        }
+        if (message.type === 'syncTransferBatchChunk') {
+          const transferPosition = transferChunks.length;
           transferChunks.push(message);
-          callback?.(message.index === rejectChunkAt ? { ok: false, error: 'rejected in test' } : { ok: true });
+          if (transferPosition === rejectChunkAt) {
+            callback?.({ ok: false, error: 'rejected in test' });
+            return Promise.resolve();
+          }
+          let batch = transferBatchStates.get(message.batchIndex);
+          if (message.chunkIndex === 0) {
+            batch = { totalChunks: message.totalChunks, chunks: [] };
+            transferBatchStates.set(message.batchIndex, batch);
+          }
+          if (!batch || batch.totalChunks !== message.totalChunks || message.chunkIndex !== batch.chunks.length) {
+            callback?.({ ok: false, error: 'out of order in test' });
+            return Promise.resolve();
+          }
+          batch.chunks.push(message.data);
+          if (batch.chunks.length === batch.totalChunks) {
+            transferPayloads.get(message.transferId).conversations.push(...JSON.parse(batch.chunks.join('')));
+            transferBatchStates.delete(message.batchIndex);
+          }
+          callback?.({ ok: true });
+          return Promise.resolve();
+        }
+        if (message.type === 'syncTransferAbort') {
+          transferStarts.delete(message.transferId);
+          transferPayloads.delete(message.transferId);
+          callback?.({ ok: true });
           return Promise.resolve();
         }
         if (message.type === 'syncNormalized') {
-          // A chunked handoff is reassembled here exactly as the background does.
-          if (message.transferId) message = { type: 'syncNormalized', transferId: message.transferId, ...JSON.parse(transferChunks.filter((c) => c.transferId === message.transferId).map((c) => c.data).join('')) };
+          if (message.transferId) {
+            const payload = transferPayloads.get(message.transferId);
+            message = { type: 'syncNormalized', transferId: message.transferId, ...payload };
+          }
           handoffs.push(message);
           if (handoffs.length === 1) {
             finishFirstHandoff = callback;
@@ -2487,26 +2523,30 @@ function chunkTestConversation() {
   };
 }
 
-test('a sync too large for one extension message is handed off in ordered chunks', async () => {
+test('hands off conversations in bounded ordered JSON batches instead of stringifying the full archive', async () => {
   const small = createHarness(chunkTestConversation());
   small.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
-  const expected = await small.firstHandoff;
-  assert.equal(small.transferChunks.length, 0, 'a small sync stays one message');
+  const smallHandoff = await small.firstHandoff;
+  assert.equal(small.transferChunks.length, 1, 'even small syncs use the bounded transfer protocol');
+  assert.equal(small.transferChunks[0].data, JSON.stringify(smallHandoff.conversations));
 
   const harness = createHarness(chunkTestConversation(), { handoffChunkChars: 1000 });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   const handoff = await harness.firstHandoff;
   assert.ok(harness.transferChunks.length > 5, `chunks: ${harness.transferChunks.length}`);
-  assert.deepEqual(harness.transferChunks.map((c) => c.index), harness.transferChunks.map((_, i) => i));
-  assert.ok(harness.transferChunks.every((c) => c.total === harness.transferChunks.length && c.data.length <= 1000 && c.transferId === handoff.transferId));
-  const { type: _a, ...expectedPayload } = expected;
-  const { type: _b, transferId: _c, ...payload } = handoff;
+  assert.deepEqual(harness.transferChunks.map((c) => c.chunkIndex), harness.transferChunks.map((_, i) => i));
+  assert.ok(harness.transferChunks.every((c) => c.totalChunks === harness.transferChunks.length
+    && c.data.length <= 1000 && c.transferId === handoff.transferId && c.batchIndex === 0));
+  assert.equal(handoff.conversations.length, 1);
+  assert.equal(handoff.conversations[0].external_id, 'conversation-big');
+  const rebuilt = JSON.parse(harness.transferChunks.map((c) => c.data).join(''));
+  assert.equal(rebuilt.length, 1);
   // Each run picks a new random inline-marker nonce; everything else must match.
   const normalize = (value) => JSON.parse(JSON.stringify(value).replace(/"inline_marker_nonce":"[0-9a-f]{32}"/g, '"inline_marker_nonce":"n"'));
-  assert.deepEqual(normalize(payload), normalize(expectedPayload), 'reassembled payload equals the single-message one');
+  assert.deepEqual(normalize(rebuilt[0]), normalize(handoff.conversations[0]));
 });
 
-test('a rejected chunk stops the handoff with an error and publishes nothing', async () => {
+test('a rejected conversation batch stops the handoff with an error and publishes nothing', async () => {
   const harness = createHarness(chunkTestConversation(), { handoffChunkChars: 1000, rejectChunkAt: 2 });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   const error = await harness.errorProgress;
