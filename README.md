@@ -1,5 +1,11 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.9 — diagnostic report lifecycle
+- Diagnostic reports are tagged with the extension version that created them; reports left by older versions are cleared automatically.
+- A new sync clears the previous report before fetching begins, including when the new attempt fails early.
+- A successful sync with no diagnostic issues leaves no old report visible.
+
+
 ## Extension v0.5.8 — archive account selection
 - The extension loads existing Claude archive account names from `archive/index.json` into a dropdown.
 - Selecting an existing account reuses its exact saved name; normal sync no longer requires typing it.
