@@ -695,17 +695,8 @@ function syncReportSummary(report) {
 
 // Read the branch head, its full tree, and archive/index.json exactly as a
 // sync sees them. Shared by sync() and the incremental-sync archive state.
-async function loadArchiveSnapshot() {
-  let ref = await getRef();
-  assertNotCancelled();
-  let branch = ref ? ref.ref.split('/').pop() : 'main';
-  let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
-  let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
-  if (baseTree?.truncated) {
-    throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
-  }
-  let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
-
+async function loadArchiveIndex(ref) {
+  const branch = ref ? ref.ref.split('/').pop() : 'main';
   let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
   const indexFile = ref ? await getFile('archive/index.json', branch) : null;
   if (indexFile) {
@@ -739,6 +730,21 @@ async function loadArchiveSnapshot() {
     index = parsedIndex;
   }
 
+  return index;
+}
+
+async function loadArchiveSnapshot() {
+  let ref = await getRef();
+  assertNotCancelled();
+  let branch = ref ? ref.ref.split('/').pop() : 'main';
+  let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
+  let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
+  if (baseTree?.truncated) {
+    throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
+  }
+  let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
+
+  const index = await loadArchiveIndex(ref);
   return { ref, branch, baseCommit, baseTree, existingPaths, index };
 }
 
@@ -753,6 +759,24 @@ function unlistedSummary(count) {
 // For incremental sync: the conversations of this account whose archived copy
 // is complete (every referenced file exists on the branch) and was written by
 // the current exporter. Only these may be skipped as unchanged.
+async function archiveAccounts() {
+  const s = await settings();
+  if (!s.github_owner || !s.github_repo || !s.github_token) {
+    throw Error('Configure GitHub settings in the extension popup first.');
+  }
+  const ref = await getRef();
+  const index = await loadArchiveIndex(ref);
+  const names = new Set(
+    index.conversations
+      .filter((entry) => entry?.provider === 'claude' && typeof entry.account === 'string')
+      .map((entry) => entry.account.trim())
+      .filter(Boolean),
+  );
+  const current = s.archive_account?.trim();
+  if (current) names.add(current);
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
 async function archiveState() {
   if (!syncRunning) cancelRequested = false;
   const s = await settings();
@@ -1134,6 +1158,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Failures before the GitHub phase (for example Claude's list) end here.
     rememberLastSync(progress);
     return false;
+  }
+  if (msg.type === 'getArchiveAccounts') {
+    archiveAccounts()
+      .then((accounts) => sendResponse({ ok: true, accounts }))
+      .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }));
+    return true;
   }
   if (msg.type === 'getArchiveState') {
     archiveState()
