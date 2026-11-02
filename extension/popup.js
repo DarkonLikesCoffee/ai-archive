@@ -218,7 +218,9 @@ async function refresh() {
     let selected = '';
     let pendingSelection = false;
     if (accountError) {
-      selected = storedAccount;
+      // Without the current GitHub account list, a saved non-pending value
+      // cannot be distinguished from an old typo. Fail closed until it loads.
+      selected = s.archive_account_pending === true ? storedAccount : '';
       pendingSelection = s.archive_account_pending === true;
     } else if (storedAccount) {
       const matchingExisting = accounts.find((name) => accountSlug(name) === accountSlug(storedAccount));
@@ -247,8 +249,10 @@ async function refresh() {
       : accounts.length > 1 && !selected
         ? 'Several accounts exist, and the saved selection does not match them. Choose the correct existing account or deliberately create a new one before syncing.'
         : 'Select an existing account, or create a new one. Your selection is remembered for future syncs.';
+    $('addAccount').disabled = Boolean(accountError);
     updateAccountText(s, selected);
   } else {
+    $('addAccount').disabled = true;
     selectedArchiveAccount = '';
     knownArchiveAccounts = [];
     $('sync').disabled = true;
