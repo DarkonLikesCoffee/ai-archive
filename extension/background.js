@@ -772,8 +772,6 @@ async function archiveAccounts() {
       .map((entry) => entry.account.trim())
       .filter(Boolean),
   );
-  const current = s.archive_account?.trim();
-  if (current) names.add(current);
   return [...names].sort((a, b) => a.localeCompare(b));
 }
 
