@@ -2498,7 +2498,9 @@ test('attachment diagnostics preserve sanitized tool input structure without rec
     size_bytes: 1234,
   });
   conversation.is_wiggle_enabled = false;
-  conversation.chat_messages[0].content.push({
+  // Claude emits tool_use in the assistant message and tool_result in
+  // a separate user message. Keep this fixture faithful to that transcript.
+  conversation.chat_messages[1].content.push({
     type: 'tool_use',
     name: 'create_file',
     id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
