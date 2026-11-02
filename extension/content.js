@@ -24,7 +24,7 @@
     });
     // Some Claude deployments may not expose count_all. In that case the list
     // is still paged until a short page is returned.
-    if (r.status === 404 || r.status === 405) return null;
+    if (r.status === 404 || r.status === 405 || r.status === 429) return null;
     if (!r.ok) throw Error('Claude conversation count: ' + r.status);
 
     let data;
