@@ -140,7 +140,7 @@ test('does not consider a legacy diagnostic report without a version current', (
 
 test('disconnect removes GitHub credentials and all persisted sync reports', async () => {
   const {
-    loadDiagnostics, getLastDiagnostics, disconnectGithubSettings,
+    loadDiagnostics, getLastDiagnostics, disconnectGithubSettings, refresh,
     element, storedSettings,
   } = loadPopup();
 
@@ -155,6 +155,9 @@ test('disconnect removes GitHub credentials and all persisted sync reports', asy
     last_sync: { stage: 'done', at: '2026-11-02T10:00:00.000Z', message: 'old sync result', report: { failed: [{ id: 'old' }] } },
     last_sync_diagnostics: { extension_version: '0.5.10', items: [{ outcome: 'failed' }] },
   });
+  // The popup calls refresh() at module load; settle that initial async read
+  // before exercising the persisted diagnostics lifecycle.
+  await refresh();
   await loadDiagnostics(storedSettings.last_sync_diagnostics);
   assert.ok(getLastDiagnostics(), 'fixture should first display the persisted diagnostic report');
 
