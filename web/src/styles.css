@@ -531,3 +531,32 @@ mark{background:transparent!important;color:inherit!important}
 .overview{padding:22px 28px 60px;max-width:1100px;display:grid;gap:22px}.stat-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.stat-tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:4px}.stat-value{font-size:26px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}.stat-label{font-size:12px;color:var(--muted)}.overview-section{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px}.overview-section h2{font-size:13px;font-weight:650;color:var(--text);margin:0 0 12px}.overview-columns{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:22px}
 .bar-rows{display:grid;gap:6px;--chart-bar:#6f8ff0}[data-theme="light"] .bar-rows{--chart-bar:#315fbe}.bar-row{display:grid;grid-template-columns:minmax(80px,180px) 1fr 48px;align-items:center;gap:10px;font-size:12px}.bar-label{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.bar-track{height:10px;display:block}.bar{display:block;height:100%;min-width:2px;background:var(--chart-bar);border-radius:0 4px 4px 0}.bar-value{color:var(--text);text-align:right;font-variant-numeric:tabular-nums}.bar-row:hover .bar-label{color:var(--text)}
 .incomplete-badge{color:#b45309;background:color-mix(in srgb,#f59e0b 14%,transparent)}
+
+
+/* Prompt outline: keep each entry at its natural height and scroll the list. */
+@media (min-width: 1200px) {
+  .reader-outline {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .reader-outline-title,
+  .reader-outline button {
+    flex: 0 0 auto;
+  }
+  .reader-outline::-webkit-scrollbar {
+    width: 6px;
+  }
+  .reader-outline::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .reader-outline::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 8px;
+  }
+  .reader-outline::-webkit-scrollbar-thumb:hover {
+    background: var(--muted);
+  }
+}
