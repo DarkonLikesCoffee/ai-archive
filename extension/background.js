@@ -1191,11 +1191,93 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  if (msg.type === 'syncTransferStart') {
+    if (syncRunning) {
+      sendResponse({ ok: false, error: 'Another archive sync is already running. Nothing was published; try again after it finishes.' });
+      return false;
+    }
+    if (typeof msg.transferId !== 'string' || !msg.transferId
+      || !Number.isSafeInteger(msg.conversationCount) || msg.conversationCount < 0
+      || !msg.metadata || typeof msg.metadata !== 'object' || Array.isArray(msg.metadata)) {
+      pendingTransfer = null;
+      sendResponse({ ok: false, error: 'The sync transfer could not be initialized safely. Nothing was published; sync again.' });
+      return false;
+    }
+    pendingTransfer = {
+      id: msg.transferId,
+      mode: 'batches',
+      expectedConversations: msg.conversationCount,
+      metadata: {
+        skipped: Array.isArray(msg.metadata.skipped) ? msg.metadata.skipped : [],
+        unchangedIds: Array.isArray(msg.metadata.unchangedIds) ? msg.metadata.unchangedIds : [],
+        fullList: msg.metadata.fullList === true,
+        listed: Number.isFinite(msg.metadata.listed) ? msg.metadata.listed : null,
+      },
+      conversations: [],
+      nextBatchIndex: 0,
+      currentBatch: null,
+    };
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (msg.type === 'syncTransferBatchChunk') {
+    const transfer = pendingTransfer;
+    const validNumbers = Number.isSafeInteger(msg.batchIndex) && msg.batchIndex >= 0
+      && Number.isSafeInteger(msg.chunkIndex) && msg.chunkIndex >= 0
+      && Number.isSafeInteger(msg.totalChunks) && msg.totalChunks > 0
+      && msg.chunkIndex < msg.totalChunks;
+    if (!transfer || transfer.mode !== 'batches' || transfer.id !== msg.transferId
+      || !validNumbers || msg.batchIndex !== transfer.nextBatchIndex
+      || typeof msg.data !== 'string') {
+      pendingTransfer = null;
+      sendResponse({ ok: false, error: 'The conversation batches reached the extension out of order. Nothing was published; sync again.' });
+      return false;
+    }
+
+    if (msg.chunkIndex === 0) {
+      if (transfer.currentBatch) {
+        pendingTransfer = null;
+        sendResponse({ ok: false, error: 'A conversation batch was interrupted. Nothing was published; sync again.' });
+        return false;
+      }
+      transfer.currentBatch = { totalChunks: msg.totalChunks, chunks: [] };
+    }
+    const batch = transfer.currentBatch;
+    if (!batch || batch.totalChunks !== msg.totalChunks || msg.chunkIndex !== batch.chunks.length) {
+      pendingTransfer = null;
+      sendResponse({ ok: false, error: 'The conversation batch was incomplete or out of order. Nothing was published; sync again.' });
+      return false;
+    }
+
+    batch.chunks.push(msg.data);
+    if (batch.chunks.length === batch.totalChunks) {
+      try {
+        const conversations = JSON.parse(batch.chunks.join(''));
+        if (!Array.isArray(conversations) || !conversations.length
+          || transfer.conversations.length + conversations.length > transfer.expectedConversations) {
+          throw new Error('invalid batch shape');
+        }
+        transfer.conversations.push(...conversations);
+        transfer.currentBatch = null;
+        transfer.nextBatchIndex++;
+      } catch {
+        pendingTransfer = null;
+        sendResponse({ ok: false, error: 'A conversation batch could not be decoded safely. Nothing was published; sync again.' });
+        return false;
+      }
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (msg.type === 'syncTransferAbort') {
+    if (pendingTransfer?.id === msg.transferId) pendingTransfer = null;
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg.type === 'syncTransferChunk') {
-    // A large sync arrives as chunks of its JSON text (see handOff in
-    // content.js). Only one transfer is assembled at a time, strictly in order.
-    if (msg.index === 0) pendingTransfer = { id: msg.transferId, total: msg.total, chunks: [] };
-    if (!pendingTransfer || pendingTransfer.id !== msg.transferId || pendingTransfer.total !== msg.total
+    // Backward-compatible receiver for the previous whole-payload chunk format.
+    if (msg.index === 0) pendingTransfer = { id: msg.transferId, mode: 'legacy', total: msg.total, chunks: [] };
+    if (!pendingTransfer || pendingTransfer.mode !== 'legacy' || pendingTransfer.id !== msg.transferId || pendingTransfer.total !== msg.total
       || msg.index !== pendingTransfer.chunks.length || typeof msg.data !== 'string') {
       pendingTransfer = null;
       sendResponse({ ok: false, error: 'The sync data reached the extension out of order. Nothing was published; sync again.' });
@@ -1220,8 +1302,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const transfer = pendingTransfer;
       pendingTransfer = null;
       try {
-        if (!transfer || transfer.id !== msg.transferId || transfer.chunks.length !== transfer.total) throw new Error('incomplete');
-        payload = JSON.parse(transfer.chunks.join(''));
+        if (!transfer || transfer.id !== msg.transferId) throw new Error('incomplete');
+        if (transfer.mode === 'batches') {
+          if (transfer.currentBatch
+            || transfer.conversations.length !== transfer.expectedConversations) throw new Error('incomplete');
+          payload = { ...transfer.metadata, conversations: transfer.conversations };
+        } else {
+          if (transfer.chunks.length !== transfer.total) throw new Error('incomplete');
+          payload = JSON.parse(transfer.chunks.join(''));
+        }
       } catch {
         const error = 'The sync data did not fully reach the extension (it may have restarted). Nothing was published; sync again.';
         broadcast({ stage: 'error', error });
