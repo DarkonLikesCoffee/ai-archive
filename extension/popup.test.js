@@ -25,7 +25,7 @@ function loadPopup({ tabs = {} } = {}) {
       set: async (values) => { Object.assign(storedSettings, values); },
       remove: async (keys) => { for (const key of (Array.isArray(keys) ? keys : [keys])) delete storedSettings[key]; },
     } },
-    runtime: { lastError: null, getManifest() { return { version: '0.5.12' }; }, onMessage: { addListener() {} }, sendMessage() { return Promise.resolve(); } },
+    runtime: { lastError: null, getManifest() { return { version: '0.5.13' }; }, onMessage: { addListener() {} }, sendMessage() { return Promise.resolve(); } },
     tabs: { query: async () => [], ...tabs },
   };
   const context = {
@@ -126,7 +126,7 @@ test('clears a persisted diagnostic report created by an older extension version
 test('keeps diagnostics from the current extension version visible', async () => {
   const { loadDiagnostics, getLastDiagnostics, refresh } = loadPopup();
   await refresh();
-  const current = { extension_version: '0.5.12', items: [{ outcome: 'incomplete' }] };
+  const current = { extension_version: '0.5.13', items: [{ outcome: 'incomplete' }] };
   await loadDiagnostics(current);
   assert.deepEqual(JSON.parse(JSON.stringify(getLastDiagnostics())), current);
 });
@@ -135,7 +135,7 @@ test('does not consider a legacy diagnostic report without a version current', (
   const { isCurrentDiagnosticReport } = loadPopup();
   assert.equal(isCurrentDiagnosticReport({ items: [{ outcome: 'failed' }] }), false);
   assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.8', items: [{ outcome: 'failed' }] }), false);
-  assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.12', items: [{ outcome: 'failed' }] }), true);
+  assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.13', items: [{ outcome: 'failed' }] }), true);
 });
 
 test('disconnect removes GitHub credentials and all persisted sync reports', async () => {
@@ -153,7 +153,7 @@ test('disconnect removes GitHub credentials and all persisted sync reports', asy
     auto_sync: true,
     auto_sync_configured: true,
     last_sync: { stage: 'done', at: '2026-11-02T10:00:00.000Z', message: 'old sync result', report: { failed: [{ id: 'old' }] } },
-    last_sync_diagnostics: { extension_version: '0.5.12', items: [{ outcome: 'failed' }] },
+    last_sync_diagnostics: { extension_version: '0.5.13', items: [{ outcome: 'failed' }] },
   });
   // The popup calls refresh() at module load; settle that initial async read
   // before exercising the persisted diagnostics lifecycle.
