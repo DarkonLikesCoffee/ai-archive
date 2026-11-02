@@ -1692,7 +1692,7 @@ test('an attachment over GitHub\'s 100 MB file limit is left out with a note ins
   const [conversation] = sampleConversation();
   conversation.messages[0].files = [{ file_uuid: 'huge', file_name: 'screen recording.mov' }, { file_uuid: 'small', file_name: 'notes.txt' }];
   conversation.assets = [
-    { file_uuid: 'huge', name: 'screen recording.mov', mime: 'video/quicktime', base64: 'AAAA', sha256: 'b'.repeat(64), size: 150 * 1024 * 1024, message_external_id: 'message-1' },
+    { file_uuid: 'huge', name: 'screen recording.mov', mime: 'video/quicktime', base64: '', sha256: 'b'.repeat(64), size: 150 * 1024 * 1024, message_external_id: 'message-1' },
     { file_uuid: 'small', name: 'notes.txt', mime: 'text/plain', base64: btoa('hi'), sha256: 'c'.repeat(64), size: 2, message_external_id: 'message-1' },
   ];
   const result = await harness.sync([conversation], () => {});
