@@ -2489,6 +2489,61 @@ test('a sync stores a sanitized diagnostic for each conversation not archived co
   harness.finishFirstHandoff({ ok: true });
 });
 
+test('attachment diagnostics preserve sanitized tool input structure without recording private content', async () => {
+  const conversation = realUploadConversation('conv-tool-shape', {
+    file_kind: 'blob',
+    file_name: 'private-report.pdf',
+    file_uuid: '99999999-8888-4777-8666-555555555555',
+    download_source: 'files_api',
+    size_bytes: 1234,
+  });
+  conversation.is_wiggle_enabled = false;
+  conversation.chat_messages[0].content.push({
+    type: 'tool_use',
+    name: 'create_file',
+    id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    input: {
+      path: '/mnt/user-data/outputs/private-report.pdf',
+      file_text: 'PRIVATE GENERATED DOCUMENT CONTENT',
+      file_id: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+    },
+  });
+  conversation.chat_messages[0].content.push({
+    type: 'tool_result',
+    tool_use_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    content: 'PRIVATE TOOL RESULT',
+    is_error: false,
+  });
+  const harness = createHarness(conversation, { sandboxListStatus: 404, storage: {} });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  await harness.firstHandoff;
+  const [item] = harness.storageState.last_sync_diagnostics.items;
+  const [message] = item.messages_with_files;
+  assert.equal(message.tool_names.includes('create_file'), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(message.tool_blocks)), [
+    {
+      type: 'tool_use',
+      name: 'create_file',
+      input_keys: ['file_id', 'file_text', 'path'],
+      input_shape: {
+        file_id: '{uuid}',
+        file_text: '<string:34>',
+        path: '/mnt/user-data/outputs/<name>.pdf',
+      },
+    },
+    {
+      type: 'tool_result',
+      content_shape: '<string:20>',
+      is_error: false,
+    },
+  ]);
+  const serialized = JSON.stringify(item);
+  for (const secret of ['PRIVATE GENERATED DOCUMENT CONTENT', 'PRIVATE TOOL RESULT', 'private-report.pdf', 'aaaaaaaa-bbbb', 'bbbbbbbb-cccc']) {
+    assert.equal(serialized.includes(secret), false, `diagnostics must not contain ${secret}`);
+  }
+  harness.finishFirstHandoff({ ok: true });
+});
+
 test('diagnostics record the sandbox list status and error shape of a failed conversation', async () => {
   const harness = createHarness(plainConversation('22222222-2222-4333-8444-555555555555'), { storage: {}, sandboxListStatus: 503 });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
