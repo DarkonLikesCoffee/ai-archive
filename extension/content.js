@@ -84,7 +84,10 @@
         }
         // A short or empty page is not proof of completion when Claude's count
         // endpoint says there should still be more records.
-        if (!page.length) break;
+        if (!page.length) {
+          finished = true;
+          break;
+        }
       } else if (page.length < CONVERSATION_LIST_PAGE_SIZE) {
         finished = true;
         break;
