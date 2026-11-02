@@ -1,5 +1,10 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.10 — disconnect cleanup
+- Disconnect now removes GitHub credentials, account selection, the last sync summary, and the stored diagnostic report.
+- The popup clears the visible sync status and diagnostic controls immediately, preventing stale information from carrying into a later connection.
+
+
 ## Extension v0.5.9 — diagnostic report lifecycle
 - Diagnostic reports are tagged with the extension version that created them; reports left by older versions are cleared automatically.
 - A new sync clears the previous report before fetching begins, including when the new attempt fails early.
