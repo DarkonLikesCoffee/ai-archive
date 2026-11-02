@@ -579,15 +579,19 @@ function normalizeAssetList(c, provider, accountSlug) {
   const byKey = new Map();
   const assets = [];
   for (const raw of (c.assets || [])) {
-    if (!raw?.base64 || !raw?.sha256) continue;
+    if (!raw?.sha256) continue;
+    const size = assetByteSize(raw);
+    const omitted = size > MAX_ARCHIVED_FILE_BYTES;
+    // The content script intentionally leaves base64 empty for files over
+    // GitHub's limit. Their size/hash metadata is enough to render the note.
+    if (!raw.base64 && !omitted) continue;
     const path = assetPath(c, raw, provider, accountSlug, usedPaths);
-    const omitted = assetByteSize(raw) > MAX_ARCHIVED_FILE_BYTES;
     const asset = {
       ...raw,
       path,
       encoding: 'base64',
       base64: omitted ? '' : raw.base64,
-      ...(omitted ? { omitted: true, size: assetByteSize(raw) } : {}),
+      ...(omitted ? { omitted: true, size } : {}),
     };
     assets.push(asset);
     if (raw.file_uuid) byKey.set(`id:${raw.file_uuid}`, asset);
