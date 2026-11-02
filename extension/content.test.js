@@ -2533,7 +2533,7 @@ test('attachment diagnostics preserve sanitized tool input structure without rec
     },
     {
       type: 'tool_result',
-      content_shape: '<string:20>',
+      content_shape: '<string:19>',
       is_error: false,
     },
   ]);
