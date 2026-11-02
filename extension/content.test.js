@@ -2523,6 +2523,7 @@ test('attachment diagnostics preserve sanitized tool input structure without rec
   assert.deepEqual(JSON.parse(JSON.stringify(message.tool_blocks)), [
     {
       type: 'tool_use',
+      tool_ref: 'tool-1',
       name: 'create_file',
       input_keys: ['file_id', 'file_text', 'path'],
       input_shape: {
@@ -2533,6 +2534,7 @@ test('attachment diagnostics preserve sanitized tool input structure without rec
     },
     {
       type: 'tool_result',
+      tool_ref: 'tool-1',
       content_shape: '<string:19>',
       is_error: false,
     },
