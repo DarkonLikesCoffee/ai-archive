@@ -560,3 +560,33 @@ mark{background:transparent!important;color:inherit!important}
     background: var(--muted);
   }
 }
+
+
+/* Mobile navigation drawer is available from both the list and reader views. */
+.reader-header-start{display:flex;align-items:center;gap:8px;min-width:0}
+.reader-header-start .menu-button{width:38px;height:38px;flex:0 0 38px}
+@media(max-width:700px){
+  .reader-shell.sidebar-open>.sidebar{
+    display:flex!important;
+    position:fixed!important;
+    top:0;
+    bottom:0;
+    left:0;
+    height:100vh!important;
+    height:100dvh!important;
+    width:min(280px,85vw);
+    z-index:60;
+    overflow-y:auto!important;
+    box-shadow:0 0 40px rgba(0,0,0,.45)
+  }
+  .reader-shell.sidebar-open>.sidebar-backdrop{
+    display:block;
+    position:fixed;
+    inset:0;
+    z-index:55;
+    border:0;
+    padding:0;
+    background:rgba(0,0,0,.45);
+    cursor:pointer
+  }
+}
