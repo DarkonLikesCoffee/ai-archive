@@ -8,6 +8,7 @@ const popupSource = await readFile(fileURLToPath(new URL('./popup.js', import.me
 
 function loadPopup({ tabs = {} } = {}) {
   const elements = new Map();
+  const storedSettings = {};
   const element = (id) => {
     if (!elements.has(id)) {
       elements.set(id, {
@@ -19,7 +20,11 @@ function loadPopup({ tabs = {} } = {}) {
     return elements.get(id);
   };
   const chrome = {
-    storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } },
+    storage: { local: {
+      get: async (keys) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).filter((key) => key in storedSettings).map((key) => [key, storedSettings[key]])),
+      set: async (values) => { Object.assign(storedSettings, values); },
+      remove: async (keys) => { for (const key of (Array.isArray(keys) ? keys : [keys])) delete storedSettings[key]; },
+    } },
     runtime: { lastError: null, onMessage: { addListener() {} }, sendMessage() { return Promise.resolve(); } },
     tabs: { query: async () => [], ...tabs },
   };
@@ -36,7 +41,8 @@ function loadPopup({ tabs = {} } = {}) {
   };
   vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__describeSyncReport = describeSyncReport;\nglobalThis.__sendToClaude = sendToClaude;
 globalThis.__renderAccountOptions = renderAccountOptions;
-globalThis.__findExistingAccountName = findExistingAccountName;`, context);
+globalThis.__findExistingAccountName = findExistingAccountName;
+globalThis.__createArchiveAccount = createArchiveAccount;`, context);
   return {
     describeRepoCheck: context.__describeRepoCheck,
     describeLastSync: context.__describeLastSync,
@@ -44,7 +50,8 @@ globalThis.__findExistingAccountName = findExistingAccountName;`, context);
     sendToClaude: context.__sendToClaude,
     renderAccountOptions: context.__renderAccountOptions,
     findExistingAccountName: context.__findExistingAccountName,
-    element, chrome
+    createArchiveAccount: context.__createArchiveAccount,
+    element, chrome, storedSettings
   };
 }
 
@@ -71,6 +78,29 @@ test('account creation resolves slug variants to the existing account instead of
   assert.equal(findExistingAccountName('LOGAN', ['logan', 'work']), 'logan');
   assert.equal(findExistingAccountName('work account', ['work-account']), 'work-account');
   assert.equal(findExistingAccountName('lohan', ['logan', 'work']), null);
+});
+
+test('creates and remembers a new archive account only after the explicit create action', async () => {
+  const { renderAccountOptions, createArchiveAccount, element, storedSettings } = loadPopup();
+  renderAccountOptions(['logan'], 'logan');
+  element('newAccountName').value = 'lohan';
+  const created = await createArchiveAccount();
+  assert.equal(created, 'lohan');
+  assert.equal(storedSettings.archive_account, 'lohan');
+  assert.equal(storedSettings.archive_account_pending, true);
+  assert.equal(element('accountLogged').value, 'lohan');
+  assert.match(element('status').textContent, /archive folder will be created on the next sync/);
+});
+
+test('creating a slug variant selects the existing account instead of creating another one', async () => {
+  const { renderAccountOptions, createArchiveAccount, element, storedSettings } = loadPopup();
+  renderAccountOptions(['work-account'], 'work-account');
+  element('newAccountName').value = 'work account';
+  const selected = await createArchiveAccount();
+  assert.equal(selected, 'work-account');
+  assert.equal(storedSettings.archive_account, 'work-account');
+  assert.equal(storedSettings.archive_account_pending, false);
+  assert.match(element('status').textContent, /no duplicate was created/);
 });
 
 test('explains repository check failures before saving GitHub settings', () => {
