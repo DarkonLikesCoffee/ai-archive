@@ -834,6 +834,7 @@
     // note in its place and is marked incomplete, so it is never mistaken for
     // a complete archive and later syncs retry it.
     const byPathCache = new Map();
+    const filesApiAssetCache = new Map();
     for (const { message, file, name, reason } of filesWithoutDownloadUrl) {
       const messageId = message.uuid || message.id || null;
       const fileId = file.file_uuid || file.uuid || null;
@@ -876,10 +877,50 @@
       }
       if (scopedMatch || sandboxMatch) continue;
 
-      // Not in the file list: download it by the path the file entry gives,
-      // through the same sandbox endpoint, when this conversation has a sandbox.
       const attempts = [];
       let downloaded = null;
+
+      // Some Claude uploads are marked as Files API blobs and have neither a
+      // preview/document URL nor a sandbox path. For those entries only, try
+      // the same-origin file-content route used by Claude's file UI. This is a
+      // read-only GET; 404/410 means this route does not serve that file, so
+      // preserve the existing incomplete-attachment behavior.
+      const downloadSource = String(file?.download_source || '').toLowerCase().replace(/-/g, '_');
+      const fileApiId = file.file_uuid || file.uuid || null;
+      if (file?.file_kind === 'blob' && downloadSource === 'files_api' && fileApiId) {
+        const cached = filesApiAssetCache.get(String(fileApiId));
+        if (cached) {
+          if (messageId && !cached.message_external_ids.includes(messageId)) {
+            cached.message_external_ids.push(messageId);
+          }
+          continue;
+        }
+
+        const url = `/api/${encodeURIComponent(org)}/files/${encodeURIComponent(fileApiId)}/content`;
+        try {
+          downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal);
+          const linked = {
+            ...downloaded,
+            source: 'message-files-api',
+            file_uuid: fileApiId,
+            message_external_id: messageId,
+            message_external_ids: messageId ? [messageId] : [],
+          };
+          filesApiAssetCache.set(String(fileApiId), linked);
+          assets.push(linked);
+          continue;
+        } catch (e) {
+          if (e?.name === 'AbortError') throw e;
+          if (!isUnavailable(e)) {
+            throw new Error(`Failed to download Claude file "${safeAssetName(name)}": ${e?.message || 'download error'}`);
+          }
+          attempts.push({ via: 'files-api', status: e.status });
+          downloaded = null;
+        }
+      }
+
+      // Not in the file list: download it by the path the file entry gives,
+      // through the same sandbox endpoint, when this conversation has a sandbox.
       if (filePath && listStatus !== 404) {
         downloaded = byPathCache.get(filePath) || null;
         for (const candidate of downloaded ? [] : sandboxPathForms(file.path)) {
