@@ -45,7 +45,8 @@ globalThis.__findExistingAccountName = findExistingAccountName;
 globalThis.__createArchiveAccount = createArchiveAccount;
 globalThis.__loadDiagnostics = loadDiagnostics;
 globalThis.__isCurrentDiagnosticReport = isCurrentDiagnosticReport;
-globalThis.__getLastDiagnostics = () => lastDiagnostics;`, context);
+globalThis.__getLastDiagnostics = () => lastDiagnostics;
+globalThis.__disconnectGithubSettings = disconnectGithubSettings;`, context);
   return {
     describeRepoCheck: context.__describeRepoCheck,
     describeLastSync: context.__describeLastSync,
@@ -57,6 +58,7 @@ globalThis.__getLastDiagnostics = () => lastDiagnostics;`, context);
     loadDiagnostics: context.__loadDiagnostics,
     isCurrentDiagnosticReport: context.__isCurrentDiagnosticReport,
     getLastDiagnostics: context.__getLastDiagnostics,
+    disconnectGithubSettings: context.__disconnectGithubSettings,
     refresh: context.refresh,
     element, chrome, storedSettings
   };
@@ -134,6 +136,41 @@ test('does not consider a legacy diagnostic report without a version current', (
   assert.equal(isCurrentDiagnosticReport({ items: [{ outcome: 'failed' }] }), false);
   assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.8', items: [{ outcome: 'failed' }] }), false);
   assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.9', items: [{ outcome: 'failed' }] }), true);
+});
+
+test('disconnect removes GitHub credentials and all persisted sync reports', async () => {
+  const {
+    loadDiagnostics, getLastDiagnostics, disconnectGithubSettings,
+    element, storedSettings,
+  } = loadPopup();
+
+  Object.assign(storedSettings, {
+    github_owner: 'owner',
+    github_repo: 'archive',
+    github_token: 'secret',
+    archive_account: 'logan',
+    archive_account_pending: false,
+    auto_sync: true,
+    auto_sync_configured: true,
+    last_sync: { stage: 'done', at: '2026-11-02T10:00:00.000Z', message: 'old sync result', report: { failed: [{ id: 'old' }] } },
+    last_sync_diagnostics: { extension_version: '0.5.9', items: [{ outcome: 'failed' }] },
+  });
+  await loadDiagnostics(storedSettings.last_sync_diagnostics);
+  assert.ok(getLastDiagnostics(), 'fixture should first display the persisted diagnostic report');
+
+  await disconnectGithubSettings();
+
+  for (const key of [
+    'github_owner', 'github_repo', 'github_token', 'archive_account',
+    'archive_account_pending', 'auto_sync', 'auto_sync_configured',
+    'last_sync', 'last_sync_diagnostics',
+  ]) {
+    assert.equal(key in storedSettings, false, `${key} should be removed`);
+  }
+  assert.equal(getLastDiagnostics(), null);
+  assert.equal(element('lastSync').textContent, '');
+  assert.equal(element('syncReport').children.length, 0);
+  assert.match(element('status').textContent, /previous sync reports removed/);
 });
 
 test('explains repository check failures before saving GitHub settings', () => {
