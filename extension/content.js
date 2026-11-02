@@ -1123,28 +1123,61 @@
         : null,
       message_count: messages.length,
       messages_with_files_total: withFiles.length,
-      // Messages carrying files, where attachment problems come from.
-      messages_with_files: shown.map((m) => {
-        const toolRefs = new Map();
-        let toolRefNumber = 0;
-        for (const block of (Array.isArray(m?.content) ? m.content : [])) {
+      // Tool calls and results are separate messages in Claude's transcript.
+      // Build a conversation-wide index so a file-bearing tool_result can be
+      // linked back to the assistant tool_use that produced it.
+      const toolRefs = new Map();
+      const toolUses = new Map();
+      let toolRefNumber = 0;
+      for (const message of messages) {
+        for (const block of (Array.isArray(message?.content) ? message.content : [])) {
           if (block?.type === 'tool_use' && typeof block.id === 'string') {
             toolRefs.set(block.id, `tool-${++toolRefNumber}`);
+            toolUses.set(block.id, block);
           }
         }
+      }
+      const toolResults = new Map();
+      for (const message of messages) {
+        for (const block of (Array.isArray(message?.content) ? message.content : [])) {
+          if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+            const results = toolResults.get(block.tool_use_id) || [];
+            results.push(block);
+            toolResults.set(block.tool_use_id, results);
+          }
+        }
+      }
+      // Messages carrying files, where attachment problems come from.
+      messages_with_files: shown.map((m) => {
+        const ownToolBlocks = (Array.isArray(m?.content) ? m.content : [])
+          .filter((block) => block?.type === 'tool_use' || block?.type === 'tool_result');
+        const relatedToolBlocks = [];
+        const seenToolBlocks = new Set();
+        const addToolBlock = (block) => {
+          if (!block || seenToolBlocks.has(block)) return;
+          seenToolBlocks.add(block);
+          relatedToolBlocks.push(block);
+        };
+        for (const block of ownToolBlocks) {
+          if (block.type === 'tool_result') addToolBlock(toolUses.get(block.tool_use_id));
+          addToolBlock(block);
+          if (block.type === 'tool_use') {
+            for (const result of (toolResults.get(block.id) || [])) addToolBlock(result);
+          }
+        }
+        const toolBlocks = relatedToolBlocks.slice(0, 20);
         return {
-        message_id: typeof m?.uuid === 'string' ? m.uuid : null,
-        sender: sanitizeShape(m?.sender, 'sender'),
-        keys: Object.keys(m || {}).sort(),
-        content_block_types: Array.isArray(m?.content) ? m.content.map((block) => sanitizeShape(block?.type, 'type')) : [],
-        tool_names: Array.isArray(m?.content)
-          ? [...new Set(m.content.filter((block) => block?.type === 'tool_use' && /^[a-z0-9_.-]{1,48}$/i.test(String(block.name || ''))).map((block) => block.name))]
-          : [],
-        // Preserve only the structure of tool activity on messages with files.
-        // This can reveal whether a file path/identifier is passed to a tool,
-        // without recording prompts, command text, file contents, or credentials.
-        tool_blocks: Array.isArray(m?.content)
-          ? m.content.filter((block) => block?.type === 'tool_use' || block?.type === 'tool_result').slice(0, 20).map((block) => ({
+          message_id: typeof m?.uuid === 'string' ? m.uuid : null,
+          sender: sanitizeShape(m?.sender, 'sender'),
+          keys: Object.keys(m || {}).sort(),
+          content_block_types: Array.isArray(m?.content) ? m.content.map((block) => sanitizeShape(block?.type, 'type')) : [],
+          tool_names: [...new Set(toolBlocks
+            .filter((block) => block?.type === 'tool_use' && /^[a-z0-9_.-]{1,48}$/i.test(String(block.name || '')))
+            .map((block) => block.name))],
+          // Preserve sanitized tool calls/results related to this file-bearing
+          // message, even when Claude places the call and result in separate
+          // transcript messages.
+          tool_blocks: toolBlocks.map((block) => ({
             type: sanitizeShape(block.type, 'type'),
             ...(block.type === 'tool_use' && toolRefs.has(block.id) ? { tool_ref: toolRefs.get(block.id) } : {}),
             ...(block.type === 'tool_result' && toolRefs.has(block.tool_use_id) ? { tool_ref: toolRefs.get(block.tool_use_id) } : {}),
@@ -1155,12 +1188,11 @@
             } : {}),
             ...(block.content !== undefined ? { content_shape: sanitizeShape(block.content) } : {}),
             ...(typeof block.is_error === 'boolean' ? { is_error: block.is_error } : {}),
-          }))
-          : [],
-        files: sanitizeShape(m?.files),
-        files_v2: sanitizeShape(m?.files_v2),
-        attachments: sanitizeShape(m?.attachments),
-      };
+          })),
+          files: sanitizeShape(m?.files),
+          files_v2: sanitizeShape(m?.files_v2),
+          attachments: sanitizeShape(m?.attachments),
+        };
       }),
     };
   }
