@@ -1517,43 +1517,48 @@
       await sendBatch(text);
     }
 
-    for (let i = 0; i < payload.conversations.length; i++) {
-      if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-      const conversation = payload.conversations[i];
-      const id = String(conversation?.external_id || conversation?.id || i + 1);
-      let serialized;
-      try {
-        serialized = JSON.stringify(conversation);
-      } catch (error) {
-        throw new Error('Could not serialize conversation "' + id + '" for transfer: '
-          + String(error?.message || error) + '. Nothing was published; retry this conversation separately.');
-      }
-      if (typeof serialized !== 'string') {
-        throw new Error('Could not serialize conversation "' + id + '" for transfer. Nothing was published; retry this conversation separately.');
+    try {
+      for (let i = 0; i < payload.conversations.length; i++) {
+        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        const conversation = payload.conversations[i];
+        const id = String(conversation?.external_id || conversation?.id || i + 1);
+        let serialized;
+        try {
+          serialized = JSON.stringify(conversation);
+        } catch (error) {
+          throw new Error('Could not serialize conversation "' + id + '" for transfer: '
+            + String(error?.message || error) + '. Nothing was published; retry this conversation separately.');
+        }
+        if (typeof serialized !== 'string') {
+          throw new Error('Could not serialize conversation "' + id + '" for transfer. Nothing was published; retry this conversation separately.');
+        }
+
+        const itemLength = serialized.length + (batchParts.length ? 1 : 0);
+        if (batchParts.length && batchLength + itemLength > HANDOFF_CHUNK_CHARS) {
+          await flushBatch();
+        }
+
+        if (serialized.length + 2 > HANDOFF_CHUNK_CHARS) {
+          // A single conversation can itself contain many attachments. Flush
+          // normal-sized batches first, then chunk this one-conversation array.
+          await flushBatch();
+          await sendBatch('[' + serialized + ']');
+        } else {
+          batchParts.push(serialized);
+          batchLength += serialized.length + (batchParts.length > 1 ? 1 : 0);
+        }
+
+        // The background worker now owns the serialized representation. Release
+        // the large object (especially base64 assets) to limit peak memory.
+        payload.conversations[i] = null;
       }
 
-      const itemLength = serialized.length + (batchParts.length ? 1 : 0);
-      if (batchParts.length && batchLength + itemLength > HANDOFF_CHUNK_CHARS) {
-        await flushBatch();
-      }
-
-      if (serialized.length + 2 > HANDOFF_CHUNK_CHARS) {
-        // A single conversation can itself contain many attachments. Flush
-        // normal-sized batches first, then chunk this one-conversation array.
-        await flushBatch();
-        await sendBatch('[' + serialized + ']');
-      } else {
-        batchParts.push(serialized);
-        batchLength += serialized.length + (batchParts.length > 1 ? 1 : 0);
-      }
-
-      // The background worker now owns the serialized representation. Release
-      // the large object (especially base64 assets) to limit peak memory.
-      payload.conversations[i] = null;
+      await flushBatch();
+      return await sendRuntimeMessage({ type: 'syncNormalized', transferId });
+    } catch (error) {
+      try { await sendRuntimeMessage({ type: 'syncTransferAbort', transferId }); } catch {}
+      throw error;
     }
-
-    await flushBatch();
-    return sendRuntimeMessage({ type: 'syncNormalized', transferId });
   }
 
   async function maybeAutoSync() {
