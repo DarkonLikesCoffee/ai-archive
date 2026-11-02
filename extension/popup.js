@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 const status = $('status');
 let activeSync = false;
 
-async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'last_sync', 'last_sync_diagnostics']); }
+async function settings() { return chrome.storage.local.get(['github_owner', 'github_repo', 'github_token', 'archive_account', 'archive_account_pending', 'auto_sync', 'last_sync', 'last_sync_diagnostics']); }
 
 let selectedArchiveAccount = '';
 let knownArchiveAccounts = [];
@@ -53,12 +53,12 @@ function updateAccountText(stored, account) {
     : `GitHub: ${stored.github_owner}/${stored.github_repo} · select an archive account`;
 }
 
-async function chooseArchiveAccount(value) {
+async function chooseArchiveAccount(value, { pending = false } = {}) {
   const account = normalizeAccountName(value);
   if (!account || !knownArchiveAccounts.includes(account)) {
     throw new Error('Choose an account from the saved account list, or create a new one.');
   }
-  await chrome.storage.local.set({ archive_account: account });
+  await chrome.storage.local.set({ archive_account: account, archive_account_pending: pending });
   const stored = await settings();
   $('accountLogged').value = account;
   selectedArchiveAccount = account;
@@ -87,11 +87,11 @@ async function createArchiveAccount() {
 
   const accounts = [...knownArchiveAccounts, requested];
   renderAccountOptions(accounts, requested);
-  await chooseArchiveAccount(requested);
+  await chooseArchiveAccount(requested, { pending: true });
   $('newAccountSection').classList.add('hidden');
   $('newAccountName').value = '';
   status.className = 'status ok';
-  status.textContent = `New archive account "${requested}" created and selected. Its conversations will be kept separate.`;
+  status.textContent = `New account "${requested}" selected. Its archive folder will be created on the next sync.`;
   return requested;
 }
 
@@ -215,20 +215,38 @@ async function refresh() {
       accountError = error?.message || 'Could not load saved archive accounts.';
     }
 
-    let selected = storedAccount;
-    if (!selected && !accountError) {
-      if (accounts.length === 1) selected = accounts[0];
-      else if (accounts.length === 0) selected = 'personal';
+    let selected = '';
+    let pendingSelection = false;
+    if (accountError) {
+      selected = storedAccount;
+      pendingSelection = s.archive_account_pending === true;
+    } else if (storedAccount) {
+      const matchingExisting = accounts.find((name) => accountSlug(name) === accountSlug(storedAccount));
+      if (matchingExisting) {
+        selected = matchingExisting;
+      } else if (s.archive_account_pending === true || accounts.length === 0) {
+        selected = storedAccount;
+        pendingSelection = true;
+      }
+      // A saved account that is absent from a non-empty archive index and was
+      // not deliberately created locally may be a previous typo. Require the
+      // user to pick a real account rather than silently syncing into it.
+    } else if (accounts.length === 1) {
+      selected = accounts[0];
+    } else if (accounts.length === 0) {
+      selected = 'personal';
+      pendingSelection = true;
     }
+
     renderAccountOptions(accounts, selected);
-    if (selected && selected !== storedAccount) {
-      await chrome.storage.local.set({ archive_account: selected });
+    if (selected && (selected !== storedAccount || pendingSelection !== (s.archive_account_pending === true))) {
+      await chrome.storage.local.set({ archive_account: selected, archive_account_pending: pendingSelection });
     }
     $('accountHelp').textContent = accountError
       ? `Could not refresh saved account names. Your saved selection is unchanged. ${accountError}`
       : accounts.length > 1 && !selected
-        ? 'Several accounts already exist. Select the correct one before syncing; or create a new account intentionally.'
-        : 'Select an existing account, or create a new one. The selected account is remembered for future syncs.';
+        ? 'Several accounts exist, and the saved selection does not match them. Choose the correct existing account or deliberately create a new one before syncing.'
+        : 'Select an existing account, or create a new one. Your selection is remembered for future syncs.';
     updateAccountText(s, selected);
   } else {
     selectedArchiveAccount = '';
@@ -313,7 +331,7 @@ $('save').onclick = async () => {
     try { data = await r.json(); } catch {}
     const problem = describeRepoCheck(r.status, data, owner, repo);
     if (problem) throw Error(problem);
-    await chrome.storage.local.remove('archive_account');
+    await chrome.storage.local.remove(['archive_account', 'archive_account_pending']);
     await chrome.storage.local.set({ github_owner: owner, github_repo: repo, github_token: token, auto_sync: false, auto_sync_configured: true });
     status.className = 'status ok'; status.textContent = 'GitHub settings saved. Automatic sync is OFF.'; await refresh();
   } catch (e) { status.className = 'status err'; status.textContent = e.message; }
@@ -387,7 +405,7 @@ $('cancel').onclick = async () => {
   chrome.runtime.sendMessage({ type: 'cancelSync' }).catch(() => {});
 };
 
-$('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'auto_sync', 'auto_sync_configured']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
+$('clear').onclick = async () => { await chrome.storage.local.remove(['github_owner', 'github_repo', 'github_token', 'archive_account', 'archive_account_pending', 'auto_sync', 'auto_sync_configured']); status.textContent = 'GitHub settings removed from this extension.'; refresh(); };
 
 $('copyDiagnostics').onclick = async () => {
   if (!lastDiagnostics) return;
