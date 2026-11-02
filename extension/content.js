@@ -1112,6 +1112,32 @@
     const problemIds = new Set([...(details.problems || []).map((p) => p.message_id), ...(details.unarchived_files || []).map((f) => f.message_id)].filter(Boolean));
     const withFiles = messages.filter(hasFiles);
     const shown = withFiles.filter((m, i) => i < 30 || problemIds.has(m?.uuid));
+
+    // Claude emits tool_use and tool_result in separate transcript messages.
+    // Index the full conversation so diagnostics for a file-bearing message
+    // can include the matching call/result pair without exposing raw IDs.
+    const toolRefs = new Map();
+    const toolUses = new Map();
+    let toolRefNumber = 0;
+    for (const message of messages) {
+      for (const block of (Array.isArray(message?.content) ? message.content : [])) {
+        if (block?.type === 'tool_use' && typeof block.id === 'string') {
+          toolRefs.set(block.id, `tool-${++toolRefNumber}`);
+          toolUses.set(block.id, block);
+        }
+      }
+    }
+    const toolResults = new Map();
+    for (const message of messages) {
+      for (const block of (Array.isArray(message?.content) ? message.content : [])) {
+        if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+          const results = toolResults.get(block.tool_use_id) || [];
+          results.push(block);
+          toolResults.set(block.tool_use_id, results);
+        }
+      }
+    }
+
     return {
       conversation_id: conversationId,
       outcome,
@@ -1123,30 +1149,6 @@
         : null,
       message_count: messages.length,
       messages_with_files_total: withFiles.length,
-      // Tool calls and results are separate messages in Claude's transcript.
-      // Build a conversation-wide index so a file-bearing tool_result can be
-      // linked back to the assistant tool_use that produced it.
-      const toolRefs = new Map();
-      const toolUses = new Map();
-      let toolRefNumber = 0;
-      for (const message of messages) {
-        for (const block of (Array.isArray(message?.content) ? message.content : [])) {
-          if (block?.type === 'tool_use' && typeof block.id === 'string') {
-            toolRefs.set(block.id, `tool-${++toolRefNumber}`);
-            toolUses.set(block.id, block);
-          }
-        }
-      }
-      const toolResults = new Map();
-      for (const message of messages) {
-        for (const block of (Array.isArray(message?.content) ? message.content : [])) {
-          if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-            const results = toolResults.get(block.tool_use_id) || [];
-            results.push(block);
-            toolResults.set(block.tool_use_id, results);
-          }
-        }
-      }
       // Messages carrying files, where attachment problems come from.
       messages_with_files: shown.map((m) => {
         const ownToolBlocks = (Array.isArray(m?.content) ? m.content : [])
@@ -1175,8 +1177,7 @@
             .filter((block) => block?.type === 'tool_use' && /^[a-z0-9_.-]{1,48}$/i.test(String(block.name || '')))
             .map((block) => block.name))],
           // Preserve sanitized tool calls/results related to this file-bearing
-          // message, even when Claude places the call and result in separate
-          // transcript messages.
+          // message, even when Claude places the call and result separately.
           tool_blocks: toolBlocks.map((block) => ({
             type: sanitizeShape(block.type, 'type'),
             ...(block.type === 'tool_use' && toolRefs.has(block.id) ? { tool_ref: toolRefs.get(block.id) } : {}),
