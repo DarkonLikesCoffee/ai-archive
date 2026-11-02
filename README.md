@@ -1,5 +1,11 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.8 — archive account selection
+- The extension loads existing Claude archive account names from `archive/index.json` into a dropdown.
+- Selecting an existing account reuses its exact saved name; normal sync no longer requires typing it.
+- A separate action creates and selects a new account intentionally.
+- A saved account that does not match a non-empty archive index is not silently used unless it was deliberately created locally; choose an existing account before syncing.
+
 A personal, portable archive for AI conversations. GitHub is the source of truth; conversations are stored as human-readable Markdown files. Claude is the first provider, but the data model is provider/account independent so ChatGPT, Gemini and other providers can be added later.
 
 ## What changed in this version
