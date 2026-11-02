@@ -302,13 +302,14 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
   vm.runInNewContext(`${fastSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
-  conversationPath, indexEntry, sha256, archiveState, broadcast,
+  conversationPath, indexEntry, sha256, archiveState, archiveAccounts, broadcast,
 };
 `, context, { filename: 'extension/background.js' });
 
   return {
     sync: context.__testHooks.sync,
     archiveState: context.__testHooks.archiveState,
+    archiveAccounts: context.__testHooks.archiveAccounts,
     storedValues: () => storedValues,
     hooks: context.__testHooks,
     requests,
@@ -1412,6 +1413,35 @@ function archivedEntry(id, extra = {}) {
     exporter_version: 1, ...extra,
   };
 }
+
+test('archive account picker lists unique Claude account names and the current account', async () => {
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [
+    { provider: 'claude', account: 'logan' },
+    { provider: 'claude', account: 'work' },
+    { provider: 'claude', account: 'logan' },
+    { provider: 'chatgpt', account: 'not-a-claude-account' },
+  ] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const accounts = JSON.parse(JSON.stringify(await harness.archiveAccounts()));
+  assert.deepEqual(accounts, ['logan', 'personal', 'work']);
+  assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/trees/base-tree')), false,
+    'account discovery should read the index without downloading the full repository tree');
+});
+
+test('archive account picker reads account names when a large index needs blob fallback', async () => {
+  const indexText = JSON.stringify({ version: 2, conversations: [
+    { provider: 'claude', account: 'work' },
+  ] });
+  const harness = makeBackgroundSyncHarness({ indexText, indexEncoding: 'none' });
+  const accounts = JSON.parse(JSON.stringify(await harness.archiveAccounts()));
+  assert.deepEqual(accounts, ['personal', 'work']);
+  assert.ok(harness.requests.some((request) => request.pathname.endsWith('/git/blobs/large-index-blob')));
+});
+
+test('archive account picker refuses to use a corrupt archive index', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: '{invalid json' });
+  await assert.rejects(harness.archiveAccounts(), /archive\/index\.json is invalid JSON/);
+});
 
 test('incremental archive state lists only complete conversations written by the current exporter', async () => {
   const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [
