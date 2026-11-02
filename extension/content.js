@@ -810,7 +810,7 @@
         assets.push({
           name,
           mime: attachment.file_type || 'text/plain',
-          base64: bytesToBase64(buffer),
+          base64: archivedAssetBase64(buffer),
           size: buffer.byteLength,
           sha256: hash,
           source: 'attachment-extracted',
@@ -921,7 +921,7 @@
         assets.push({
           name,
           mime,
-          base64: bytesToBase64(buffer),
+          base64: archivedAssetBase64(buffer),
           size: bytes.byteLength,
           sha256: hash,
           source: index === null ? 'tool-result' : 'message-content',
