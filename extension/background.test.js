@@ -1538,6 +1538,73 @@ test('a finished sync is not reported as still fetching to a reopened popup', as
   assert.notEqual(state.stage, 'fetching');
 });
 
+
+test('reassembles bounded conversation batches and rejects incomplete transfers', async () => {
+  const background = loadBackgroundForSyncState();
+  const metadata = { skipped: [], unchangedIds: ['old-1'], fullList: true, listed: 2 };
+  assert.equal(background.send({
+    type: 'syncTransferStart',
+    transferId: 'batches-1',
+    conversationCount: 2,
+    metadata,
+  }).ok, true);
+
+  const data = JSON.stringify([{ external_id: 'new-1' }, { external_id: 'new-2' }]);
+  const chunks = data.match(/[\s\S]{1,9}/g);
+  for (const [chunkIndex, chunk] of chunks.entries()) {
+    assert.equal(background.send({
+      type: 'syncTransferBatchChunk',
+      transferId: 'batches-1',
+      batchIndex: 0,
+      chunkIndex,
+      totalChunks: chunks.length,
+      data: chunk,
+    }).ok, true);
+  }
+
+  background.send({ type: 'syncNormalized', transferId: 'batches-1' }, { tab: { id: 7 } });
+  for (let i = 0; i < 20 && !background.broadcasts.some((m) => m.stage === 'error'); i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.match(background.broadcasts.find((m) => m.stage === 'error').error, /Configure GitHub settings/,
+    'the assembled conversations should reach sync()');
+
+  const incomplete = loadBackgroundForSyncState();
+  assert.equal(incomplete.send({
+    type: 'syncTransferStart',
+    transferId: 'batches-2',
+    conversationCount: 2,
+    metadata,
+  }).ok, true);
+  const partial = incomplete.send({ type: 'syncTransferBatchChunk', transferId: 'batches-2',
+    batchIndex: 0, chunkIndex: 0, totalChunks: 1, data: '[{"external_id":"only-one"}]' });
+  assert.equal(partial.ok, true);
+  let response;
+  incomplete.send({ type: 'syncNormalized', transferId: 'batches-2' }, { tab: { id: 7 } }, (value) => { response = value; });
+  assert.equal(response.ok, false, 'the finalizer must reject a missing conversation');
+  assert.match(response.error, /did not fully reach the extension/);
+});
+
+test('rejects conversation batch chunks that arrive out of order', () => {
+  const background = loadBackgroundForSyncState();
+  assert.equal(background.send({
+    type: 'syncTransferStart',
+    transferId: 'batches-order',
+    conversationCount: 1,
+    metadata: {},
+  }).ok, true);
+  const response = background.send({
+    type: 'syncTransferBatchChunk',
+    transferId: 'batches-order',
+    batchIndex: 0,
+    chunkIndex: 1,
+    totalChunks: 2,
+    data: '}',
+  });
+  assert.equal(response.ok, false);
+  assert.match(response.error, /out of order/);
+});
+
 test('reassembles a sync handed off in chunks before syncing', async () => {
   const background = loadBackgroundForSyncState();
   const text = JSON.stringify({ conversations: [], skipped: [], unchangedIds: [], fullList: true });
