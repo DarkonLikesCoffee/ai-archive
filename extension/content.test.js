@@ -46,6 +46,7 @@ function createHarness(conversation, {
   const transferStarts = new Map();
   const transferPayloads = new Map();
   const transferBatchStates = new Map();
+  const transferAssetStates = new Map();
   const progressMessages = [];
   let resolveFirstHandoff;
   const firstHandoff = new Promise((resolve) => { resolveFirstHandoff = resolve; });
@@ -115,6 +116,28 @@ function createHarness(conversation, {
           if (batch.chunks.length === batch.totalChunks) {
             transferPayloads.get(message.transferId).conversations.push(...JSON.parse(batch.chunks.join('')));
             transferBatchStates.delete(message.batchIndex);
+          }
+          callback?.({ ok: true });
+          return Promise.resolve();
+        }
+        if (message.type === 'syncTransferAssetChunk') {
+          transferChunks.push(message);
+          const key = `${message.conversationIndex}:${message.assetIndex}`;
+          let assetTransfer = transferAssetStates.get(key);
+          if (message.chunkIndex === 0) {
+            assetTransfer = { totalChunks: message.totalChunks, chunks: [] };
+            transferAssetStates.set(key, assetTransfer);
+          }
+          if (!assetTransfer || assetTransfer.totalChunks !== message.totalChunks
+            || message.chunkIndex !== assetTransfer.chunks.length) {
+            callback?.({ ok: false, error: 'out of order asset chunk in test' });
+            return Promise.resolve();
+          }
+          assetTransfer.chunks.push(message.data);
+          if (assetTransfer.chunks.length === assetTransfer.totalChunks) {
+            const conversation = transferPayloads.get(message.transferId).conversations[message.conversationIndex];
+            conversation.assets[message.assetIndex].base64 = assetTransfer.chunks.join('');
+            transferAssetStates.delete(key);
           }
           callback?.({ ok: true });
           return Promise.resolve();
@@ -2570,6 +2593,47 @@ function plainConversation(uuid, extraContent = []) {
   };
 }
 
+
+
+test('transfers asset bytes separately and strips duplicated inline base64 from raw message metadata', async () => {
+  const base64 = Buffer.from('large-ish inline attachment payload for transfer', 'utf8').toString('base64');
+  const conversation = {
+    uuid: 'conversation-with-inline-asset',
+    name: 'Inline asset transfer',
+    current_leaf_message_uuid: 'assistant-message',
+    chat_messages: [
+      {
+        uuid: 'user-message',
+        parent_message_uuid: ROOT,
+        sender: 'human',
+        content: [{ type: 'text', text: 'Please inspect this image.' }],
+      },
+      {
+        uuid: 'assistant-message',
+        parent_message_uuid: 'user-message',
+        sender: 'assistant',
+        content: [{
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: base64 },
+        }],
+      },
+    ],
+  };
+  const harness = createHarness(conversation);
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  const assetChunk = harness.transferChunks.find((message) => message.type === 'syncTransferAssetChunk');
+  assert.ok(assetChunk, 'inline asset bytes should use the independent asset channel');
+  const exported = handoff.conversations[0];
+  assert.equal(exported.assets.length, 1);
+  assert.equal(exported.assets[0].base64, base64, 'the background receives the exact base64 asset');
+  const rawMetadata = exported.messages.find((message) => message.external_id === 'assistant-message').metadata;
+  assert.notEqual(rawMetadata.content[0].source.data, base64,
+    'raw source metadata must not duplicate the binary string');
+  assert.match(rawMetadata.content[0].source.data, /omitted binary payload/);
+  harness.finishFirstHandoff({ ok: true });
+});
 
 test('streams all 812 conversations through bounded batches without a monolithic archive string', async () => {
   const list = Array.from({ length: 812 }, (_, index) => ({
