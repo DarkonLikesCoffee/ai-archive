@@ -1,5 +1,16 @@
 # AI Archive — autonomous development log
 
+## Cloud development integration — 2026-11-03
+
+- Added `.github/workflows/auto-merge-development.yml`.
+- It listens for successful completion of the existing `Web CI` workflow on pull-request events.
+- It resolves PRs associated with the exact tested commit and only merges same-repository PRs whose base is `development` and whose head SHA matches the successful CI run.
+- Merge strategy is squash. It does not check out or execute PR code in the privileged workflow and does not use admin/bypass flags.
+- Updated `CLAUDE.md` and `AUTOPILOT.md`: Claude Code cloud sessions should use `development` as the base, work on their session branch, and open PRs targeting `development`; automation handles integration after CI.
+- `master` remains excluded.
+- **Not yet verified:** this workflow has not yet been exercised by a real Claude Code cloud PR. Confirm the workflow-run trigger, permissions and GitHub merge policy on the first test PR. If repository rules require review, the workflow will not bypass them.
+- Existing `Web CI` covers extension syntax checks, extension unit tests, web unit tests and web production build. Browser E2E tests are not part of this CI workflow.
+
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
 ## Baseline handoff — 2026-11-03
