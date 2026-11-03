@@ -13,15 +13,16 @@ Work from this session was submitted as separate PRs targeting `development`. Al
 | #86 | Index v3 design proposal (sharded search caches) — **needs owner decision**; not implemented |
 | #87 | Extension E2E as a non-blocking CI job. Red until #83 merges (the failure is that known popup check) |
 | #88 | README: where the tokens are stored |
+| #89 | Read-only archive integrity verifier (ROADMAP P0.1) and the `web/scripts/verify-archive.mjs` command |
 
 Notes for the next session:
 - **Log order.** #83, #84 and #85 add log entries lower in this file, so parallel PRs would not conflict. Once all are merged, move them up so the newest comes first.
 - **Branch state.** Start from the latest `development`. Do not stack new work on unmerged PR branches.
-- **User verification pending.** Re-run the ~812-conversation sync on 0.5.20 and report the popup text if it fails; the message now names the step. The size of `archive/index.json` on GitHub tells how close the archive is to the 40 MiB index limit.
+- **User verification pending.** Run `web/scripts/verify-archive.mjs` (from #89) against the real archive with a read-only token. Re-run the ~812-conversation sync on 0.5.20 and report the popup text if it fails; the message now names the step. The size of `archive/index.json` on GitHub tells how close the archive is to the 40 MiB index limit.
 - **Earlier pending item.** The user still has to confirm the files of the six upgraded-workspace conversations.
 - **Next tasks**, in order:
   1. After #83 merges, check that `extension-e2e` is green on `development`.
-  2. ROADMAP P0.1: a read-only archive integrity verifier (index → files, SHA-256, sizes, orphans), tested with synthetic fixtures.
+  2. ROADMAP P0.2: work out which index fields can be rebuilt from Markdown and asset files (design and dry-run only); the verifier from #89 can check any rebuilt index.
   3. Implement index v3 only if #86 is approved.
   4. Audit finding 8: restrict `fetchAsset` to known Claude hosts, after collecting sanitized evidence of real URL shapes.
 
