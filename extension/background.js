@@ -854,6 +854,11 @@ function syncReportSummary(report) {
   let text = '';
   if (report.listed != null) text += ` Claude listed ${plural(report.listed, 'conversation', 'conversations')}.`;
   if (report.unchanged) text += ` ${plural(report.unchanged, 'unchanged conversation was', 'unchanged conversations were')} not downloaded again.`;
+  if (report.archiveStateError) {
+    text += report.fullList
+      ? ` The archive state could not be read (${report.archiveStateError}), so every conversation was downloaded again instead of skipping unchanged ones.`
+      : ` The archive state could not be read (${report.archiveStateError}), so this automatic sync checked only the latest conversations.`;
+  }
   const describeFailure = (item) => `"${item.title || item.id}" (${String(item.error || 'unknown error').slice(0, 160)})`;
   const failedNew = report.failed.filter((item) => !item.archived);
   const failedKept = report.failed.filter((item) => item.archived);
@@ -966,11 +971,12 @@ async function archiveState() {
     .map((entry) => ({ id: entry.id, updated_at: entry.updated_at }));
 }
 
-async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null } = {}) {
+async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null } = {}) {
   const unchanged = Array.isArray(unchangedIds) ? unchangedIds.map(String) : [];
   const failedItems = Array.isArray(skipped) ? skipped : [];
   const report = {
     listed: fullList && Number.isFinite(listed) ? listed : null,
+    ...(typeof archiveStateError === 'string' && archiveStateError ? { archiveStateError: archiveStateError.slice(0, 300), fullList } : {}),
     committed: [],
     unchanged: unchanged.length,
     incomplete: [],
@@ -1789,6 +1795,7 @@ function completeTransfer(msg) {
     unchangedIds: Array.isArray(metadata.unchangedIds) ? metadata.unchangedIds : [],
     fullList: metadata.fullList === true,
     listed: Number.isFinite(metadata.listed) ? metadata.listed : null,
+    archiveStateError: typeof metadata.archiveStateError === 'string' ? metadata.archiveStateError.slice(0, 300) : null,
     conversations: transfer.conversations,
   };
 }
@@ -1919,6 +1926,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       fullList: payload.fullList === true,
       unchangedIds: Array.isArray(payload.unchangedIds) ? payload.unchangedIds : [],
       listed: Number.isFinite(payload.listed) ? payload.listed : null,
+      archiveStateError: typeof payload.archiveStateError === 'string' ? payload.archiveStateError : null,
     })
       .finally(() => {
         if (runningTransferId === msg.transferId) runningTransferId = null;

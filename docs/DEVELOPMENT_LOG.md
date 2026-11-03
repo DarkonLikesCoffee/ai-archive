@@ -39,3 +39,11 @@ This file is the durable handoff between Claude Code sessions. Keep entries fact
 
 ### Next action
 Perform the read-only technical audit described in `AUTOPILOT.md`. Write findings to `docs/TECHNICAL_AUDIT.md`, then implement one small, high-priority issue with regression coverage. Do not begin a broad refactor or a new provider.
+
+## Archive-state fallback is reported — 2026-11-03 (audit finding 3)
+
+(Appended at the end to avoid merge conflicts with parallel PRs; reorder newest-first once they are merged.)
+- **Problem.** When `getArchiveState` failed (for example a GitHub 502 while reading the archive file list), `content.js` silently downloaded every conversation again; the outcome gave no hint why nothing was skipped as unchanged.
+- **Change.** `getArchivedState()` now returns the failure reason (sanitized, bounded); it travels in the transfer metadata as `archiveStateError`, is stored in `report.archiveStateError`, and the completion message says "The archive state could not be read (…), so every conversation was downloaded again…" (or, for an automatic sync, that only the latest conversations were checked). The sync is not marked partial: nothing was lost.
+- **Tests.** Extension unit tests 191/191 (new: content handoff carries the reason / no reason when the state is readable; background message variants). E2E: unchanged except the pre-existing popup failure fixed by PR #83.
+- **Next task.** Index v3 design document (audit finding 1c): move search text out of the single index blob, backward-compatible reader, migration notes. Design only, for owner review.
