@@ -43,9 +43,6 @@ function loadPopup({ tabs = {} } = {}) {
 globalThis.__renderAccountOptions = renderAccountOptions;
 globalThis.__findExistingAccountName = findExistingAccountName;
 globalThis.__createArchiveAccount = createArchiveAccount;
-globalThis.__loadDiagnostics = loadDiagnostics;
-globalThis.__isCurrentDiagnosticReport = isCurrentDiagnosticReport;
-globalThis.__getLastDiagnostics = () => lastDiagnostics;
 globalThis.__disconnectGithubSettings = disconnectGithubSettings;`, context);
   return {
     describeRepoCheck: context.__describeRepoCheck,
@@ -112,35 +109,9 @@ test('creating a slug variant selects the existing account instead of creating a
   assert.match(element('status').textContent, /no duplicate was created/);
 });
 
-test('clears a persisted diagnostic report created by an older extension version', async () => {
-  const { loadDiagnostics, getLastDiagnostics, refresh, element, storedSettings } = loadPopup();
-  await refresh();
-  const stale = { extension_version: '0.5.8', items: [{ outcome: 'failed' }] };
-  storedSettings.last_sync_diagnostics = stale;
-  await loadDiagnostics(stale);
-  assert.equal('last_sync_diagnostics' in storedSettings, false,
-    'the obsolete persistent record should be removed from extension storage');
-  assert.equal(getLastDiagnostics(), null, 'an older report should not be offered for copying');
-});
-
-test('keeps diagnostics from the current extension version visible', async () => {
-  const { loadDiagnostics, getLastDiagnostics, refresh } = loadPopup();
-  await refresh();
-  const current = { extension_version: '0.5.16', items: [{ outcome: 'incomplete' }] };
-  await loadDiagnostics(current);
-  assert.deepEqual(JSON.parse(JSON.stringify(getLastDiagnostics())), current);
-});
-
-test('does not consider a legacy diagnostic report without a version current', () => {
-  const { isCurrentDiagnosticReport } = loadPopup();
-  assert.equal(isCurrentDiagnosticReport({ items: [{ outcome: 'failed' }] }), false);
-  assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.8', items: [{ outcome: 'failed' }] }), false);
-  assert.equal(isCurrentDiagnosticReport({ extension_version: '0.5.16', items: [{ outcome: 'failed' }] }), true);
-});
-
 test('disconnect removes GitHub credentials and all persisted sync reports', async () => {
   const {
-    loadDiagnostics, getLastDiagnostics, disconnectGithubSettings, refresh,
+    disconnectGithubSettings, refresh,
     element, storedSettings,
   } = loadPopup();
 
@@ -158,9 +129,6 @@ test('disconnect removes GitHub credentials and all persisted sync reports', asy
   // The popup calls refresh() at module load; settle that initial async read
   // before exercising the persisted diagnostics lifecycle.
   await refresh();
-  await loadDiagnostics(storedSettings.last_sync_diagnostics);
-  assert.ok(getLastDiagnostics(), 'fixture should first display the persisted diagnostic report');
-
   await disconnectGithubSettings();
 
   for (const key of [
@@ -170,7 +138,6 @@ test('disconnect removes GitHub credentials and all persisted sync reports', asy
   ]) {
     assert.equal(key in storedSettings, false, `${key} should be removed`);
   }
-  assert.equal(getLastDiagnostics(), null);
   assert.equal(element('lastSync').textContent, '');
   assert.equal(element('syncReport').children.length, 0);
   assert.match(element('status').textContent, /previous sync reports removed/);
@@ -280,20 +247,18 @@ test('cancel never opens a tab, and an unresponsive Claude tab asks for a refres
   assert.equal(stale.created.length, 0);
 });
 
-test('a partial sync is labelled as such and lists each affected conversation with its ID', () => {
+test('summarizes incomplete conversations without repeating long file-error messages', () => {
   const { describeLastSync, describeSyncReport } = loadPopup();
   const now = Date.parse('2026-10-27T12:00:00Z');
-  assert.match(describeLastSync({ stage: 'done', at: '2026-10-27T11:58:00Z', message: 'Sync finished with problems: …', partial: true }, now), /^Last sync finished with problems 2 min ago: /);
-  const lines = JSON.parse(JSON.stringify(describeSyncReport({
-    failed: [{ id: 'c-1', title: 'Repaso de Information Science', error: 'HTTP 503', archived: false }, { id: 'c-2', title: 'Old', error: 'HTTP 500', archived: true }],
-    incomplete: [{ id: 'c-3', title: 'Base de datos', missing: ['BD-GICD-Tema2-MER+DC+UML.pdf'] }],
-    keptPrevious: [{ id: 'c-4', title: 'Kept' }],
-  })));
-  assert.deepEqual(lines, [
-    'Not exported, not in the archive yet: Repaso de Information Science (c-1) — HTTP 503',
-    'Not exported, archived copy kept: Old (c-2) — HTTP 500',
-    'Archived with files missing: Base de datos (c-3) — BD-GICD-Tema2-MER+DC+UML.pdf',
-    'Not updated, archived copy kept (new export is missing files): Kept (c-4)',
-  ]);
+  const report = {
+    incomplete: [{ id: 'c-3', title: 'Code block and image rendering fixes', missing: ['ai-conversation-archive-main.zip (35.4 MiB, too large to upload to GitHub)'] }],
+  };
+  assert.equal(describeLastSync({ stage: 'done', at: '2026-10-27T11:58:00Z', message: 'Sync finished with problems: details', partial: true, report }, now),
+    'Last sync finished with problems 2 min ago.');
+  assert.deepEqual(JSON.parse(JSON.stringify(describeSyncReport(report))), [{
+    type: 'incomplete', title: 'Code block and image rendering fixes', id: 'c-3',
+    subtitle: 'Conversation archived · attachments missing',
+    details: ['ai-conversation-archive-main.zip (35.4 MiB, too large to upload to GitHub)'],
+  }]);
   assert.deepEqual(JSON.parse(JSON.stringify(describeSyncReport(null))), []);
 });
