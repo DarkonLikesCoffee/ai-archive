@@ -1482,6 +1482,28 @@ test('a sync with unchanged conversations reports them and does not count them a
   assert.doesNotMatch(message, /not returned by Claude/);
 });
 
+test('a sync that could not read the archive state says every conversation was downloaded again', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const progress = [];
+  const result = await harness.sync(sampleConversation(), (event) => progress.push(event), [], {
+    fullList: true, listed: 1, unchangedIds: [], archiveStateError: 'GitHub 502: Server Error',
+  });
+  assert.equal(result.partial, false, 'a full download loses nothing, so the sync is not partial');
+  assert.equal(result.report.archiveStateError, 'GitHub 502: Server Error');
+  assert.match(progress.at(-1).message,
+    /The archive state could not be read \(GitHub 502: Server Error\), so every conversation was downloaded again instead of skipping unchanged ones\./);
+
+  const automatic = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const automaticProgress = [];
+  await automatic.sync(sampleConversation(), (event) => automaticProgress.push(event), [], { fullList: false, archiveStateError: 'GitHub 502: Server Error' });
+  assert.match(automaticProgress.at(-1).message, /so this automatic sync checked only the latest conversations\./);
+
+  const normal = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const normalProgress = [];
+  await normal.sync(sampleConversation(), (event) => normalProgress.push(event), [], { fullList: true, listed: 1 });
+  assert.doesNotMatch(normalProgress.at(-1).message, /archive state/);
+});
+
 test('records the exporter version for a previously archived conversation even when its Markdown is unchanged', async () => {
   // First sync writes the conversation; capture its index entry without the exporter version.
   const first = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
@@ -2281,26 +2303,4 @@ test('GitHub errors keep GitHub\'s own message, stay bounded, and never contain 
   const validation = gitHubError(response(422), JSON.stringify({ message: 'Validation Failed', errors: [{ code: 'missing_field' }] }), settings);
   assert.equal(validation.inputTooLarge, false, 'other 422 responses are not size errors');
   assert.equal(gitHubError(response(413), 'Request Entity Too Large', settings).inputTooLarge, true);
-});
-
-test('a sync that could not read the archive state says every conversation was downloaded again', async () => {
-  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
-  const progress = [];
-  const result = await harness.sync(sampleConversation(), (event) => progress.push(event), [], {
-    fullList: true, listed: 1, unchangedIds: [], archiveStateError: 'GitHub 502: Server Error',
-  });
-  assert.equal(result.partial, false, 'a full download loses nothing, so the sync is not partial');
-  assert.equal(result.report.archiveStateError, 'GitHub 502: Server Error');
-  assert.match(progress.at(-1).message,
-    /The archive state could not be read \(GitHub 502: Server Error\), so every conversation was downloaded again instead of skipping unchanged ones\./);
-
-  const automatic = makeBackgroundSyncHarness({ indexText: emptyIndex() });
-  const automaticProgress = [];
-  await automatic.sync(sampleConversation(), (event) => automaticProgress.push(event), [], { fullList: false, archiveStateError: 'GitHub 502: Server Error' });
-  assert.match(automaticProgress.at(-1).message, /so this automatic sync checked only the latest conversations\./);
-
-  const normal = makeBackgroundSyncHarness({ indexText: emptyIndex() });
-  const normalProgress = [];
-  await normal.sync(sampleConversation(), (event) => normalProgress.push(event), [], { fullList: true, listed: 1 });
-  assert.doesNotMatch(normalProgress.at(-1).message, /archive state/);
 });
