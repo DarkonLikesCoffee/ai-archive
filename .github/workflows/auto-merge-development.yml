@@ -1,0 +1,47 @@
+name: Auto-merge Claude cloud work into development
+
+on:
+  workflow_run:
+    workflows:
+      - Web CI
+    types:
+      - completed
+
+# This workflow runs with write permissions only after the unprivileged PR CI
+# workflow has completed. It never checks out or executes pull-request code.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge-verified-development-pr:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_branch != 'development' &&
+      github.event.workflow_run.head_branch != 'master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge matching PR into development
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Resolve PRs associated with this exact tested commit. Do not trust
+          # branch names alone: the PR head SHA must match the successful CI run.
+          prs="$(gh api --paginate "repos/${GH_REPO}/commits/${HEAD_SHA}/pulls"             --jq '.[] | select(.base.ref == "development" and .head.sha == env.HEAD_SHA and .head.repo.full_name == env.GH_REPO) | .number')"
+
+          if [[ -z "${prs}" ]]; then
+            echo "No same-repository PR targeting development matches the tested commit; nothing to merge."
+            exit 0
+          fi
+
+          while IFS= read -r pr_number; do
+            [[ -z "${pr_number}" ]] && continue
+            echo "Squash-merging PR #${pr_number} into development."
+            gh pr merge "${pr_number}" --repo "${GH_REPO}" --squash
+          done <<< "${prs}"
