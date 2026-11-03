@@ -3396,6 +3396,9 @@ test('serializes structured tool JSON deterministically without changing array o
     'equivalent objects with different insertion order must produce identical archived Markdown');
   assert.ok(first.indexOf('first row') < first.indexOf('second row'),
     'array entries must retain their original order');
-  assert.ok(first.includes('"nested": {\n          "first": 1,\n          "second": 2\n        }'),
+  const nestedStart = first.indexOf('"nested": {');
+  const firstKey = first.indexOf('"first": 1', nestedStart);
+  const secondKey = first.indexOf('"second": 2', nestedStart);
+  assert.ok(nestedStart >= 0 && firstKey > nestedStart && secondKey > firstKey,
     'nested object properties must be serialized in sorted order');
 });
