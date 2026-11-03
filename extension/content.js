@@ -860,7 +860,7 @@
       ? await fetchSandboxFiles(org, conversationId, messages, directAssets.filter(Boolean), signal, incomplete, sandboxInfo)
       : { assets: [], listStatus: null };
     if (sandboxSupported && listStatus === 404 && mayHaveSandboxFiles(messages)) {
-      incomplete.push({ kind: 'sandbox', reason: 'Claude returned HTTP 404 for this conversation\\'s file list, so files created by Claude\\'s tools may be missing' });
+      incomplete.push({ kind: "sandbox", reason: "Claude returned HTTP 404 for this conversation's file list, so files created by Claude's tools may be missing" });
     }
     for (const asset of sandbox) {
       const key = `${asset.source_path}|${asset.sha256}`;
