@@ -1603,11 +1603,11 @@ test('keeps every tool input field when the input is more than a bare command or
   assert.equal(sections[0], [
     '### Claude tool: artifacts',
     '',
-    '\`\`\`json\\n{\\n  "command": "create",\\n  "id": "hello",\\n  "language": "python",\\n  "title": "Hello"\\n}\\n\`\`\`',
+    '```json\\n{\\n  "command": "create",\\n  "id": "hello",\\n  "language": "python",\\n  "title": "Hello"\\n}```',
     '',
     '**content**',
     '',
-    '\`\`\`python\\ndef hello():\\n    print("hi")\\n\\n\`\`\`',
+    '```python\\ndef hello():\\n    print("hi")\\n\\n```',
     '',
     '<!-- /tool -->',
   ].join('\\n'), 'artifact content and metadata must survive');
@@ -1667,11 +1667,11 @@ test('renders multi-line tool input fields as readable fences closed by an end m
     '',
     '**file\\\\_text**',
     '',
-    '\`\`\`\`text\\nline one\\n\`\`\`\\nline with fence\\n<!-- /tool -->\\n\\n\`\`\`\`',
+    '```json\\n{\\n  "command": "create",\\n  "language": "x`y",\\n  "path": "/a.md"\\n}```',
     '',
     '<!-- /tool -->',
     '<!-- /tool -->',
-  ].join('\n'));
+    '````text\\nline one\\n```\\nline with fence\\n<!-- /tool -->\\n\\n````',
   assert.equal(sections[1].includes(wrappedBase64), false, 'line-wrapped base64 must not be dumped');
   assert.match(sections[1], /"data": "\[omitted inline payload: 354 characters\]"/);
   assert.equal(sections[1].includes('<!-- /tool -->'), false);
