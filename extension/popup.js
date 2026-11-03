@@ -48,9 +48,11 @@ function renderAccountOptions(accounts, selected) {
 }
 
 function updateAccountText(stored, account) {
-  $('accountText').textContent = account
-    ? `GitHub: ${stored.github_owner}/${stored.github_repo} · account: ${account}`
-    : `GitHub: ${stored.github_owner}/${stored.github_repo} · select an archive account`;
+  $('githubIdentity').textContent = stored.github_owner || 'GitHub account not configured';
+  $('githubRepository').textContent = stored.github_repo ? `Repository: ${stored.github_repo}` : '';
+  $('accountHelp').textContent = account
+    ? 'This profile keeps its conversations in a separate folder inside the repository.'
+    : 'Choose an existing archive profile, or create a new one.';
 }
 
 async function chooseArchiveAccount(value, { pending = false } = {}) {
@@ -108,78 +110,81 @@ function describeLastSync(record, now = Date.now()) {
   const label = record.stage === 'error' ? 'Last sync failed'
     : record.stage === 'cancelled' ? 'Last sync cancelled'
       : record.partial ? 'Last sync finished with problems' : 'Last sync';
-  // Long enough for a failure to name the attachment and GitHub's reason;
-  // the per-conversation report lists the rest.
-  const text = String(record.message || '');
-  const message = text.length > 900 ? `${text.slice(0, 900)}…` : text;
-  return message ? `${label} ${when}: ${message}` : `${label} ${when}.`;
+  const hasReport = Boolean(record.report && (
+    record.report.incomplete?.length || record.report.failed?.length || record.report.keptPrevious?.length
+  ));
+  const message = hasReport ? '' : String(record.message || '');
+  const summary = message.length > 150 ? `${message.slice(0, 150)}…` : message;
+  return summary ? `${label} ${when}: ${summary}` : `${label} ${when}.`;
 }
 
-// One line per conversation that was not archived completely, so a partial
-// sync can be checked conversation by conversation (titles plus IDs).
 function describeSyncReport(report) {
   if (!report || typeof report !== 'object') return [];
-  const lines = [];
-  const name = (item) => `${item.title || item.id} (${item.id})`;
+  const entries = [];
   for (const item of Array.isArray(report.failed) ? report.failed : []) {
-    lines.push(`Not exported${item.archived ? ', archived copy kept' : ', not in the archive yet'}: ${name(item)} — ${item.error || 'unknown error'}`);
+    entries.push({ type: 'failed', title: item.title || item.id, id: item.id,
+      subtitle: item.archived ? 'Not exported · previous archive kept' : 'Not exported · not in archive',
+      details: [item.error || 'Unknown error'] });
   }
   for (const item of Array.isArray(report.incomplete) ? report.incomplete : []) {
-    lines.push(`Archived with files missing: ${name(item)} — ${(item.missing || []).join(', ')}`);
+    entries.push({ type: 'incomplete', title: item.title || item.id, id: item.id,
+      subtitle: 'Conversation archived · attachments missing',
+      details: Array.isArray(item.missing) ? item.missing : [] });
   }
   for (const item of Array.isArray(report.keptPrevious) ? report.keptPrevious : []) {
-    lines.push(`Not updated, archived copy kept (new export is missing files): ${name(item)}`);
+    entries.push({ type: 'kept', title: item.title || item.id,
+      subtitle: 'Previous archive kept · new export incomplete',
+      details: Array.isArray(item.missing) ? item.missing : [] });
   }
-  return lines;
+  return entries;
 }
 
 function showSyncReport(report) {
-  const list = $('syncReport');
-  if (!list) return;
-  list.replaceChildren(...describeSyncReport(report).map((line) => {
-    const item = document.createElement('li');
-    item.textContent = line;
-    return item;
-  }));
-  list.classList.toggle('hidden', !list.children.length);
-}
-
-// The sanitized diagnostics the content script stored for the last sync (see
-// sanitizeShape in content.js), offered for copying when there are any.
-let lastDiagnostics = null;
-
-function currentExtensionVersion() {
-  try { return chrome.runtime?.getManifest?.()?.version || null; }
-  catch { return null; }
-}
-
-function isCurrentDiagnosticReport(diagnostics) {
-  const version = currentExtensionVersion();
-  return Boolean(version
-    && diagnostics?.extension_version === version
-    && Array.isArray(diagnostics.items)
-    && diagnostics.items.length);
-}
-
-function showDiagnostics(diagnostics) {
-  lastDiagnostics = isCurrentDiagnosticReport(diagnostics) ? diagnostics : null;
-  $('copyDiagnostics')?.classList.toggle('hidden', !lastDiagnostics);
-}
-
-// Old extension versions wrote diagnostics without a version. Clear those
-// records on upgrade instead of surfacing an unrelated report indefinitely.
-async function loadDiagnostics(diagnostics) {
-  const version = currentExtensionVersion();
-  if (diagnostics && version && diagnostics.extension_version !== version) {
-    try { await chrome.storage.local.remove('last_sync_diagnostics'); } catch {}
-    showDiagnostics(null);
+  const panel = $('syncReport');
+  if (!panel) return;
+  const entries = describeSyncReport(report);
+  if (!entries.length) {
+    panel.replaceChildren();
+    panel.classList.add('hidden');
     return;
   }
-  showDiagnostics(diagnostics);
-}
-
-function diagnosticReportText(diagnostics, version) {
-  return JSON.stringify({ report: 'AI Archive sync diagnostics', extension_version: version || null, ...diagnostics }, null, 2);
+  const summary = document.createElement('div');
+  summary.className = 'report-summary';
+  const title = document.createElement('strong');
+  title.textContent = `${entries.length} conversation${entries.length === 1 ? '' : 's'} need attention`;
+  const note = document.createElement('span');
+  note.textContent = 'Expand an item to see which attachment was skipped.';
+  summary.append(title, note);
+  const list = document.createElement('div');
+  list.className = 'report-list';
+  for (const entry of entries) {
+    const details = document.createElement('details');
+    details.className = `report-item ${entry.type}`;
+    const heading = document.createElement('summary');
+    const labels = document.createElement('span');
+    labels.className = 'report-heading';
+    const main = document.createElement('span');
+    main.className = 'report-title';
+    main.textContent = entry.title;
+    const state = document.createElement('span');
+    state.className = 'report-state';
+    state.textContent = entry.subtitle;
+    labels.append(main, state);
+    heading.append(labels);
+    details.append(heading);
+    const body = document.createElement('div');
+    body.className = 'report-details';
+    for (const line of entry.details) {
+      const row = document.createElement('div');
+      row.className = 'report-detail-line';
+      row.textContent = line;
+      body.append(row);
+    }
+    details.append(body);
+    list.append(details);
+  }
+  panel.replaceChildren(summary, list);
+  panel.classList.remove('hidden');
 }
 
 function setProgress(msg) {
@@ -230,7 +235,6 @@ async function refresh() {
   $('autoSync').checked = s.auto_sync === true;
   $('lastSync').textContent = describeLastSync(s.last_sync);
   showSyncReport(s.last_sync?.report);
-  await loadDiagnostics(s.last_sync_diagnostics);
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
     const storedAccount = normalizeAccountName(s.archive_account);
@@ -447,9 +451,7 @@ async function disconnectGithubSettings() {
   ]);
   selectedArchiveAccount = '';
   knownArchiveAccounts = [];
-  lastDiagnostics = null;
   showSyncReport(null);
-  showDiagnostics(null);
   $('lastSync').textContent = '';
   $('accountText').textContent = '';
   status.className = 'status ok';
@@ -466,28 +468,16 @@ $('clear').onclick = async () => {
   }
 };
 
-$('copyDiagnostics').onclick = async () => {
-  if (!lastDiagnostics) return;
-  try {
-    await navigator.clipboard.writeText(diagnosticReportText(lastDiagnostics, chrome.runtime.getManifest?.()?.version));
-    status.className = 'status ok';
-    status.textContent = 'Diagnostic report copied. It contains no message text, titles, file names, file contents or credentials.';
-  } catch (e) {
-    status.className = 'status err';
-    status.textContent = `Could not copy the diagnostic report: ${e.message}`;
-  }
-};
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'syncProgress') return;
   setProgress(msg);
   if (msg.stage === 'fetching' && Number(msg.current) === 0) {
-    showDiagnostics(null);
   }
   if (['done', 'error', 'cancelled'].includes(msg.stage)) {
-    $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error, partial: msg.partial === true });
+    $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error, partial: msg.partial === true, report: msg.report });
     showSyncReport(msg.report);
-    chrome.storage.local.get('last_sync_diagnostics').then((stored) => loadDiagnostics(stored.last_sync_diagnostics)).catch(() => showDiagnostics(null));
+
   }
 });
 chrome.runtime.sendMessage({ type: 'getSyncState' }, (state) => { if (!chrome.runtime.lastError && state?.running) setProgress(state); });
