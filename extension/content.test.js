@@ -1663,14 +1663,14 @@ test('renders multi-line tool input fields as readable fences closed by an end m
   assert.equal(sections[0], [
     '### Claude tool: str_replace_based_edit_tool',
     '',
-    '```json\\n{\\n  "command": "create",\\n  "language": "x`y",\\n  "path": "/a.md"\\n}```',
+    '```json\n{\n  "command": "create",\n  "language": "x`y",\n  "path": "/a.md"\n}```',
     '',
-    '**file\\\\_text**',
+    '**file\\_text**',
     '',
-    '````text\\nline one\\n```\\nline with fence\\n<!-- /tool -->\\n\\n````',
+    '````text\nline one\n```\nline with fence\n<!-- /tool -->\n\n````',
     '',
     '<!-- /tool -->',
-  ].join('\\n'));
+  ].join('\n'));
   assert.equal(sections[1].includes(wrappedBase64), false, 'line-wrapped base64 must not be dumped');
   assert.match(sections[1], /"data": "\[omitted inline payload: 354 characters\]"/);
   assert.equal(sections[1].includes('<!-- /tool -->'), false);
