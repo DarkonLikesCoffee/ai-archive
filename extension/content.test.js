@@ -1603,14 +1603,14 @@ test('keeps every tool input field when the input is more than a bare command or
   assert.equal(sections[0], [
     '### Claude tool: artifacts',
     '',
-    '  "language": "python",\n' +
-    '  "title": "Hello"\n' +
+    '\`\`\`json\\n{\\n  "command": "create",\\n  "id": "hello",\\n  "language": "python",\\n  "title": "Hello"\\n}\\n\`\`\`',
+    '',
     '**content**',
     '',
-    '```python\ndef hello():\n    print("hi")\n\n```',
+    '\`\`\`python\\ndef hello():\\n    print("hi")\\n\\n\`\`\`',
     '',
     '<!-- /tool -->',
-  ].join('\n'), 'artifact content and metadata must survive');
+  ].join('\\n'), 'artifact content and metadata must survive');
   assert.deepEqual(json(sections[1]), conversation.chat_messages[1].content[1].input);
   assert.deepEqual(json(sections[2]), { command: 'ls -la', description: 'List files' });
   assert.deepEqual(json(sections[3]), { code: 'console.log(1)', timeout: 30 });
@@ -1661,15 +1661,15 @@ test('renders multi-line tool input fields as readable fences closed by an end m
   const content = handoff.conversations[0].messages[1].content;
   const sections = content.split('\n\n### ');
 
-  assert.equal(sections[0], [
     '### Claude tool: str_replace_based_edit_tool',
     '',
-    '  "language": "x`y",\n' +
-    '  "path": "/a.md"\n' +
-    '**file\\_text**',
+    '\`\`\`json\\n{\\n  "command": "create",\\n  "language": "x`y",\\n  "path": "/a.md"\\n}\\n\`\`\`',
     '',
-    '````text\nline one\n```\nline with fence\n<!-- /tool -->\n\n````',
+    '**file\\\\_text**',
     '',
+    '\`\`\`\`text\\nline one\\n\`\`\`\\nline with fence\\n<!-- /tool -->\\n\\n\`\`\`\`',
+    '',
+    '<!-- /tool -->',
     '<!-- /tool -->',
   ].join('\n'));
   assert.equal(sections[1].includes(wrappedBase64), false, 'line-wrapped base64 must not be dumped');
