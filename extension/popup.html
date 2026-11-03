@@ -4,17 +4,43 @@
 <meta charset="utf-8">
 <title>AI Archive</title>
 <style>
-  *{box-sizing:border-box} body{width:390px;margin:0;padding:18px;font:14px system-ui,-apple-system,sans-serif;background:#f6f6f6;color:#171717}
-  h1{margin:0 0 4px;font-size:20px}.muted{color:#666;margin:0 0 16px}.section{background:#fff;border:1px solid #ddd;border-radius:12px;padding:14px;margin-bottom:12px}
-  label{display:block;margin:10px 0 5px;font-weight:600}input,select{width:100%;padding:9px;border:1px solid #ccc;border-radius:8px;background:#fff;font:inherit}
-  button{width:100%;margin-top:10px;padding:10px;border:0;border-radius:8px;background:#111;color:#fff;font-weight:600;cursor:pointer}button.secondary{background:#e9e9e9;color:#111}button.danger{background:#b42318}button:disabled{opacity:.55;cursor:not-allowed}
-  .toggle{display:flex;gap:8px;align-items:center;font-weight:500}.toggle input{width:auto}.status{margin-top:10px;font-size:12px}.ok{color:#176b3a}.err{color:#b42318}
-  .progress{height:8px;background:#e4e4e4;border-radius:99px;overflow:hidden;margin:10px 0}.progress>div{height:100%;width:0;background:#111;transition:width .15s ease}.stage{font-weight:650}.details{font-size:12px;color:#666;line-height:1.45}.hidden{display:none}.hint{font-size:11px;color:#666;line-height:1.4;margin:8px 0 0}.report{margin:6px 0 0;padding-left:16px;font-size:11px;color:#8a3b12;line-height:1.4;max-height:160px;overflow-y:auto}.report li{margin:2px 0;word-break:break-word}
+  *{box-sizing:border-box}
+  body{width:390px;max-width:100%;margin:0;padding:16px;font:14px/1.45 system-ui,-apple-system,sans-serif;background:#f4f5f7;color:#1b1b1b}
+  h1{margin:0 0 3px;font-size:20px;line-height:1.25}
+  .muted{color:#666;margin:0 0 12px}
+  .section{background:#fff;border:1px solid #e1e3e6;border-radius:12px;padding:14px;margin-bottom:12px}
+  label{display:block;margin:10px 0 5px;font-weight:600}
+  input,select{width:100%;padding:9px 10px;border:1px solid #cdd1d6;border-radius:8px;background:#fff;font:inherit;color:inherit}
+  button{width:100%;margin-top:10px;padding:10px;border:0;border-radius:8px;background:#171717;color:#fff;font-weight:650;cursor:pointer}
+  button.secondary{background:#eceef1;color:#222}button.danger{background:#b42318}button:disabled{opacity:.55;cursor:not-allowed}
+  .toggle{display:flex;gap:8px;align-items:center;font-weight:500}.toggle input{width:auto}
+  .status{margin-top:10px;font-size:12px}.ok{color:#176b3a}.err{color:#b42318}
+  .identity{padding:10px 11px;background:#f6f7f8;border:1px solid #e6e8eb;border-radius:9px;margin-bottom:10px;display:grid;gap:2px}
+  .identity-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#69717b;font-weight:700}
+  #githubIdentity{font-size:14px}.identity-repo{font-size:11px;color:#68717d;overflow-wrap:anywhere}
+  .progress{height:8px;background:#e4e4e4;border-radius:99px;overflow:hidden;margin:10px 0}.progress>div{height:100%;width:0;background:#171717;transition:width .15s ease}
+  .stage{font-weight:650}.details{font-size:12px;color:#666;line-height:1.45}.hidden{display:none}
+  .hint{font-size:11px;color:#69717b;line-height:1.4;margin:8px 0 0}
+  .last-sync{font-size:12px;line-height:1.4;color:#626b75;margin-top:9px;overflow-wrap:anywhere}
+  .sync-report{margin-top:10px;border:1px solid #f0d5ab;background:#fffaf2;border-radius:9px;overflow:hidden}
+  .report-summary{padding:10px 11px 8px;display:grid;gap:2px;color:#77420d}
+  .report-summary strong{font-size:12px}.report-summary span{font-size:11px;color:#8b6a40}
+  .report-list{border-top:1px solid #f0dfc7}
+  .report-item{border-bottom:1px solid #f1e4d3}.report-item:last-child{border-bottom:0}
+  .report-item summary{list-style:none;cursor:pointer;padding:9px 11px;display:flex;align-items:flex-start;gap:8px}
+  .report-item summary::-webkit-details-marker{display:none}
+  .report-item summary:after{content:'+';font-size:15px;font-weight:600;color:#94652c;margin-left:auto;line-height:1}
+  .report-item[open] summary:after{content:'−'}
+  .report-heading{min-width:0;display:grid;gap:2px}
+  .report-title{font-size:12px;font-weight:650;color:#3e3326;overflow-wrap:anywhere}
+  .report-state{font-size:10px;color:#85613a}
+  .report-details{padding:0 11px 9px;font-size:11px;line-height:1.4;color:#76532d}
+  .report-detail-line{overflow-wrap:anywhere;padding-top:3px}
   #newAccountSection{margin-top:8px;padding:10px;background:#f7f7f7;border:1px solid #e5e5e5;border-radius:8px}
 </style>
 </head>
 <body>
-<h1>AI Archive</h1><p class="muted">Claude → private GitHub archive</p>
+<h1>AI Archive</h1><p class="muted">Claude → GitHub conversation archive</p>
 <section id="setup" class="section">
   <label>GitHub owner</label><input id="owner" placeholder="your-username">
   <label>Private repository</label><input id="repo" placeholder="ai-conversation-archive">
@@ -22,8 +48,12 @@
   <button id="save">Save GitHub settings</button>
 </section>
 <section id="logged" class="section hidden">
-  <div id="accountText" class="muted"></div>
-  <label>Archive account</label><select id="accountLogged"></select>
+  <div class="identity">
+    <span class="identity-label">Connected GitHub account</span>
+    <strong id="githubIdentity">Not connected</strong>
+    <span class="identity-repo" id="githubRepository"></span>
+  </div>
+  <label>Archive profile</label><select id="accountLogged"></select>
   <p id="accountHelp" class="hint">Choose an existing account, or create a new one.</p>
   <button id="addAccount" class="secondary" type="button">+ Create new account</button>
   <div id="newAccountSection" class="hidden">
@@ -42,9 +72,8 @@
   </select>
   <label class="toggle"><input id="autoSync" type="checkbox"><span>Automatically sync when Claude opens</span></label>
   <button id="sync">Sync Claude</button>
-  <div id="lastSync" class="muted"></div>
-  <ul id="syncReport" class="report hidden"></ul>
-  <button id="copyDiagnostics" class="secondary hidden" title="Copies the structure of Claude's responses for the conversations that were not archived completely: no message text, titles, file names, file contents or credentials">Copy diagnostic report</button>
+  <div id="lastSync" class="last-sync"></div>
+  <section id="syncReport" class="sync-report hidden" aria-live="polite"></section>
   <button id="clear" class="secondary">Disconnect</button>
 </section>
 <section id="progressSection" class="section hidden">
