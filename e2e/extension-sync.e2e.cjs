@@ -467,6 +467,58 @@ function handleClaude(url) {
         && !Object.keys(files).some((file) => file.endsWith(`big-${hugeIndex}.bin`)), last);
     }
 
+    // The shape of the conversation that failed on a real account with
+    // "Invalid string length": many inline base64 screenshots in tool results
+    // (whose bytes the raw message metadata used to carry a second time) plus
+    // several uploaded files and a long transcript, all in one conversation.
+    {
+      const screenshots = Array.from({ length: 6 }, () => crypto.randomBytes(6 * 1024 * 1024));
+      const uploads = Array.from({ length: 4 }, () => crypto.randomBytes(5 * 1024 * 1024));
+      const firstUpload = BIG_FILES.length;
+      BIG_FILES.push(...uploads);
+      const id = 'conv-heavy';
+      const chat_messages = [{
+        uuid: `${id}-m0`, parent_message_uuid: ROOT, sender: 'human', created_at: '2026-10-27T14:00:00Z',
+        content: [{ type: 'text', text: 'Review these files. ' + 'Context paragraph. '.repeat(20000) }],
+        files: uploads.map((_, n) => ({ file_uuid: `heavy-${n}`, file_name: `big-${firstUpload + n}.bin`, preview_url: `/api/fake-assets/big-${firstUpload + n}.bin` })),
+        attachments: [],
+      }];
+      let parent = chat_messages[0].uuid;
+      screenshots.forEach((bytes, n) => {
+        const uuid = `${id}-m${n + 1}`;
+        chat_messages.push({
+          uuid, parent_message_uuid: parent, sender: 'assistant', created_at: '2026-10-27T14:00:00Z',
+          content: [
+            { type: 'tool_use', id: `tool-${n}`, name: 'screenshot', input: { url: `https://example.com/page-${n}` } },
+            { type: 'tool_result', tool_use_id: `tool-${n}`, name: 'screenshot', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: bytes.toString('base64') } }] },
+            { type: 'text', text: `Screenshot ${n} looks fine.` },
+          ],
+          files: [], attachments: [],
+        });
+        parent = uuid;
+      });
+      claudeConversations.set(id, { uuid: id, name: 'Heavy conversation', created_at: '2026-10-01T00:00:00Z', updated_at: '2026-10-27T14:00:00Z', model: 'claude-test', current_leaf_message_uuid: parent, chat_messages });
+
+      const commitsBefore = github.commitCount();
+      const blobPostsBefore = github.requests.filter((r) => /^POST \S*\/git\/blobs$/.test(r)).length;
+      last = await syncAll();
+      files = github.files();
+      const heavyAssets = Object.entries(files).filter(([file]) => file.includes('/assets/conv-heavy-'));
+      const heavyMarkdown = Object.entries(files).find(([file]) => /Heavy-conversation--conv-heavy-/.test(file))?.[1]?.toString() || '';
+      check('a conversation with ~48 MB of inline screenshots and four uploads publishes in one commit',
+        github.commitCount() === commitsBefore + 1 && /1 conversation changed/.test(last), last.slice(0, 300));
+      check('every screenshot and upload of it is archived byte for byte',
+        heavyAssets.length === 10
+          && screenshots.every((bytes) => heavyAssets.some(([, content]) => content.equals(bytes)))
+          && uploads.every((bytes) => heavyAssets.some(([, content]) => content.equals(bytes))),
+        `${heavyAssets.length} assets`);
+      check('its Markdown carries no base64 payload', heavyMarkdown.length > 0 && heavyMarkdown.length < 1024 * 1024
+        && !heavyMarkdown.includes(screenshots[0].toString('base64').slice(0, 200)), `${heavyMarkdown.length} characters`);
+      const blobPosts = github.requests.filter((r) => /^POST \S*\/git\/blobs$/.test(r)).length - blobPostsBefore;
+      // 10 attachments + the Markdown + archive/index.json, each uploaded once.
+      check('each new file is uploaded to GitHub exactly once', blobPosts === 12, `blob uploads=${blobPosts}`);
+    }
+
     check('no page errors', errors.length === 0, errors.join(' | '));
   } finally {
     await context.close().catch(() => {}); // keep the original error if the browser died

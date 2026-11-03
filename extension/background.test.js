@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
-import { webcrypto } from 'node:crypto';
+import { webcrypto, createHash } from 'node:crypto';
 
 const MARKER_NONCE = '0123456789abcdef0123456789abcdef';
 const marker = (index) => `[[AI_ARCHIVE_INLINE_ASSET:${MARKER_NONCE}:${index}]]`;
@@ -313,6 +313,12 @@ globalThis.__testHooks = {
     storedValues: () => storedValues,
     hooks: context.__testHooks,
     requests,
+    send(message, sender = { tab: { id: 7 } }) {
+      let response;
+      listeners[0](message, sender, (value) => { response = value; });
+      return response;
+    },
+    request: (message, sender = { tab: { id: 7 } }) => new Promise((resolve) => listeners[0](message, sender, resolve)),
     metrics() {
       return { settingsReadCount, maxActiveBlobRequests, blobCount };
     },
@@ -1323,13 +1329,16 @@ function loadBackgroundForSyncState() {
     runtime: { onMessage: { addListener(listener) { listeners.push(listener); } }, sendMessage(message) { broadcasts.push(message); return Promise.resolve(); } },
     tabs: { sendMessage(tabId, message) { tabMessages.push({ tabId, message }); return Promise.resolve(); } },
   };
-  vm.runInNewContext(backgroundSource, { chrome, AbortController, fetch: () => new Promise(() => {}), Date: FakeDate });
+  vm.runInNewContext(backgroundSource, { chrome, AbortController, fetch: () => new Promise(() => {}), Date: FakeDate, TextEncoder, TextDecoder, Uint8Array, atob, btoa, crypto: webcrypto });
   const send = (message, sender = {}) => {
     let response;
     listeners[0](message, sender, (value) => { response = value; });
     return response;
   };
-  return { send, tabMessages, broadcasts, advance(ms) { now += ms; } };
+  // For messages the background may answer asynchronously (an attachment's
+  // last chunk is checked and staged before the answer).
+  const request = (message, sender = {}) => new Promise((resolve) => listeners[0](message, sender, resolve));
+  return { send, request, tabMessages, broadcasts, advance(ms) { now += ms; } };
 }
 
 test('reports the content script fetching phase to a reopened popup', () => {
@@ -1539,47 +1548,67 @@ test('a finished sync is not reported as still fetching to a reopened popup', as
 });
 
 
+const sha256Hex = (bytes) => createHash('sha256').update(bytes).digest('hex');
+
+// Builds the transfer messages content.js sends for `conversations`, chunked
+// at `chunkChars`: a header and one record per message, then attachments.
+function streamTransferMessages(transferId, conversations, { chunkChars = 9, recordsPerBatch = 2 } = {}) {
+  const messages = [];
+  let batchIndex = 0;
+  const pushBatch = (records) => {
+    const text = JSON.stringify(records);
+    const chunks = text.match(new RegExp(`[\\s\\S]{1,${chunkChars}}`, 'g'));
+    for (const [chunkIndex, data] of chunks.entries()) {
+      messages.push({ type: 'syncTransferBatchChunk', transferId, batchIndex, chunkIndex, totalChunks: chunks.length, totalChars: text.length, data });
+    }
+    batchIndex++;
+  };
+  for (const [conversationIndex, conversation] of conversations.entries()) {
+    const { messages: conversationMessages = [], assets = [], ...header } = conversation;
+    const records = [{
+      conversation_index: conversationIndex,
+      message_count: conversationMessages.length,
+      conversation: {
+        ...header,
+        assets: assets.map(({ base64, ...asset }) => ({ ...asset, base64: '', payload_chars: base64 ? base64.length : 0 })),
+      },
+    }, ...conversationMessages.map((message) => ({ conversation_index: conversationIndex, message }))];
+    for (let i = 0; i < records.length; i += recordsPerBatch) pushBatch(records.slice(i, i + recordsPerBatch));
+    for (const [assetIndex, asset] of assets.entries()) {
+      if (!asset.base64) continue;
+      const chunks = asset.base64.match(new RegExp(`[\\s\\S]{1,${chunkChars}}`, 'g'));
+      for (const [chunkIndex, data] of chunks.entries()) {
+        messages.push({ type: 'syncTransferAssetChunk', transferId, conversationIndex, assetIndex, chunkIndex, totalChunks: chunks.length, totalChars: asset.base64.length, data });
+      }
+    }
+  }
+  return messages;
+}
+
+function transferAsset(name, text) {
+  const bytes = Buffer.from(text, 'utf8');
+  return { name, size: bytes.length, sha256: sha256Hex(bytes), base64: bytes.toString('base64') };
+}
+
+async function deliverAll(background, messages) {
+  const responses = [];
+  for (const message of messages) responses.push(await background.request(message, { tab: { id: 7 } }));
+  return responses;
+}
+
 test('reassembles bounded conversation batches and rejects incomplete transfers', async () => {
   const background = loadBackgroundForSyncState();
-  const metadata = { skipped: [], unchangedIds: ['old-1'], fullList: true, listed: 2 };
-  assert.equal(background.send({
-    type: 'syncTransferStart',
-    transferId: 'batches-1',
-    conversationCount: 2,
-    metadata,
-  }).ok, true);
+  assert.equal(background.send({ type: 'syncTransferStart', transferId: 'batches-1' }, { tab: { id: 7 } }).ok, true);
 
-  const data = JSON.stringify([
-    { external_id: 'new-1', assets: [{ name: 'image.png', size: 12, sha256: 'hash-image', base64: '' }] },
-    { external_id: 'new-2', assets: [] },
-  ]);
-  const chunks = data.match(/[\s\S]{1,9}/g);
-  for (const [chunkIndex, chunk] of chunks.entries()) {
-    assert.equal(background.send({
-      type: 'syncTransferBatchChunk',
-      transferId: 'batches-1',
-      batchIndex: 0,
-      chunkIndex,
-      totalChunks: chunks.length,
-      data: chunk,
-    }).ok, true);
-  }
+  const conversations = [
+    { external_id: 'new-1', messages: [{ external_id: 'm1', content: 'one' }, { external_id: 'm2', content: 'two' }], assets: [transferAsset('image.png', 'hello world!')] },
+    { external_id: 'new-2', messages: [], assets: [] },
+  ];
+  const responses = await deliverAll(background, streamTransferMessages('batches-1', conversations));
+  assert.ok(responses.every((response) => response.ok), JSON.stringify(responses.find((response) => !response.ok)));
 
-  const assetText = 'aGVsbG8gd29ybGQh';
-  const assetChunks = assetText.match(/[\\s\\S]{1,5}/g);
-  for (const [chunkIndex, chunk] of assetChunks.entries()) {
-    assert.equal(background.send({
-      type: 'syncTransferAssetChunk',
-      transferId: 'batches-1',
-      conversationIndex: 0,
-      assetIndex: 0,
-      chunkIndex,
-      totalChunks: assetChunks.length,
-      data: chunk,
-    }).ok, true);
-  }
-
-  background.send({ type: 'syncNormalized', transferId: 'batches-1' }, { tab: { id: 7 } });
+  const metadata = { skipped: [], unchangedIds: ['old-1'], fullList: true, listed: 3 };
+  background.send({ type: 'syncNormalized', transferId: 'batches-1', conversationCount: 2, metadata }, { tab: { id: 7 } });
   for (let i = 0; i < 20 && !background.broadcasts.some((m) => m.stage === 'error'); i++) {
     await new Promise((resolve) => setImmediate(resolve));
   }
@@ -1587,67 +1616,57 @@ test('reassembles bounded conversation batches and rejects incomplete transfers'
     'the assembled conversations should reach sync()');
 
   const incomplete = loadBackgroundForSyncState();
-  assert.equal(incomplete.send({
-    type: 'syncTransferStart',
-    transferId: 'batches-2',
-    conversationCount: 2,
-    metadata,
-  }).ok, true);
-  const partial = incomplete.send({ type: 'syncTransferBatchChunk', transferId: 'batches-2',
-    batchIndex: 0, chunkIndex: 0, totalChunks: 1, data: '[{"external_id":"only-one"}]' });
-  assert.equal(partial.ok, true);
-  const response = incomplete.send({ type: 'syncNormalized', transferId: 'batches-2' }, { tab: { id: 7 } });
-  assert.equal(response.ok, false, 'the finalizer must reject a missing conversation');
-  assert.match(response.error, /did not fully reach the extension/);
+  assert.equal(incomplete.send({ type: 'syncTransferStart', transferId: 'batches-2' }).ok, true);
+  // Only the header of a conversation said to have two messages arrives.
+  const [header] = streamTransferMessages('batches-2', [{ external_id: 'only-one', messages: [{}, {}] }], { chunkChars: 10000, recordsPerBatch: 1 });
+  assert.equal(incomplete.send(header).ok, true);
+  const response = incomplete.send({ type: 'syncNormalized', transferId: 'batches-2', conversationCount: 1, metadata }, { tab: { id: 7 } });
+  assert.equal(response.ok, false, 'the finalizer must reject a conversation with missing messages');
+  assert.match(response.error, /did not fully reach the extension .*0 of 2 messages/);
+
+  const missingConversation = loadBackgroundForSyncState();
+  assert.equal(missingConversation.send({ type: 'syncTransferStart', transferId: 'batches-3' }).ok, true);
+  await deliverAll(missingConversation, streamTransferMessages('batches-3', [{ external_id: 'a', messages: [] }]));
+  const countMismatch = missingConversation.send({ type: 'syncNormalized', transferId: 'batches-3', conversationCount: 2, metadata }, { tab: { id: 7 } });
+  assert.equal(countMismatch.ok, false, 'the finalizer must reject a missing conversation');
+  assert.match(countMismatch.error, /1 of 2 conversations arrived/);
 });
 
 
-test('refuses to finalize a transfer while attachment chunks are incomplete', () => {
+test('refuses to finalize a transfer while attachment chunks are incomplete', async () => {
   const background = loadBackgroundForSyncState();
-  const started = background.send({
-    type: 'syncTransferStart',
-    transferId: 'asset-incomplete',
-    conversationCount: 1,
-    metadata: {},
-  });
-  assert.equal(started.ok, true);
-  const conversation = JSON.stringify([{ external_id: 'with-asset', assets: [{ name: 'large.bin', size: 10, sha256: 'sha', base64: '' }] }]);
-  assert.equal(background.send({
-    type: 'syncTransferBatchChunk',
-    transferId: 'asset-incomplete',
-    batchIndex: 0,
-    chunkIndex: 0,
-    totalChunks: 1,
-    data: conversation,
-  }).ok, true);
-  assert.equal(background.send({
-    type: 'syncTransferAssetChunk',
-    transferId: 'asset-incomplete',
-    conversationIndex: 0,
-    assetIndex: 0,
-    chunkIndex: 0,
-    totalChunks: 2,
-    data: 'YWJj',
-  }).ok, true);
-  const response = background.send({ type: 'syncNormalized', transferId: 'asset-incomplete' }, { tab: { id: 7 } });
+  assert.equal(background.send({ type: 'syncTransferStart', transferId: 'asset-incomplete' }).ok, true);
+  const messages = streamTransferMessages('asset-incomplete', [
+    { external_id: 'with-asset', messages: [], assets: [transferAsset('large.bin', 'abcdefghijklmnop')] },
+  ], { chunkChars: 8 });
+  const assetChunks = messages.filter((message) => message.type === 'syncTransferAssetChunk');
+  assert.ok(assetChunks.length > 1);
+  await deliverAll(background, messages.slice(0, -1));
+  const response = background.send({ type: 'syncNormalized', transferId: 'asset-incomplete', conversationCount: 1, metadata: {} }, { tab: { id: 7 } });
   assert.equal(response.ok, false);
   assert.match(response.error, /did not fully reach the extension/);
+
+  // An attachment whose metadata says it carries bytes that never arrive.
+  const neverSent = loadBackgroundForSyncState();
+  assert.equal(neverSent.send({ type: 'syncTransferStart', transferId: 'asset-missing' }).ok, true);
+  const headerOnly = messages.filter((message) => message.type === 'syncTransferBatchChunk')
+    .map((message) => ({ ...message, transferId: 'asset-missing' }));
+  await deliverAll(neverSent, headerOnly);
+  const missing = neverSent.send({ type: 'syncNormalized', transferId: 'asset-missing', conversationCount: 1, metadata: {} }, { tab: { id: 7 } });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /1 attachment\(s\) of conversation "with-asset" did not arrive/);
 });
 
 test('rejects conversation batch chunks that arrive out of order', () => {
   const background = loadBackgroundForSyncState();
-  assert.equal(background.send({
-    type: 'syncTransferStart',
-    transferId: 'batches-order',
-    conversationCount: 1,
-    metadata: {},
-  }).ok, true);
+  assert.equal(background.send({ type: 'syncTransferStart', transferId: 'batches-order' }).ok, true);
   const response = background.send({
     type: 'syncTransferBatchChunk',
     transferId: 'batches-order',
     batchIndex: 0,
     chunkIndex: 1,
     totalChunks: 2,
+    totalChars: 2,
     data: '}',
   });
   assert.equal(response.ok, false);
@@ -1795,4 +1814,232 @@ test('an incomplete export never replaces an archived copy that has files the ne
   assert.equal(harness.requests.some((r) => r.method === 'POST' || r.method === 'PATCH'), false);
   const done = progress.find((event) => event.stage === 'done');
   assert.match(done.message, /^Sync finished with problems: no archived conversation changed, so no GitHub commit was made\. Claude listed 1 conversation\. 1 conversation was not updated because the new export is missing files that are already archived; the archived copy was kept: "Base de datos"\.$/);
+});
+
+// ---- Streaming transfer receiver: malformed, interrupted and staged transfers ----
+
+async function startedTransfer(id = 'stream-1', sender = { tab: { id: 7 } }) {
+  const background = loadBackgroundForSyncState();
+  assert.equal(background.send({ type: 'syncTransferStart', transferId: id }, sender).ok, true);
+  return background;
+}
+
+function finalize(background, transferId, conversationCount) {
+  return background.send({ type: 'syncNormalized', transferId, conversationCount, metadata: {} }, { tab: { id: 7 } });
+}
+
+test('a duplicated, skipped or resized batch chunk fails the transfer and nothing can be finalized', async () => {
+  const conversations = [{ external_id: 'c1', messages: [{ external_id: 'm1', content: 'x'.repeat(40) }] }];
+  const messages = streamTransferMessages('dup', conversations, { chunkChars: 10, recordsPerBatch: 10 });
+  assert.ok(messages.length > 3);
+
+  const duplicated = await startedTransfer('dup');
+  assert.equal(duplicated.send(messages[0]).ok, true);
+  const again = duplicated.send(messages[0]);
+  assert.equal(again.ok, false, 'a repeated chunk must be refused');
+  assert.match(again.error, /interrupted|incomplete or out of order/);
+  assert.equal(duplicated.send(messages[1]).ok, false, 'the failed transfer accepts nothing more');
+  assert.equal(finalize(duplicated, 'dup', 1).ok, false);
+
+  const skipped = await startedTransfer('dup');
+  assert.equal(skipped.send(messages[0]).ok, true);
+  assert.equal(skipped.send(messages[2]).ok, false, 'a missing chunk must be detected');
+
+  const resized = await startedTransfer('dup');
+  assert.equal(resized.send(messages[0]).ok, true);
+  assert.equal(resized.send({ ...messages[1], totalChars: messages[1].totalChars + 1 }).ok, false,
+    'chunks of one batch must agree on its total length');
+
+  const truncated = await startedTransfer('dup');
+  const lastIndex = messages.length - 1;
+  for (const message of messages.slice(0, lastIndex)) assert.equal(truncated.send(message).ok, true);
+  const short = truncated.send({ ...messages[lastIndex], data: messages[lastIndex].data.slice(0, -1) });
+  assert.equal(short.ok, false, 'a batch shorter than announced must not be decoded');
+});
+
+test('an attachment corrupted in transfer is caught by its checksum before anything is published', async () => {
+  const asset = transferAsset('report.txt', 'The quarterly report, exactly as downloaded.');
+  const messages = streamTransferMessages('corrupt', [{ external_id: 'c1', messages: [], assets: [asset] }], { chunkChars: 16 });
+  const lastAsset = messages.findLastIndex((message) => message.type === 'syncTransferAssetChunk');
+  // Same length, one different character: only the checksum can tell.
+  const original = messages[lastAsset].data;
+  const flipped = (original[0] === 'A' ? 'B' : 'A') + original.slice(1);
+  const corrupted = messages.map((message, index) => (index === lastAsset ? { ...message, data: flipped } : message));
+
+  const background = await startedTransfer('corrupt');
+  const responses = await deliverAll(background, corrupted);
+  const failure = responses.at(-1);
+  assert.equal(failure.ok, false);
+  assert.match(failure.error, /"report\.txt" could not be received safely: (its contents do not match the checksum|it arrived with \d+ bytes)/);
+  assert.equal(finalize(background, 'corrupt', 1).ok, false, 'a corrupted transfer can never be finalized');
+
+  const reordered = await startedTransfer('reordered');
+  const reorderedMessages = streamTransferMessages('reordered', [{ external_id: 'c1', messages: [], assets: [asset] }], { chunkChars: 16 });
+  const assetChunks = reorderedMessages.filter((message) => message.type === 'syncTransferAssetChunk');
+  for (const message of reorderedMessages.filter((message) => message.type === 'syncTransferBatchChunk')) {
+    assert.equal(reordered.send(message).ok, true);
+  }
+  assert.equal(reordered.send(assetChunks[0]).ok, true);
+  const swapped = reordered.send(assetChunks[2]);
+  assert.equal(swapped.ok, false, 'attachment chunks out of order must be refused');
+  assert.match(swapped.error, /incomplete or out of order/);
+});
+
+test('attachments and messages are accepted only for the conversation being received', async () => {
+  const first = { external_id: 'first', messages: [{ external_id: 'm1' }], assets: [transferAsset('a.txt', 'first file')] };
+  const second = { external_id: 'second', messages: [{ external_id: 'm2' }], assets: [transferAsset('b.txt', 'second file')] };
+  const all = streamTransferMessages('scope', [first, second], { chunkChars: 4096 });
+  const [firstHeader, firstAsset, secondHeader, secondAsset] = all;
+  assert.deepEqual(all.map((m) => m.type), ['syncTransferBatchChunk', 'syncTransferAssetChunk', 'syncTransferBatchChunk', 'syncTransferAssetChunk']);
+
+  // The next conversation cannot start while this one's attachment is missing.
+  const early = await startedTransfer('scope');
+  assert.equal(early.send(firstHeader).ok, true);
+  const next = early.send({ ...secondHeader, batchIndex: 1 });
+  assert.equal(next.ok, false);
+  assert.match(next.error, /attachment\(s\) of conversation "first" did not arrive/);
+
+  // An attachment of an earlier conversation is refused after the next one began.
+  const late = await startedTransfer('scope');
+  assert.equal(late.send(firstHeader).ok, true);
+  assert.equal((await late.request(firstAsset)).ok, true);
+  assert.equal(late.send(secondHeader).ok, true);
+  assert.equal((await late.request(firstAsset)).ok, false, 'a finished conversation accepts no attachment chunks');
+
+  // The same attachment cannot be delivered twice.
+  const twice = await startedTransfer('scope');
+  assert.equal(twice.send(firstHeader).ok, true);
+  assert.equal((await twice.request(firstAsset)).ok, true);
+  const repeated = await twice.request(firstAsset);
+  assert.equal(repeated.ok, false);
+  assert.match(repeated.error, /already received/);
+
+  // A message record for a conversation that is not the current one.
+  const wrong = await startedTransfer('wrong');
+  const header = streamTransferMessages('wrong', [{ external_id: 'only', messages: [{ external_id: 'm' }] }], { chunkChars: 4096, recordsPerBatch: 1 })[0];
+  assert.equal(wrong.send(header).ok, true);
+  const misplacedText = JSON.stringify([{ conversation_index: 3, message: { external_id: 'x' } }]);
+  const misplaced = wrong.send({ type: 'syncTransferBatchChunk', transferId: 'wrong', batchIndex: 1, chunkIndex: 0, totalChunks: 1, totalChars: misplacedText.length, data: misplacedText });
+  assert.equal(misplaced.ok, false);
+  assert.match(misplaced.error, /out of order or for an unexpected conversation/);
+
+  // And a complete, correct transfer of both conversations is accepted.
+  const complete = await startedTransfer('scope');
+  assert.ok((await deliverAll(complete, all)).every((response) => response.ok));
+  assert.equal(finalize(complete, 'scope', 2), undefined, 'the finalizer hands off to sync(), which answers asynchronously');
+  for (let i = 0; i < 20 && !complete.broadcasts.some((m) => m.stage === 'error'); i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.match(complete.broadcasts.find((m) => m.stage === 'error').error, /Configure GitHub settings/, 'both conversations reached sync()');
+});
+
+test('a stray message from another transfer never destroys the running one, and a fresh retry replaces an interrupted one', async () => {
+  const background = await startedTransfer('current');
+  const conversations = [{ external_id: 'c1', messages: [{ external_id: 'm1', content: 'hello' }] }];
+  const stray = streamTransferMessages('older-sync', conversations, { chunkChars: 4096 })[0];
+  const strayResponse = background.send(stray);
+  assert.equal(strayResponse.ok, false);
+  assert.match(strayResponse.error, /no longer receiving this sync/);
+  assert.equal(background.send({ type: 'syncTransferAbort', transferId: 'older-sync' }).ok, true);
+  assert.equal(background.send({ type: 'syncTransferKeepAlive', transferId: 'current' }).ok, true, 'the running transfer is untouched');
+
+  // Another Claude tab cannot take over a transfer that is still active...
+  const otherTab = background.send({ type: 'syncTransferStart', transferId: 'other-tab' }, { tab: { id: 8 } });
+  assert.equal(otherTab.ok, false);
+  assert.match(otherTab.error, /Another Claude tab/);
+  // ...but one abandoned for longer than the stale limit is replaced.
+  background.advance(3 * 60 * 1000);
+  assert.equal(background.send({ type: 'syncTransferStart', transferId: 'other-tab' }, { tab: { id: 8 } }).ok, true);
+  assert.equal(background.send({ type: 'syncTransferKeepAlive', transferId: 'current' }).ok, false, 'the abandoned transfer is gone');
+
+  // The same tab retrying (for example after a reload) replaces its interrupted transfer at once.
+  const interrupted = await startedTransfer('first-try');
+  const firstTry = streamTransferMessages('first-try', conversations, { chunkChars: 8 });
+  assert.equal(interrupted.send(firstTry[0]).ok, true);
+  assert.equal(interrupted.send({ type: 'syncTransferStart', transferId: 'retry' }, { tab: { id: 7 } }).ok, true);
+  assert.equal(interrupted.send(firstTry[1]).ok, false, 'chunks of the interrupted transfer are refused');
+  assert.ok((await deliverAll(interrupted, streamTransferMessages('retry', conversations))).every((response) => response.ok));
+  assert.equal(finalize(interrupted, 'first-try', 1).ok, false, 'the interrupted transfer cannot be finalized');
+});
+
+test('cancelling clears a transfer that is being received, and a restarted worker reports the transfer as lost', async () => {
+  const background = await startedTransfer('to-cancel');
+  background.send({ type: 'cancelSync' });
+  const keepAlive = background.send({ type: 'syncTransferKeepAlive', transferId: 'to-cancel' });
+  assert.equal(keepAlive.ok, false);
+  assert.match(keepAlive.error, /no longer receiving this sync .*Nothing was published; sync again/);
+
+  // A fresh worker (Chrome restarted it) knows nothing of the transfer.
+  const restarted = loadBackgroundForSyncState();
+  const chunk = streamTransferMessages('to-cancel', [{ external_id: 'c', messages: [] }])[0];
+  assert.equal(restarted.send(chunk).ok, false);
+  assert.equal(finalize(restarted, 'to-cancel', 1).ok, false);
+});
+
+test('attachments are uploaded as Git blobs while the transfer is received and only referenced by the final commit', async () => {
+  const archivedBytes = Buffer.from('already archived image bytes');
+  const archivedAsset = { path: 'archive/conversations/claude/personal/assets/old/aaaa-old.png', sha256: sha256Hex(archivedBytes), size: archivedBytes.length, name: 'old.png' };
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [{ id: 'old', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/old.md', assets: [archivedAsset] }] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  assert.equal(harness.send({ type: 'syncTransferStart', transferId: 'staged' }).ok, true);
+
+  const fresh = transferAsset('notes.txt', 'brand new notes '.repeat(50));
+  const reused = { name: 'copy.png', size: archivedBytes.length, sha256: archivedAsset.sha256, base64: archivedBytes.toString('base64') };
+  const oversized = { name: 'huge.mov', size: 150 * 1024 * 1024, sha256: 'f'.repeat(64), base64: '' };
+  const conversation = {
+    ...sampleConversation()[0],
+    messages: [{ external_id: 'message-1', role: 'user', content: 'see files', files: [], attachments: [] }],
+    assets: [
+      { ...fresh, message_external_id: 'message-1' },
+      { ...reused, message_external_id: 'message-1' },
+      { ...oversized, message_external_id: 'message-1' },
+    ],
+  };
+  const messages = streamTransferMessages('staged', [conversation], { chunkChars: 64 });
+  const assetChunks = messages.filter((message) => message.type === 'syncTransferAssetChunk');
+  assert.ok(assetChunks.length > 2, 'the new file travels in several chunks');
+  assert.equal(assetChunks.some((message) => message.assetIndex === 2), false, 'an oversized file sends no bytes');
+  const responses = await deliverAll(harness, messages);
+  assert.ok(responses.every((response) => response.ok), JSON.stringify(responses.find((response) => !response.ok)));
+
+  const blobPosts = () => harness.requests.filter((request) => request.method === 'POST' && request.pathname.endsWith('/git/blobs'));
+  assert.equal(blobPosts().length, 1, 'only the new file is uploaded; bytes already in the archive are reused');
+  assert.equal(blobPosts()[0].body.content, fresh.base64);
+  assert.equal(blobPosts()[0].body.encoding, 'base64');
+  assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false, 'nothing is published during the transfer');
+
+  const result = await harness.request({ type: 'syncNormalized', transferId: 'staged', conversationCount: 1, metadata: { skipped: [], unchangedIds: [] } });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.commit, 'new-commit');
+  const tree = harness.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/git/trees')).body.tree;
+  const byName = (name) => tree.find((entry) => entry.path.endsWith(name));
+  assert.equal(byName('notes.txt').sha, 'blob-1', 'the commit references the blob uploaded during the transfer');
+  assert.equal(byName('copy.png').sha, `existing-${archivedAsset.path}`, 'the reused file points at the archived blob');
+  assert.equal(byName('huge.mov'), undefined, 'an oversized file is never written');
+  const markdownBlob = blobPosts().find((request) => request.body.encoding === 'utf-8' && request.body.content.includes('# Sync test'));
+  assert.match(markdownBlob.body.content, /\*\*Not archived: huge\.mov\*\* \(150 MB; GitHub does not accept files over 100 MB\)/);
+  assert.equal(blobPosts().filter((request) => request.body.content === fresh.base64).length, 1, 'no attachment is uploaded twice');
+  const index = JSON.parse(blobPosts().find((request) => request.body.content.includes('"conversations"') && request.body.content.includes('format_version')).body.content);
+  const entry = index.conversations.find((item) => item.id === 'conversation-123456');
+  assert.deepEqual(entry.assets.map((asset) => asset.name).sort(), ['copy.png', 'notes.txt']);
+  assert.equal(JSON.stringify(entry).includes('blob_sha'), false, 'transfer-only fields stay out of the index');
+});
+
+test('a conversation whose Markdown exceeds GitHub\'s file limit is reported and kept, and the others are still committed', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
+  const [small] = sampleConversation();
+  // 35 million three-byte characters: about 105 MB of UTF-8.
+  const huge = {
+    ...small,
+    external_id: 'conversation-huge',
+    title: 'Enormous transcript',
+    messages: [{ external_id: 'huge-1', role: 'assistant', content: '€'.repeat(35 * 1000 * 1000), files: [], attachments: [] }],
+  };
+  const result = await harness.sync([huge, small], () => {});
+  assert.equal(result.commit, 'new-commit');
+  assert.equal(result.changed, 1);
+  assert.equal(result.partial, true);
+  assert.equal(result.report.failed.length, 1);
+  assert.equal(result.report.failed[0].id, 'conversation-huge');
+  assert.match(result.report.failed[0].error, /over GitHub's 100 MB file limit/);
+  const blobs = harness.requests.filter((request) => request.method === 'POST' && request.pathname.endsWith('/git/blobs'));
+  assert.ok(blobs.every((request) => request.body.content.length < 1024 * 1024), 'the oversized transcript is never uploaded');
 });

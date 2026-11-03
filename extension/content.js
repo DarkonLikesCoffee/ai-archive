@@ -475,24 +475,83 @@
   // Do not duplicate raw binary data in message metadata. The rendered message
   // and the separately materialized asset already preserve the user-visible
   // content; background asset matching only needs paths, names and tool inputs.
-  function metadataForAssetMatching(value, key = '') {
-    if (typeof value === 'string') {
-      if (/^(data|base64|bytes)$/i.test(key) && value.length > 256) {
-        return `[omitted binary payload: ${value.length} characters]`;
-      }
-      if (/^data:[^,]+;base64,/i.test(value)) {
-        return `[omitted inline binary payload: ${value.length} characters]`;
-      }
-      return value;
+  //
+  // Binary payloads are recognized by their field name (data/base64/bytes, as
+  // Anthropic sources use), by a data: URL anywhere in a string, or by shape:
+  // a long run made only of base64 characters (no spaces, dots or other
+  // punctuation that text, paths and file names contain) wherever it is
+  // nested, since Claude tools and MCP servers use many field names for it.
+  const BINARY_KEY = /^(data|base64|bytes)$/i;
+  const LONG_BASE64_CHARS = 4096;
+  const EMBEDDED_DATA_URL = /data:[\w.+-]+\/[\w.+-]+(?:;[\w.+-]+=[\w.+-]+)*;base64,[A-Za-z0-9+/=\r\n]{256,}/gi;
+
+  function looksLikeBase64Payload(value) {
+    if (value.length < LONG_BASE64_CHARS) return false;
+    // Only the first characters are scanned for speed; a payload must also
+    // end like one. Text that merely starts with a long token is kept.
+    const head = value.slice(0, LONG_BASE64_CHARS);
+    const tail = value.slice(-256);
+    return /^[A-Za-z0-9+/_-]+$/.test(head.replace(/\r?\n/g, '')) && /^[A-Za-z0-9+/_=\r\n-]+$/.test(tail);
+  }
+
+  function redactBinaryString(value, key = '') {
+    if (BINARY_KEY.test(key) && value.length > 256) {
+      return `[omitted binary payload: ${value.length} characters]`;
     }
-    if (Array.isArray(value)) return value.map((item) => metadataForAssetMatching(item, key));
-    if (value && typeof value === 'object') {
-      return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [
-        childKey,
-        metadataForAssetMatching(child, childKey),
-      ]));
+    if (/^data:[^,]+;base64,/i.test(value)) {
+      return `[omitted inline binary payload: ${value.length} characters]`;
+    }
+    if (looksLikeBase64Payload(value)) {
+      return `[omitted binary payload: ${value.length} characters]`;
+    }
+    if (value.length > 256 && /;base64,/i.test(value)) {
+      return value.replace(EMBEDDED_DATA_URL, (match) => `[omitted inline binary payload: ${match.length} characters]`);
     }
     return value;
+  }
+
+  function metadataForAssetMatching(value, key = '', seen = new WeakSet()) {
+    if (typeof value === 'string') return redactBinaryString(value, key);
+    if (!value || typeof value !== 'object') return value;
+    // JSON from Claude has no cycles; this only keeps a malformed object
+    // graph from recursing forever.
+    if (seen.has(value)) return '[omitted repeated reference]';
+    seen.add(value);
+    try {
+      if (Array.isArray(value)) return value.map((item) => metadataForAssetMatching(item, key, seen));
+      return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [
+        childKey,
+        metadataForAssetMatching(child, childKey, seen),
+      ]));
+    } finally {
+      seen.delete(value);
+    }
+  }
+
+  // Every string in a value, without building one serialized copy of it.
+  function someString(value, predicate, seen = new WeakSet()) {
+    if (typeof value === 'string') return predicate(value);
+    if (!value || typeof value !== 'object' || seen.has(value)) return false;
+    seen.add(value);
+    const children = Array.isArray(value) ? value : Object.values(value);
+    for (const child of children) {
+      if (someString(child, predicate, seen)) return true;
+    }
+    return false;
+  }
+
+  // Lower-cased text used to find sandbox paths and file names a message
+  // mentions. Built once per message from its binary-free form, so inline
+  // base64 images are neither serialized again nor searched for each file.
+  const messageHaystacks = new WeakMap();
+  function messageHaystack(message) {
+    if (!message || typeof message !== 'object') return '';
+    let haystack = messageHaystacks.get(message);
+    if (haystack === undefined) {
+      haystack = JSON.stringify(metadataForAssetMatching(message)).toLowerCase();
+      messageHaystacks.set(message, haystack);
+    }
+    return haystack;
   }
 
   // Oversized assets are represented by metadata and a "Not archived" note in
@@ -552,7 +611,10 @@
         if (block?.type === 'tool_use' && /file|bash|str_replace|present/i.test(String(block.name || ''))) return true;
       }
     }
-    return /\/mnt\/(?:user-data|data)\//.test(JSON.stringify(messages));
+    // Checked string by string: serializing the whole lineage would copy every
+    // inline base64 image of the conversation into one (possibly enormous)
+    // string just to search it.
+    return someString(messages, (value) => /\/mnt\/(?:user-data|data)\//.test(value));
   }
 
   function sandboxFileIsReferenced(file, messages, allFiles, directAssets = []) {
@@ -565,7 +627,7 @@
     }).length;
 
     return messages.some((message) => {
-      const serialized = JSON.stringify(message || {}).toLowerCase();
+      const serialized = messageHaystack(message || {});
       // A full path is unambiguous even when two files share a basename.
       if (serialized.includes(sourcePath)) return true;
       // Basename fallback is safe only when it uniquely identifies one sandbox file.
@@ -958,7 +1020,7 @@
         return nameKeys.has(String(asset.name || '').toLowerCase());
       });
 
-      const messageData = JSON.stringify(message).toLowerCase();
+      const messageData = messageHaystack(message);
       const sandboxCandidates = assets.filter((asset) => {
         if (asset.source !== 'sandbox') return false;
         const basename = String(asset.source_path || '').replace(/\\/g, '/').split('/').pop() || asset.name || '';
@@ -1145,6 +1207,25 @@
     return chain;
   }
 
+  // The background renders a reply excerpt from its extracted text, but any
+  // other attachment's extracted text is archived as a text asset (see
+  // collectMessageAssets) and also stays in the message metadata used for
+  // matching. A third copy in the message's attachment list is not needed.
+  function transferAttachment(attachment) {
+    if (!attachment || typeof attachment !== 'object') return attachment;
+    if (typeof attachment.extracted_content !== 'string' || !attachment.extracted_content) {
+      return metadataForAssetMatching(attachment);
+    }
+    const { extracted_content: text, ...rest } = attachment;
+    // A reply excerpt is quoted text the user selected; it is rendered from
+    // here and is kept verbatim even if it happens to look like base64.
+    if (isReplyExcerptAttachment(attachment)) return { ...metadataForAssetMatching(rest), extracted_content: text };
+    return {
+      ...metadataForAssetMatching(rest),
+      extracted_content: `[archived as an attachment file: ${text.length} characters]`,
+    };
+  }
+
   async function normalize(c, org, signal, sandboxInfo = {}) {
     const raw = selectActiveLineage(c);
     const inlineMarkerNonce = createInlineMarkerNonce();
@@ -1161,8 +1242,8 @@
         content: content || '',
         source_created_at: m.created_at || null,
         metadata: metadataForAssetMatching(m),
-        files: Array.isArray(m.files) ? m.files : [],
-        attachments: Array.isArray(m.attachments) ? m.attachments : [],
+        files: Array.isArray(m.files) ? m.files.map((file) => metadataForAssetMatching(file)) : [],
+        attachments: Array.isArray(m.attachments) ? m.attachments.map(transferAttachment) : [],
       };
     });
 
@@ -1403,59 +1484,77 @@
       const total = selected.length;
       sendProgress({ stage: 'fetching', current: 0, total, selected: limit });
 
-      const conversations = [];
       // One conversation that cannot be exported safely (a malformed payload, an
-      // attachment that will not download) must not block every other
-      // conversation. It is left out of this sync, so its archived copy stays
-      // exactly as it was, and the completion message names it. Cancellation
-      // still stops everything, and if nothing could be exported the sync fails.
+      // attachment that will not download, a message too large to serialize)
+      // must not block every other conversation. It is left out of this sync,
+      // so its archived copy stays exactly as it was, and the completion
+      // message names it. Cancellation still stops everything, and if nothing
+      // could be exported the sync fails.
       const skipped = [];
       const diagnostics = [];
       let firstExportError = null;
-      for (let i = 0; i < selected.length; i++) {
-        if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        let payload = null;
-        const sandboxInfo = {};
-        try {
-          payload = await full(org, selected[i].uuid, signal);
-          const conversation = await normalize(payload, org, signal, sandboxInfo);
+      // The transfer starts before fetching, so a busy extension is reported
+      // at once instead of after every conversation has been downloaded.
+      const transfer = await createTransferSession(signal);
+      let result;
+      try {
+        for (let i = 0; i < selected.length; i++) {
           if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-          conversations.push(conversation);
-          if (conversation.incomplete.length) {
-            diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'incomplete', {
-              problems: conversation.incomplete.map((item) => ({
-                kind: item.kind,
-                reason: item.reason,
-                message_id: item.message_external_id || null,
-                file_extension: fileExtension(item.name),
-              })),
-              ...sandboxInfo,
-            }));
+          transfer.assertUsable();
+          let payload = null;
+          let prepared = null;
+          const sandboxInfo = {};
+          try {
+            payload = await full(org, selected[i].uuid, signal);
+            const conversation = await normalize(payload, org, signal, sandboxInfo);
+            if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+            prepared = transfer.prepare(conversation);
+            if (conversation.incomplete.length) {
+              diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'incomplete', {
+                problems: conversation.incomplete.map((item) => ({
+                  kind: item.kind,
+                  reason: item.reason,
+                  message_id: item.message_external_id || null,
+                  file_extension: fileExtension(item.name),
+                })),
+                ...sandboxInfo,
+              }));
+            }
+          } catch (e) {
+            if (e?.name === 'AbortError' || signal.aborted) throw e;
+            diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'failed', { error: sanitizeError(e?.message || e), ...sandboxInfo }));
+            firstExportError ??= e;
+            skipped.push({
+              id: selected[i].uuid,
+              title: selected[i].name || selected[i].uuid,
+              error: String(e?.message || e),
+            });
           }
-        } catch (e) {
-          if (e?.name === 'AbortError' || signal.aborted) throw e;
-          diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'failed', { error: sanitizeError(e?.message || e), ...sandboxInfo }));
-          firstExportError ??= e;
-          skipped.push({
-            id: selected[i].uuid,
-            title: selected[i].name || selected[i].uuid,
-            error: String(e?.message || e),
-          });
+          payload = null;
+          // A failure while handing a prepared conversation over is not a
+          // problem of this conversation: the transfer is no longer complete,
+          // so the whole sync stops and nothing is published.
+          if (prepared) await transfer.sendConversation(prepared);
+          prepared = null;
+          sendProgress({ stage: 'fetching', current: i + 1, total, selected: limit });
         }
-        sendProgress({ stage: 'fetching', current: i + 1, total, selected: limit });
-      }
-      await storeDiagnostics(diagnostics);
-      if (!conversations.length && firstExportError) throw firstExportError;
+        await storeDiagnostics(diagnostics);
+        if (!transfer.conversationCount && firstExportError) throw firstExportError;
 
-      if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-      sendProgress({ stage: 'preparing', current: 0, total, selected: limit });
-      // Data is already normalized above; this stage exists to make the handoff explicit.
-      sendProgress({ stage: 'preparing', current: total, total, selected: limit });
-      if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-      // Keep the content-script lock until the background sync has actually
-      // finished; otherwise another startSync message can trigger a second fetch
-      // while the first batch is still being committed to GitHub.
-      const result = await handOff({ conversations, skipped, unchangedIds, fullList: limit === 'all', listed: listData.length }, signal);
+        if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        sendProgress({ stage: 'preparing', current: 0, total, selected: limit });
+        // Every conversation is already in the background; this stage makes
+        // the final handoff explicit.
+        sendProgress({ stage: 'preparing', current: total, total, selected: limit });
+        if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+        // Keep the content-script lock until the background sync has actually
+        // finished; otherwise another startSync message can trigger a second fetch
+        // while the first batch is still being committed to GitHub.
+        result = await transfer.finish({ skipped, unchangedIds, fullList: limit === 'all', listed: listData.length });
+      } catch (e) {
+        await transfer.abort();
+        throw e;
+      }
       if (!result?.ok && !result?.cancelled) {
         sendProgress({ stage: 'error', error: result?.error || 'No response' });
       }
@@ -1475,12 +1574,28 @@
   const AUTO_SYNC_LIMIT = 20;
   const AUTO_SYNC_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
-  // Chrome rejects extension messages over 64 MiB, and attachments travel as
-  // base64, so a large sync is handed to the background as consecutive chunks
-  // of its JSON text, which the background reassembles before syncing. A chunk
-  // of 8M characters stays under the limit even if every character needed
-  // escaping as several bytes.
+  // ---- Handing conversations to the background worker ----
+  //
+  // Each conversation is handed to the background as soon as it has been
+  // fetched and normalized, then released, so the Claude tab never holds the
+  // whole account (and every attachment of it) at once. The transfer is a
+  // stream of JSON records sent in bounded batches:
+  //   {conversation_index, message_count, conversation}  conversation header
+  //   {conversation_index, message}                      one message
+  // Each record is serialized on its own, so the largest JSON string built is
+  // one message, never a conversation or the archive. Attachment bytes never
+  // enter that JSON: they follow as base64 in separate bounded chunks, which
+  // the background checks against each file's size and SHA-256. The background
+  // publishes nothing until the final syncNormalized message confirms every
+  // conversation, message and attachment arrived.
+  //
+  // Chrome rejects extension messages over 64 MiB. A chunk of 8M characters
+  // stays under the limit even if every character needed escaping as several
+  // bytes.
   const HANDOFF_CHUNK_CHARS = 8 * 1024 * 1024;
+  // Chrome stops an idle extension service worker after about 30 seconds, and
+  // downloading one conversation's attachments can take longer than that.
+  const TRANSFER_KEEPALIVE_MS = 15 * 1000;
 
   function sendRuntimeMessage(message) {
     return new Promise((resolve, reject) => {
@@ -1495,47 +1610,107 @@
     });
   }
 
-  async function handOff(payload, signal) {
-    const transferId = createInlineMarkerNonce();
-    const metadata = {
-      skipped: payload.skipped,
-      unchangedIds: payload.unchangedIds,
-      fullList: payload.fullList,
-      listed: payload.listed,
-    };
-    const started = await sendRuntimeMessage({
-      type: 'syncTransferStart',
-      transferId,
-      conversationCount: payload.conversations.length,
-      metadata,
+  // Serializes a normalized conversation into transfer records before any of
+  // it is sent, so a conversation that cannot be serialized is left out of the
+  // sync (and reported) without leaving half of it in the background.
+  function prepareConversationTransfer(conversation, conversationIndex) {
+    const id = String(conversation?.external_id || conversationIndex + 1);
+    const assets = Array.isArray(conversation?.assets) ? conversation.assets : [];
+    const payloads = [];
+    const headerAssets = assets.map((asset, assetIndex) => {
+      const { base64, ...rest } = asset && typeof asset === 'object' ? asset : {};
+      const payload = typeof base64 === 'string' ? base64 : '';
+      const size = Number(rest.size) || Math.floor(payload.length * 3 / 4);
+      // Oversized files carry no bytes; the background still receives their
+      // name, size and hash and renders a visible "Not archived" note.
+      const transferable = payload.length > 0 && size <= MAX_ARCHIVED_FILE_BYTES;
+      if (transferable) payloads.push({ assetIndex, base64: payload });
+      return { ...rest, base64: '', payload_chars: transferable ? payload.length : 0 };
     });
+    const { messages: rawMessages, assets: _assets, ...header } = conversation || {};
+    const messages = Array.isArray(rawMessages) ? rawMessages : [];
+
+    const records = [];
+    const serialize = (value, what) => {
+      let text;
+      try {
+        text = JSON.stringify(value);
+      } catch (error) {
+        throw new Error(`Could not prepare ${what} of conversation "${id}" for the extension: ${String(error?.message || error)}. This conversation was left out of the sync; its archived copy, if any, was kept.`);
+      }
+      if (typeof text !== 'string') {
+        throw new Error(`Could not prepare ${what} of conversation "${id}" for the extension. This conversation was left out of the sync; its archived copy, if any, was kept.`);
+      }
+      records.push(text);
+    };
+    serialize({
+      conversation_index: conversationIndex,
+      message_count: messages.length,
+      conversation: { ...header, assets: headerAssets },
+    }, 'the metadata');
+    for (const [messageIndex, message] of messages.entries()) {
+      serialize({ conversation_index: conversationIndex, message },
+        `message ${messageIndex + 1} of ${messages.length} ("${message?.external_id || messageIndex + 1}")`);
+    }
+    return { id, records, payloads };
+  }
+
+  async function createTransferSession(signal) {
+    const transferId = createInlineMarkerNonce();
+    let lostError = null;
+    let finishing = false;
+    let keepAlive = null;
+    let batchParts = [];
+    let batchLength = 2; // '[' and ']'
+    let batchIndex = 0;
+    let sentConversations = 0;
+
+    const started = await sendRuntimeMessage({ type: 'syncTransferStart', transferId, protocol: 2 });
     if (!started?.ok) {
       throw new Error(started?.error || 'The extension could not prepare the sync transfer. Nothing was published; sync again.');
     }
 
-    // Conversation transcripts are sent as bounded JSON batches. Asset bytes
-    // travel separately so one conversation containing many large attachments
-    // never needs to become one enormous JSON string.
-    let batchParts = [];
-    let batchLength = 2; // '[' and ']'
-    let batchIndex = 0;
+    if (typeof setInterval === 'function') {
+      keepAlive = setInterval(() => {
+        sendRuntimeMessage({ type: 'syncTransferKeepAlive', transferId }).then((response) => {
+          if (!response?.ok && !finishing) {
+            lostError ??= new Error(response?.error || 'The extension stopped receiving this sync. Nothing was published; sync again.');
+          }
+        }, (error) => {
+          if (!finishing) {
+            lostError ??= new Error(`The extension stopped receiving this sync (${String(error?.message || error)}). Nothing was published; sync again.`);
+          }
+        });
+      }, TRANSFER_KEEPALIVE_MS);
+    }
+    const stopKeepAlive = () => {
+      if (keepAlive !== null) clearInterval(keepAlive);
+      keepAlive = null;
+    };
+
+    function assertUsable() {
+      if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
+      if (lostError) throw lostError;
+    }
+
+    async function send(message, fallbackError) {
+      assertUsable();
+      const response = await sendRuntimeMessage({ ...message, transferId });
+      if (!response?.ok) throw new Error(response?.error || fallbackError);
+      return response;
+    }
 
     async function sendBatch(text) {
       const totalChunks = Math.max(1, Math.ceil(text.length / HANDOFF_CHUNK_CHARS));
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const data = text.slice(chunkIndex * HANDOFF_CHUNK_CHARS, (chunkIndex + 1) * HANDOFF_CHUNK_CHARS);
-        const response = await sendRuntimeMessage({
+        await send({
           type: 'syncTransferBatchChunk',
-          transferId,
           batchIndex,
           chunkIndex,
           totalChunks,
-          data,
-        });
-        if (!response?.ok) {
-          throw new Error(response?.error || 'The extension did not accept a sync batch. Nothing was published; sync again.');
-        }
+          totalChars: text.length,
+          data: text.slice(chunkIndex * HANDOFF_CHUNK_CHARS, (chunkIndex + 1) * HANDOFF_CHUNK_CHARS),
+        }, 'The extension did not accept a sync batch. Nothing was published; sync again.');
       }
       batchIndex++;
     }
@@ -1548,83 +1723,75 @@
       await sendBatch(text);
     }
 
+    async function queueRecord(record) {
+      if (record.length + 2 > HANDOFF_CHUNK_CHARS) {
+        // One large message travels as its own batch, split into chunks.
+        await flushBatch();
+        await sendBatch('[' + record + ']');
+        return;
+      }
+      if (batchParts.length && batchLength + record.length + 1 > HANDOFF_CHUNK_CHARS) await flushBatch();
+      batchLength += record.length + (batchParts.length ? 1 : 0);
+      batchParts.push(record);
+    }
+
     async function sendAsset(conversationIndex, assetIndex, base64) {
       const totalChunks = Math.max(1, Math.ceil(base64.length / HANDOFF_CHUNK_CHARS));
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const response = await sendRuntimeMessage({
+        await send({
           type: 'syncTransferAssetChunk',
-          transferId,
           conversationIndex,
           assetIndex,
           chunkIndex,
           totalChunks,
+          totalChars: base64.length,
           data: base64.slice(chunkIndex * HANDOFF_CHUNK_CHARS, (chunkIndex + 1) * HANDOFF_CHUNK_CHARS),
-        });
-        if (!response?.ok) {
-          throw new Error(response?.error || 'The extension did not accept an attachment chunk. Nothing was published; sync again.');
-        }
+        }, 'The extension did not accept an attachment chunk. Nothing was published; sync again.');
       }
     }
 
-    try {
-      for (let i = 0; i < payload.conversations.length; i++) {
-        if (signal?.aborted) throw new DOMException('Sync cancelled', 'AbortError');
-        const conversation = payload.conversations[i];
-        const id = String(conversation?.external_id || conversation?.id || i + 1);
-        const assets = Array.isArray(conversation?.assets) ? conversation.assets : [];
-        const transferableAssets = assets
-          .map((asset, assetIndex) => ({ asset, assetIndex, base64: typeof asset?.base64 === 'string' ? asset.base64 : '' }))
-          .filter(({ asset, base64 }) => {
-            const size = Number(asset?.size) || Math.floor(base64.length * 3 / 4);
-            return base64.length > 0 && size <= MAX_ARCHIVED_FILE_BYTES;
-          });
-
-        // The receiver needs the metadata, not another copy of the base64
-        // payload. Preserve size/hash/name so oversized files can be noted.
-        const metadataConversation = {
-          ...conversation,
-          assets: assets.map(({ base64: _base64, ...asset }) => ({ ...asset, base64: '' })),
-        };
-
-        let serialized;
-        try {
-          serialized = JSON.stringify(metadataConversation);
-        } catch (error) {
-          throw new Error('Could not serialize conversation metadata "' + id + '" for transfer: '
-            + String(error?.message || error) + '. Nothing was published; retry this conversation separately.');
-        }
-        if (typeof serialized !== 'string') {
-          throw new Error('Could not serialize conversation metadata "' + id + '" for transfer. Nothing was published; retry this conversation separately.');
-        }
-
-        const itemLength = serialized.length + (batchParts.length ? 1 : 0);
-        const needsSeparateAssetTransfer = transferableAssets.length > 0;
-        if (needsSeparateAssetTransfer || serialized.length + 2 > HANDOFF_CHUNK_CHARS
-          || (batchParts.length && batchLength + itemLength > HANDOFF_CHUNK_CHARS)) {
+    return {
+      transferId,
+      get conversationCount() { return sentConversations; },
+      assertUsable,
+      prepare(conversation) {
+        return prepareConversationTransfer(conversation, sentConversations);
+      },
+      async sendConversation(prepared) {
+        const conversationIndex = sentConversations;
+        for (const record of prepared.records) await queueRecord(record);
+        prepared.records = null;
+        if (prepared.payloads.length) {
+          // A conversation's attachments follow its own records.
           await flushBatch();
-          await sendBatch('[' + serialized + ']');
-
-          for (const { asset, assetIndex, base64 } of transferableAssets) {
-            await sendAsset(i, assetIndex, base64);
-            asset.base64 = '';
+          for (const payload of prepared.payloads) {
+            await sendAsset(conversationIndex, payload.assetIndex, payload.base64);
+            payload.base64 = '';
           }
-        } else {
-          batchParts.push(serialized);
-          batchLength += serialized.length + (batchParts.length > 1 ? 1 : 0);
         }
-
-        // Each conversation (and its attachment bytes) is now owned by the
-        // background worker. Release it before moving to the next one.
-        payload.conversations[i] = null;
-      }
-
-      await flushBatch();
-      return await sendRuntimeMessage({ type: 'syncNormalized', transferId });
-    } catch (error) {
-      try { await sendRuntimeMessage({ type: 'syncTransferAbort', transferId }); } catch {}
-      throw error;
-    }
+        sentConversations++;
+      },
+      async finish(metadata) {
+        await flushBatch();
+        assertUsable();
+        finishing = true;
+        try {
+          return await sendRuntimeMessage({
+            type: 'syncNormalized',
+            transferId,
+            conversationCount: sentConversations,
+            metadata,
+          });
+        } finally {
+          stopKeepAlive();
+        }
+      },
+      async abort() {
+        finishing = true;
+        stopKeepAlive();
+        try { await sendRuntimeMessage({ type: 'syncTransferAbort', transferId }); } catch {}
+      },
+    };
   }
 
   async function maybeAutoSync() {

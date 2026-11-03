@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { webcrypto } from 'node:crypto';
+import { webcrypto, createHash } from 'node:crypto';
 import vm from 'node:vm';
 
 const contentPath = fileURLToPath(new URL('./content.js', import.meta.url));
@@ -15,6 +15,37 @@ function jsonResponse(value) {
     status: 200,
     json: async () => value,
     headers: { get: () => null },
+  };
+}
+
+
+const backgroundSource = await readFile(fileURLToPath(new URL('./background.js', import.meta.url)), 'utf8');
+const TRANSFER_TYPES = new Set(['syncTransferStart', 'syncTransferBatchChunk', 'syncTransferAssetChunk', 'syncTransferKeepAlive', 'syncTransferAbort']);
+
+// The real background.js, without GitHub settings: it receives and checks
+// every transfer message exactly as in the extension, and completeTransfer
+// hands the reassembled payload to the test instead of syncing it to GitHub.
+function loadReceivingBackground() {
+  const listeners = [];
+  const context = {
+    chrome: {
+      storage: { local: { get: async () => ({}), set: async () => {} } },
+      runtime: {
+        onMessage: { addListener(listener) { listeners.push(listener); } },
+        sendMessage() { return Promise.resolve(); },
+      },
+    },
+    AbortController, TextEncoder, TextDecoder, Uint8Array, atob, btoa, crypto: webcrypto, setTimeout, clearTimeout,
+  };
+  vm.runInNewContext(`${backgroundSource}\nglobalThis.__completeTransfer = completeTransfer;\nglobalThis.__pendingTransfer = () => pendingTransfer;`, context, { filename: 'extension/background.js' });
+  return {
+    deliver(message, callback) {
+      listeners[0](message, { tab: { id: 1 } }, (response) => callback?.(response));
+    },
+    complete(message) {
+      return JSON.parse(JSON.stringify(context.__completeTransfer(message)));
+    },
+    pending() { return context.__pendingTransfer(); },
   };
 }
 
@@ -38,15 +69,15 @@ function createHarness(conversation, {
   archiveState = null,
   handoffChunkChars = null,
   rejectChunkAt = -1,
+  restartBackgroundAtChunk = -1,
+  timers = null,
+  prelude = '',
 } = {}) {
   const listeners = [];
   const requests = [];
   const handoffs = [];
   const transferChunks = [];
-  const transferStarts = new Map();
-  const transferPayloads = new Map();
-  const transferBatchStates = new Map();
-  const transferAssetStates = new Map();
+  let background = loadReceivingBackground();
   const progressMessages = [];
   let resolveFirstHandoff;
   const firstHandoff = new Promise((resolve) => { resolveFirstHandoff = resolve; });
@@ -74,7 +105,7 @@ function createHarness(conversation, {
     } : {}),
     runtime: {
       lastError: null,
-      getManifest() { return { version: '0.5.14' }; },
+      getManifest() { return { version: '0.5.15' }; },
       onMessage: {
         addListener(listener) {
           listeners.push(listener);
@@ -90,67 +121,29 @@ function createHarness(conversation, {
           callback?.(archiveState ? { ok: true, conversations: archiveState } : { ok: false, error: 'not configured in test' });
           return Promise.resolve();
         }
-        if (message.type === 'syncTransferStart') {
-          transferStarts.set(message.transferId, message);
-          transferPayloads.set(message.transferId, { ...message.metadata, conversations: [] });
-          callback?.({ ok: true });
-          return Promise.resolve();
-        }
-        if (message.type === 'syncTransferBatchChunk') {
-          const transferPosition = transferChunks.length;
-          transferChunks.push(message);
-          if (transferPosition === rejectChunkAt) {
-            callback?.({ ok: false, error: 'rejected in test' });
-            return Promise.resolve();
+        if (TRANSFER_TYPES.has(message.type)) {
+          if (message.type === 'syncTransferBatchChunk' || message.type === 'syncTransferAssetChunk') {
+            const transferPosition = transferChunks.length;
+            transferChunks.push(message);
+            if (transferPosition === rejectChunkAt) {
+              callback?.({ ok: false, error: 'rejected in test' });
+              return Promise.resolve();
+            }
+            if (transferPosition === restartBackgroundAtChunk) background = loadReceivingBackground();
           }
-          let batch = transferBatchStates.get(message.batchIndex);
-          if (message.chunkIndex === 0) {
-            batch = { totalChunks: message.totalChunks, chunks: [] };
-            transferBatchStates.set(message.batchIndex, batch);
-          }
-          if (!batch || batch.totalChunks !== message.totalChunks || message.chunkIndex !== batch.chunks.length) {
-            callback?.({ ok: false, error: 'out of order in test' });
-            return Promise.resolve();
-          }
-          batch.chunks.push(message.data);
-          if (batch.chunks.length === batch.totalChunks) {
-            transferPayloads.get(message.transferId).conversations.push(...JSON.parse(batch.chunks.join('')));
-            transferBatchStates.delete(message.batchIndex);
-          }
-          callback?.({ ok: true });
-          return Promise.resolve();
-        }
-        if (message.type === 'syncTransferAssetChunk') {
-          transferChunks.push(message);
-          const key = `${message.conversationIndex}:${message.assetIndex}`;
-          let assetTransfer = transferAssetStates.get(key);
-          if (message.chunkIndex === 0) {
-            assetTransfer = { totalChunks: message.totalChunks, chunks: [] };
-            transferAssetStates.set(key, assetTransfer);
-          }
-          if (!assetTransfer || assetTransfer.totalChunks !== message.totalChunks
-            || message.chunkIndex !== assetTransfer.chunks.length) {
-            callback?.({ ok: false, error: 'out of order asset chunk in test' });
-            return Promise.resolve();
-          }
-          assetTransfer.chunks.push(message.data);
-          if (assetTransfer.chunks.length === assetTransfer.totalChunks) {
-            const conversation = transferPayloads.get(message.transferId).conversations[message.conversationIndex];
-            conversation.assets[message.assetIndex].base64 = assetTransfer.chunks.join('');
-            transferAssetStates.delete(key);
-          }
-          callback?.({ ok: true });
-          return Promise.resolve();
-        }
-        if (message.type === 'syncTransferAbort') {
-          transferStarts.delete(message.transferId);
-          transferPayloads.delete(message.transferId);
-          callback?.({ ok: true });
+          // The real background receiver checks and reassembles the transfer.
+          background.deliver(message, callback);
           return Promise.resolve();
         }
         if (message.type === 'syncNormalized') {
           if (message.transferId) {
-            const payload = transferPayloads.get(message.transferId);
+            let payload;
+            try {
+              payload = background.complete(message);
+            } catch (error) {
+              callback?.({ ok: false, error: `The sync data did not fully reach the extension (${error.message}).` });
+              return Promise.resolve();
+            }
             message = { type: 'syncNormalized', transferId: message.transferId, ...payload };
           }
           handoffs.push(message);
@@ -267,6 +260,7 @@ function createHarness(conversation, {
   if (handoffChunkChars) {
     harnessSource = harnessSource.replace('const HANDOFF_CHUNK_CHARS = 8 * 1024 * 1024;', `const HANDOFF_CHUNK_CHARS = ${handoffChunkChars};`);
   }
+  if (prelude) harnessSource = `${prelude}\n${harnessSource}`;
   vm.runInNewContext(harnessSource, {
     chrome,
     fetch,
@@ -276,6 +270,7 @@ function createHarness(conversation, {
     Uint8Array,
     btoa,
     atob,
+    ...(timers ? { setInterval: timers.setInterval, clearInterval: timers.clearInterval } : {}),
     crypto: {
       getRandomValues: (array) => webcrypto.getRandomValues(array),
       subtle: {
@@ -301,6 +296,7 @@ function createHarness(conversation, {
     errorProgress,
     cancelledProgress,
     firstHandoff,
+    get background() { return background; },
     metrics() {
       return { maxActiveDownloads };
     },
@@ -2546,27 +2542,51 @@ function chunkTestConversation() {
   };
 }
 
+// The batches of a transfer, decoded back into their JSON records.
+function transferRecords(harness) {
+  const batches = new Map();
+  for (const chunk of harness.transferChunks.filter((c) => c.type === 'syncTransferBatchChunk')) {
+    batches.set(chunk.batchIndex, (batches.get(chunk.batchIndex) || '') + chunk.data);
+  }
+  return [...batches.keys()].sort((a, b) => a - b).flatMap((index) => JSON.parse(batches.get(index)));
+}
+
 test('hands off conversations in bounded ordered JSON batches instead of stringifying the full archive', async () => {
   const small = createHarness(chunkTestConversation());
   small.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   const smallHandoff = await small.firstHandoff;
   assert.equal(small.transferChunks.length, 1, 'even small syncs use the bounded transfer protocol');
-  assert.equal(small.transferChunks[0].data, JSON.stringify(smallHandoff.conversations));
+  const smallRecords = JSON.parse(small.transferChunks[0].data);
+  // One header record and one record per message: never one string holding
+  // a whole conversation with all of its messages.
+  assert.deepEqual(smallRecords.map((record) => Object.keys(record).sort().join(',')), [
+    'conversation,conversation_index,message_count',
+    'conversation_index,message',
+    'conversation_index,message',
+  ]);
+  assert.equal(smallRecords[0].conversation.messages, undefined);
+  assert.deepEqual(smallRecords.slice(1).map((record) => record.message), smallHandoff.conversations[0].messages);
 
   const harness = createHarness(chunkTestConversation(), { handoffChunkChars: 1000 });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
   const handoff = await harness.firstHandoff;
   assert.ok(harness.transferChunks.length > 5, `chunks: ${harness.transferChunks.length}`);
-  assert.deepEqual(harness.transferChunks.map((c) => c.chunkIndex), harness.transferChunks.map((_, i) => i));
-  assert.ok(harness.transferChunks.every((c) => c.totalChunks === harness.transferChunks.length
-    && c.data.length <= 1000 && c.transferId === handoff.transferId && c.batchIndex === 0));
+  assert.ok(harness.transferChunks.every((c) => c.data.length <= 1000 && c.transferId === handoff.transferId));
+  // Within each batch the chunks are numbered in order and agree on the total.
+  const byBatch = Map.groupBy(harness.transferChunks, (c) => c.batchIndex);
+  assert.deepEqual([...byBatch.keys()], [...byBatch.keys()].map((_, i) => i), 'batches are numbered consecutively');
+  for (const chunks of byBatch.values()) {
+    assert.deepEqual(chunks.map((c) => c.chunkIndex), chunks.map((_, i) => i));
+    assert.ok(chunks.every((c) => c.totalChunks === chunks.length
+      && c.totalChars === chunks.reduce((sum, chunk) => sum + chunk.data.length, 0)));
+  }
   assert.equal(handoff.conversations.length, 1);
   assert.equal(handoff.conversations[0].external_id, 'conversation-big');
-  const rebuilt = JSON.parse(harness.transferChunks.map((c) => c.data).join(''));
-  assert.equal(rebuilt.length, 1);
+  const records = transferRecords(harness);
+  const rebuilt = { ...records[0].conversation, messages: records.slice(1).map((record) => record.message) };
   // Each run picks a new random inline-marker nonce; everything else must match.
   const normalize = (value) => JSON.parse(JSON.stringify(value).replace(/"inline_marker_nonce":"[0-9a-f]{32}"/g, '"inline_marker_nonce":"n"'));
-  assert.deepEqual(normalize(rebuilt[0]), normalize(handoff.conversations[0]));
+  assert.deepEqual(normalize(rebuilt), normalize(handoff.conversations[0]));
 });
 
 test('a rejected conversation batch stops the handoff with an error and publishes nothing', async () => {
@@ -2730,7 +2750,7 @@ test('a new sync clears the previous diagnostic report before work begins, inclu
   assert.equal(failure.stage, 'error', 'the malformed Claude list should fail before export');
   assert.deepEqual(JSON.parse(JSON.stringify(harness.storageState.last_sync_diagnostics.items)), [],
     'diagnostics from the previous sync must be removed even when the new sync fails before collecting conversations');
-  assert.equal(harness.storageState.last_sync_diagnostics.extension_version, '0.5.14');
+  assert.equal(harness.storageState.last_sync_diagnostics.extension_version, '0.5.15');
 });
 
 test('a sync stores a sanitized diagnostic for each conversation not archived completely, with nothing private in it', async () => {
@@ -2753,7 +2773,7 @@ test('a sync stores a sanitized diagnostic for each conversation not archived co
   for (const secret of [secretText, 'Base de datos', 'BD-GICD', 'SECRET-TOKEN', 'sig=', '99999999-8888', 'aaaaaaaa-bbbb']) {
     assert.equal(text.includes(secret), false, `diagnostics must not contain ${secret}`);
   }
-  assert.equal(stored.extension_version, '0.5.14');
+  assert.equal(stored.extension_version, '0.5.15');
   assert.equal(stored.items.length, 1);
   const [item] = stored.items;
   assert.equal(item.conversation_id, '11111111-2222-4333-8444-555555555555', 'the conversation ID is kept so the owner can match it');
@@ -2996,5 +3016,290 @@ test('a real document entry downloads through its document_pdf URL', async () =>
   const [exported] = (await harness.firstHandoff).conversations;
   assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), []);
   assert.equal(exported.assets[0].name, 'apuntes.pdf');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+// ---- Streaming handoff: bounded, verified, and recoverable ----
+
+const sha256Hex = (bytes) => createHash('sha256').update(bytes).digest('hex');
+
+function decodedRecords(harness) {
+  return transferRecords(harness);
+}
+
+test('812 conversations of mixed sizes with attachments stream through the real receiver, bounded and complete', async () => {
+  const CHUNK = 64 * 1024;
+  const list = Array.from({ length: 812 }, (_, index) => ({
+    uuid: 'mixed-' + index,
+    name: 'Conversation ' + index,
+    created_at: '2026-10-26T08:00:00.000Z',
+    updated_at: new Date(Date.UTC(2026, 9, 26, 8, 0, 0) + (812 - index) * 1000).toISOString(),
+  }));
+  const imageFor = (index, n) => Buffer.from(`png-bytes-${index}-${n}-`.repeat(40 + (index % 5) * 400)).toString('base64');
+  const conversationFor = (id) => {
+    const index = Number(id.split('-')[1]);
+    const extra = [];
+    if (index % 7 === 0) {
+      extra.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageFor(index, 1) } });
+      extra.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageFor(index, 2) } });
+    }
+    if (index % 11 === 0) extra.push({ type: 'text', text: `long answer ${index} `.repeat(12000) });
+    if (index % 13 === 0) {
+      extra.push({ type: 'tool_use', name: 'create_file', input: { path: `/tmp/out-${index}.py`, file_text: 'print("line")\n'.repeat(9000) } });
+    }
+    return plainConversation(id, extra);
+  };
+  let harness;
+  const chunksSentWhenFetched = [];
+  harness = createHarness(null, {
+    conversationListResponse: list,
+    conversationCountResponse: { count: 812 },
+    fullConversationResponse: (id) => {
+      chunksSentWhenFetched.push(harness.transferChunks.length);
+      return conversationFor(id);
+    },
+    handoffChunkChars: CHUNK,
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+
+  assert.equal(handoff.listed, 812);
+  assert.equal(handoff.skipped.length, 0);
+  assert.equal(handoff.conversations.length, 812);
+  assert.deepEqual(handoff.conversations.map((c) => c.external_id), list.map((c) => c.uuid));
+  // Streaming: conversations already handed over before later ones are
+  // downloaded, so the Claude tab never holds the whole account.
+  assert.ok(chunksSentWhenFetched[406] > 0 && chunksSentWhenFetched[811] > chunksSentWhenFetched[406],
+    `chunks sent before fetching conversation 407: ${chunksSentWhenFetched[406]}`);
+  assert.ok(harness.transferChunks.every((chunk) => chunk.data.length <= CHUNK), 'every chunk respects the bound');
+
+  let imageAssets = 0;
+  for (const [index, conversation] of handoff.conversations.entries()) {
+    const expected = conversationFor(conversation.external_id);
+    assert.equal(conversation.messages.length, 2);
+    if (index % 7 === 0) {
+      assert.equal(conversation.assets.length, 2, `conversation ${index}`);
+      for (const [n, asset] of conversation.assets.entries()) {
+        assert.equal(asset.base64, imageFor(index, n + 1));
+        assert.equal(sha256Hex(Buffer.from(asset.base64, 'base64')), asset.sha256);
+        assert.equal(asset.payload_chars, undefined, 'transfer bookkeeping is removed');
+        imageAssets++;
+      }
+      // The duplicate of each image's bytes in message metadata is redacted.
+      const metadataText = JSON.stringify(conversation.messages[1].metadata);
+      assert.equal(metadataText.includes(imageFor(index, 1).slice(0, 200)), false);
+    } else {
+      assert.equal(conversation.assets.length, 0, `conversation ${index}`);
+    }
+    if (index % 11 === 0) {
+      const longText = expected.chat_messages[1].content.find((block) => block.type === 'text' && block.text.startsWith('long answer')).text;
+      assert.ok(conversation.messages[1].content.includes(longText), 'long text is preserved exactly');
+    }
+    if (index % 13 === 0) assert.ok(conversation.messages[1].content.includes('print("line")\n'.repeat(9000)), 'large tool input is preserved exactly');
+  }
+  assert.equal(imageAssets, 2 * Math.ceil(812 / 7));
+  assert.equal(harness.background.pending(), null, 'the receiver released the finished transfer');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('base64 hidden in unexpected nested fields, data URLs and file entries is not transferred again as metadata', async () => {
+  const payload = Buffer.alloc(300 * 1024, 7).toString('base64');
+  const urlSafe = payload.replace(/\+/g, '-').replace(/\//g, '_');
+  const conversation = {
+    uuid: 'hidden-payloads',
+    name: 'Hidden payloads',
+    current_leaf_message_uuid: 'a1',
+    chat_messages: [
+      {
+        uuid: 'u1', parent_message_uuid: ROOT, sender: 'human',
+        content: [{ type: 'text', text: 'Process /mnt/user-data/uploads/photo.png please.' }],
+        files: [{ file_uuid: 'f1', file_name: 'photo.png', thumbnail: { encoded: payload } }],
+        attachments: [{ file_name: 'dump.txt', file_type: 'text/plain', extracted_content: 'dump text '.repeat(1000) }],
+        vendor_extension: { deeply: { nested: [{ blob: payload }, { image_data: urlSafe }] } },
+      },
+      {
+        uuid: 'a1', parent_message_uuid: 'u1', sender: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'artifacts', input: { command: 'create', content: `<img src="data:image/png;base64,${payload}"> saved to /mnt/user-data/outputs/page.html` } },
+          { type: 'tool_result', name: 'artifacts', content: [{ type: 'json', value: { screenshot_b64: payload } }] },
+          { type: 'text', text: 'Done.' },
+        ],
+      },
+    ],
+  };
+  const harness = createHarness(conversation, { handoffChunkChars: 64 * 1024 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const [user, assistant] = handoff.conversations[0].messages;
+
+  const metadataText = JSON.stringify([user.metadata, assistant.metadata, user.files, user.attachments]);
+  assert.equal(metadataText.includes(payload.slice(0, 1000)), false, 'standard base64 is redacted wherever it is nested');
+  assert.equal(metadataText.includes(urlSafe.slice(0, 1000)), false, 'URL-safe base64 is redacted too');
+  assert.match(metadataText, /omitted (inline )?binary payload/);
+  // Paths and names used to match sandbox files survive the redaction.
+  assert.match(JSON.stringify(user.metadata), /\/mnt\/user-data\/uploads\/photo\.png/);
+  assert.match(JSON.stringify(assistant.metadata), /saved to \/mnt\/user-data\/outputs\/page\.html/);
+  assert.equal(user.files[0].file_name, 'photo.png');
+  assert.equal(user.files[0].file_uuid, 'f1');
+  // Extracted text is archived once as a file, not repeated in the attachment list.
+  assert.match(user.attachments[0].extracted_content, /archived as an attachment file: 10000 characters/);
+  const textAsset = handoff.conversations[0].assets.find((asset) => asset.name === 'dump.txt');
+  assert.equal(Buffer.from(textAsset.base64, 'base64').toString('utf8'), 'dump text '.repeat(1000));
+
+  // The whole transfer is far smaller than the raw payload copies it replaced.
+  const transferred = harness.transferChunks.reduce((sum, chunk) => sum + chunk.data.length, 0);
+  const rendered = JSON.stringify(handoff.conversations[0].messages.map((m) => m.content)).length;
+  assert.ok(transferred < rendered + 200 * 1024,
+    `transferred ${transferred} characters for ${rendered} characters of rendered transcript`);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a conversation with several attachments sends each one separately in bounded chunks after its own records', async () => {
+  const files = ['a.bin', 'b.bin', 'c.bin'].map((name, index) => ({
+    file_uuid: `file-${index}`,
+    file_name: name,
+    preview_url: `https://files.example/${name}`,
+  }));
+  const contents = { 'a.bin': 'A'.repeat(70000), 'b.bin': 'B'.repeat(10), 'c.bin': '€'.repeat(30000) };
+  const conversation = {
+    uuid: 'several-files', name: 'Several files', current_leaf_message_uuid: 'u1',
+    chat_messages: [{ uuid: 'u1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'three files' }], files }],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: Object.fromEntries(files.map((file) => [file.preview_url, { content: contents[file.file_name] }])),
+    handoffChunkChars: 16 * 1024,
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const assets = handoff.conversations[0].assets;
+  assert.deepEqual(assets.map((asset) => asset.name), ['a.bin', 'b.bin', 'c.bin']);
+  for (const asset of assets) {
+    assert.equal(Buffer.from(asset.base64, 'base64').toString('utf8'), contents[asset.name]);
+  }
+  const types = harness.transferChunks.map((chunk) => chunk.type);
+  const firstAssetChunk = types.indexOf('syncTransferAssetChunk');
+  assert.ok(firstAssetChunk > 0 && types.slice(firstAssetChunk).every((type) => type === 'syncTransferAssetChunk'),
+    'all records of the conversation precede its attachments');
+  const perAsset = Map.groupBy(harness.transferChunks.filter((chunk) => chunk.type === 'syncTransferAssetChunk'), (chunk) => chunk.assetIndex);
+  assert.deepEqual([...perAsset.keys()], [0, 1, 2]);
+  assert.ok(perAsset.get(0).length > 1 && perAsset.get(2).length > 1, 'large files are split into several chunks');
+  assert.ok(harness.transferChunks.every((chunk) => chunk.data.length <= 16 * 1024));
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a conversation that cannot be serialized is left out with a clear error while the others are still handed off', async () => {
+  // Simulates V8's limit on one string: serializing the poisoned message throws
+  // exactly what Chrome throws for a string that would be too long.
+  const prelude = `{
+    const stringify = JSON.stringify;
+    JSON.stringify = function (value, ...rest) {
+      const text = stringify.call(JSON, value, ...rest);
+      if (value && typeof value === 'object' && 'message' in value && typeof text === 'string' && text.includes('POISON-TOO-LONG')) {
+        throw new RangeError('Invalid string length');
+      }
+      return text;
+    };
+  }`;
+  const list = ['ok-1', 'too-big', 'ok-2'].map((uuid) => ({ uuid, name: uuid, created_at: '2026-10-26T08:00:00.000Z', updated_at: '2026-10-26T08:30:00.000Z' }));
+  const harness = createHarness(null, {
+    prelude,
+    conversationListResponse: list,
+    conversationCountResponse: { count: 3 },
+    fullConversationResponse: (id) => plainConversation(id, id === 'too-big' ? [{ type: 'text', text: 'POISON-TOO-LONG' }] : []),
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.deepEqual(handoff.conversations.map((c) => c.external_id), ['ok-1', 'ok-2']);
+  assert.equal(handoff.skipped.length, 1);
+  assert.equal(handoff.skipped[0].id, 'too-big');
+  assert.match(handoff.skipped[0].error, /Could not prepare message 2 of 2 \("a1"\) of conversation "too-big" for the extension: Invalid string length\. This conversation was left out of the sync/);
+  const records = decodedRecords(harness);
+  assert.equal(records.some((record) => JSON.stringify(record).includes('too-big')), false, 'no part of it reached the background');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a background worker restart mid-transfer stops the sync with a clear error, and a fresh retry succeeds', async () => {
+  const conversation = chunkTestConversation();
+  const harness = createHarness(conversation, { handoffChunkChars: 1000, restartBackgroundAtChunk: 3 });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await harness.errorProgress;
+  assert.match(error.error, /no longer receiving this sync .*background worker restarted.*Nothing was published; sync again/);
+  assert.equal(harness.handoffs.length, 0, 'nothing reached the GitHub phase');
+
+  // The next sync starts a fresh transfer on the new worker and completes.
+  const before = harness.transferChunks.length;
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations.length, 1);
+  assert.equal(handoff.conversations[0].messages.length, 2);
+  assert.ok(harness.transferChunks.slice(before).every((chunk) => chunk.transferId === handoff.transferId));
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('keepalives hold the transfer open while conversations download, and a lost transfer aborts the sync', async () => {
+  const intervals = new Map();
+  let nextId = 1;
+  const timers = {
+    setInterval(fn, ms) { const id = nextId++; intervals.set(id, { fn, ms }); return id; },
+    clearInterval(id) { intervals.delete(id); },
+  };
+  let harness;
+  const list = ['k-1', 'k-2', 'k-3'].map((uuid) => ({ uuid, name: uuid, created_at: '2026-10-26T08:00:00.000Z', updated_at: '2026-10-26T08:30:00.000Z' }));
+  let fetched = 0;
+  harness = createHarness(null, {
+    timers,
+    conversationListResponse: list,
+    conversationCountResponse: { count: 3 },
+    fullConversationResponse: (id) => {
+      fetched++;
+      // A long download: the keepalive fires while it is in progress.
+      for (const { fn, ms } of intervals.values()) { assert.equal(ms, 15000); fn(); }
+      return plainConversation(id);
+    },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations.length, 3);
+  assert.equal(intervals.size, 1, 'the keepalive also covers the GitHub phase of the handoff');
+  harness.finishFirstHandoff({ ok: true });
+  for (let i = 0; i < 10 && intervals.size; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(intervals.size, 0, 'the keepalive stops once the background answers the handoff');
+
+  // Now the worker forgets the transfer between two conversations.
+  const lost = createHarness(null, {
+    timers,
+    conversationListResponse: list,
+    conversationCountResponse: { count: 3 },
+    fullConversationResponse: (id) => {
+      if (id === 'k-2') {
+        lost.background.deliver({ type: 'cancelSync' }, () => {});
+        for (const { fn } of intervals.values()) fn();
+      }
+      return plainConversation(id);
+    },
+  });
+  lost.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const error = await lost.errorProgress;
+  assert.match(error.error, /no longer receiving this sync/);
+  assert.equal(lost.handoffs.length, 0);
+  assert.equal(intervals.size, 0, 'the keepalive is stopped when the sync fails');
+});
+
+test('a reply excerpt is handed off verbatim even when the quoted text looks like base64', async () => {
+  const quoted = Buffer.alloc(6000, 3).toString('base64');
+  const conversation = {
+    uuid: 'excerpt-base64', name: 'Excerpt', current_leaf_message_uuid: 'u1',
+    chat_messages: [{
+      uuid: 'u1', parent_message_uuid: ROOT, sender: 'human',
+      content: [{ type: 'text', text: 'What is this string?' }],
+      attachments: [{ file_name: 'excerpt_from_previous_claude_message.txt', extracted_content: quoted }],
+    }],
+  };
+  const harness = createHarness(conversation);
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations[0].messages[0].attachments[0].extracted_content, quoted);
+  assert.equal(handoff.conversations[0].assets.length, 0, 'an excerpt is quoted inline, not archived as a file');
   harness.finishFirstHandoff({ ok: true });
 });

@@ -125,6 +125,10 @@ function gitHubError(response, text, s) {
 
 async function gh(path, opts = {}, allowAfterCancel = false) {
   if (!allowAfterCancel) assertNotCancelled();
+  // `signal` lets the sync transfer cancel its own uploads; it is not a
+  // fetch option of its own here.
+  const { signal: requestSignal, ...fetchOptions } = opts;
+  opts = fetchOptions;
   const s = activeGitHubSettings || await settings();
   if (!s.github_owner || !s.github_repo || !s.github_token) throw Error('Configure GitHub settings in the extension popup first.');
   const headers = {
@@ -135,7 +139,7 @@ async function gh(path, opts = {}, allowAfterCancel = false) {
     ...(opts.headers || {}),
   };
   const controller = syncAbortController;
-  const signal = allowAfterCancel ? undefined : controller?.signal;
+  const signal = allowAfterCancel ? undefined : (requestSignal || controller?.signal);
   const method = String(opts.method || 'GET').toUpperCase();
   const retryable = isRetryableGitHubRequest(path, method);
 
@@ -312,6 +316,22 @@ function escapeMarkdownLabel(value) {
 // archived; uploading it would fail every sync. It is left out with a note.
 const MAX_ARCHIVED_FILE_BYTES = 100 * 1024 * 1024;
 
+// UTF-8 size of a string, stopping as soon as it passes `limit`.
+function utf8LengthExceeds(text, limit) {
+  const value = String(text ?? '');
+  if (value.length * 3 <= limit) return false;
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) { bytes += 4; i++; }
+    else bytes += 3;
+    if (bytes > limit) return true;
+  }
+  return false;
+}
+
 function assetByteSize(raw) {
   const size = Number(raw?.size);
   return Number.isFinite(size) && size > 0 ? size : Math.floor(String(raw?.base64 || '').length * 3 / 4);
@@ -331,6 +351,18 @@ function assetMarkdown(asset, path) {
 function isReplyExcerptAttachment(file) {
   const name = String(file?.file_name || file?.name || '').trim().toLowerCase();
   return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
+}
+
+// Matching runs for every asset/message pair (and every inline marker), so
+// serialize each message's metadata once instead of once per comparison.
+const messageHaystacks = new WeakMap();
+function messageHaystack(message) {
+  let haystack = messageHaystacks.get(message);
+  if (haystack === undefined) {
+    haystack = JSON.stringify(message.metadata || message).toLowerCase();
+    messageHaystacks.set(message, haystack);
+  }
+  return haystack;
 }
 
 function assetMatchesMessage(asset, message, allAssets = []) {
@@ -369,7 +401,7 @@ function assetMatchesMessage(asset, message, allAssets = []) {
   }
 
   // A full sandbox path is the strongest available association for generated files.
-  const haystack = JSON.stringify(message.metadata || message).toLowerCase();
+  const haystack = messageHaystack(message);
   const sourcePath = String(asset.source_path || '').replace(/\\/g, '/').toLowerCase();
   const baseName = String(asset.name || '').toLowerCase();
   if (sourcePath && haystack.includes(sourcePath)) return true;
@@ -584,15 +616,18 @@ function normalizeAssetList(c, provider, accountSlug) {
     const omitted = size > MAX_ARCHIVED_FILE_BYTES;
     // The content script intentionally leaves base64 empty for files over
     // GitHub's limit. Their size/hash metadata is enough to render the note.
-    if (!raw.base64 && !omitted) continue;
+    // An asset staged during the transfer carries the SHA of the Git blob that
+    // already holds its bytes instead of the bytes themselves.
+    if (!raw.base64 && !raw.blob_sha && !omitted) continue;
     const path = assetPath(c, raw, provider, accountSlug, usedPaths);
     const asset = {
       ...raw,
       path,
       encoding: 'base64',
-      base64: omitted ? '' : raw.base64,
+      base64: omitted ? '' : (raw.base64 || ''),
       ...(omitted ? { omitted: true, size } : {}),
     };
+    if (omitted) delete asset.blob_sha;
     assets.push(asset);
     if (raw.file_uuid) byKey.set(`id:${raw.file_uuid}`, asset);
     if (raw.name && !byKey.has(`name:${raw.name}`)) byKey.set(`name:${raw.name}`, asset);
@@ -644,8 +679,8 @@ async function sha256(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function createBlob(content, encoding = 'utf-8') {
-  return gh('/git/blobs', { method: 'POST', body: JSON.stringify({ content, encoding }) });
+async function createBlob(content, encoding = 'utf-8', signal = undefined) {
+  return gh('/git/blobs', { method: 'POST', body: JSON.stringify({ content, encoding }), ...(signal ? { signal } : {}) });
 }
 
 // GitHub's low-level Git Database endpoints (blobs/trees/commits) reject
@@ -847,6 +882,21 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       const path = conversationPath(c, provider, accountSlug);
       const normalizedAssets = normalizeAssetList(c, provider, accountSlug);
       const markdown = conversationMarkdown(c, provider, account, normalizedAssets.byKey, normalizedAssets.assets);
+      const key = `${provider}:${account}:${c.external_id}`;
+      const previous = map.get(key);
+      // GitHub rejects any file over 100 MiB, which would fail the commit of
+      // every other conversation too. Leave this one out, keep its archived
+      // copy, and say why; attachments are separate files and do not count.
+      if (utf8LengthExceeds(markdown, MAX_ARCHIVED_FILE_BYTES)) {
+        report.failed.push({
+          id: String(c.external_id),
+          title: c.title || String(c.external_id),
+          error: `its Markdown transcript is over GitHub's 100 MB file limit (${Math.round(markdown.length / (1024 * 1024))} million characters)`,
+          archived: Boolean(previous),
+        });
+        onProgress?.({ stage: 'checking', current: i + 1, total, changed: changedConversations });
+        continue;
+      }
       const entry = indexEntry(c, path, provider, account, normalizedAssets.assets);
       const rawSearchText = entry.search_text;
       entry.search_text_sha256 = await sha256(rawSearchText);
@@ -859,8 +909,6 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         entry.search_text_encoding = 'plain';
       }
       entry.content_sha256 = await sha256(markdown);
-      const key = `${provider}:${account}:${c.external_id}`;
-      const previous = map.get(key);
       const previousAssets = Array.isArray(previous?.assets) ? previous.assets : [];
       const missingItems = incompleteItems(c);
       // Never let an incomplete export replace an archived copy that has files
@@ -919,7 +967,9 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
           if (asset.omitted) continue;
           const previousAsset = previousAssets.find((a) => a.path === asset.path && a.sha256 === asset.sha256);
           if (!previousAsset || !existingPaths.has(asset.path)) {
-            changes.push({ path: asset.path, content: asset.base64, encoding: 'base64' });
+            changes.push(asset.blob_sha
+              ? { path: asset.path, sha: asset.blob_sha }
+              : { path: asset.path, content: asset.base64, encoding: 'base64' });
           }
         }
       }
@@ -1051,7 +1101,8 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
             continue;
           }
 
-          const blob = await createBlob(change.content, change.encoding || 'utf-8');
+          // Attachment bytes uploaded while the transfer was received.
+          const blob = change.sha ? { sha: change.sha } : await createBlob(change.content, change.encoding || 'utf-8');
           assertNotCancelled();
           treeEntries[i] = { path: change.path, mode: '100644', type: 'blob', sha: blob.sha };
           uploaded += 1;
@@ -1153,6 +1204,377 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
   }
 }
 
+// ---- Receiving a sync from the Claude tab (see createTransferSession in content.js) ----
+//
+// The content script streams JSON records in ordered, chunked batches: one
+// header per conversation, then each of its messages, then each attachment's
+// base64 in separate chunks. Every step is checked here: a missing,
+// duplicated, reordered or altered chunk, message, conversation or file fails
+// the whole transfer, and nothing is published until syncNormalized confirms
+// the counts. Attachments are checked against their size and SHA-256 and,
+// when the archive repository can take blobs, uploaded as unreferenced Git
+// blobs at once, so the worker holds one attachment at a time rather than
+// every attachment of the sync. Such a blob is only published by the final
+// commit; an abandoned transfer leaves nothing on the branch.
+const TRANSFER_STALE_MS = 2 * 60 * 1000;
+const TRANSFER_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const TRANSFER_RETRY = 'Nothing was published; sync again.';
+let runningTransferId = null;
+
+class TransferError extends Error {}
+
+function transferLostResponse() {
+  return {
+    ok: false,
+    error: `The extension is no longer receiving this sync (it was cancelled, replaced by a newer sync, or the extension's background worker restarted). ${TRANSFER_RETRY}`,
+  };
+}
+
+function plainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function failTransfer(transfer, error) {
+  if (pendingTransfer === transfer) pendingTransfer = null;
+  try { transfer?.abortController?.abort(); } catch {}
+  return { ok: false, error };
+}
+
+// The pending transfer this message belongs to. A message for any other
+// transfer (an older sync, another tab) is refused without touching the
+// transfer that is actually running.
+function transferFor(msg) {
+  const transfer = pendingTransfer;
+  if (!transfer || transfer.mode !== 'stream' || typeof msg.transferId !== 'string' || transfer.id !== msg.transferId) return null;
+  transfer.lastActivity = Date.now();
+  return transfer;
+}
+
+function startTransfer(msg, sender) {
+  if (syncRunning) {
+    return { ok: false, error: 'Another archive sync is already running. Nothing was published; try again after it finishes.' };
+  }
+  if (typeof msg.transferId !== 'string' || !TRANSFER_ID.test(msg.transferId)
+    || (msg.metadata != null && !plainObject(msg.metadata))) {
+    return { ok: false, error: `The sync transfer could not be initialized safely. ${TRANSFER_RETRY}` };
+  }
+  const tabId = sender?.tab?.id ?? null;
+  const existing = pendingTransfer;
+  // A transfer still active in another tab is not replaced. One left behind
+  // by a closed or reloaded tab (or this same tab) is.
+  if (existing && existing.id !== msg.transferId && existing.tabId !== tabId
+    && Date.now() - existing.lastActivity < TRANSFER_STALE_MS) {
+    return { ok: false, error: 'Another Claude tab is already handing a sync to the extension. Nothing was published; wait for it to finish, or cancel it, then sync again.' };
+  }
+  if (existing) failTransfer(existing, null);
+  // A cancel from an earlier sync must not stop this one's uploads.
+  cancelRequested = false;
+  pendingTransfer = {
+    id: msg.transferId,
+    mode: 'stream',
+    tabId,
+    lastActivity: Date.now(),
+    abortController: new AbortController(),
+    metadata: plainObject(msg.metadata) ? msg.metadata : null,
+    conversations: [],
+    current: null,
+    nextBatchIndex: 0,
+    currentBatch: null,
+    currentAsset: null,
+    busy: false,
+    uploads: null,
+    stats: { uploaded: 0, reused: 0, kept: 0 },
+  };
+  return { ok: true };
+}
+
+function describeConversation(c, index) {
+  return `"${String(c?.external_id || `#${index + 1}`).slice(0, 80)}"`;
+}
+
+// Throws unless the conversation received last is complete.
+function finishCurrentConversation(transfer) {
+  const current = transfer.current;
+  if (!current) return;
+  const c = transfer.conversations[current.index];
+  if (c.messages.length !== current.expectedMessages) {
+    throw new TransferError(`conversation ${describeConversation(c, current.index)} arrived with ${c.messages.length} of ${current.expectedMessages} messages`);
+  }
+  if (transfer.currentAsset || current.pendingAssets.size) {
+    throw new TransferError(`${current.pendingAssets.size} attachment(s) of conversation ${describeConversation(c, current.index)} did not arrive`);
+  }
+  for (const asset of c.assets) delete asset.payload_chars;
+  transfer.current = null;
+}
+
+function beginConversation(transfer, record) {
+  finishCurrentConversation(transfer);
+  const index = transfer.conversations.length;
+  const header = record.conversation;
+  if (record.conversation_index !== index || !plainObject(header)
+    || !Number.isSafeInteger(record.message_count) || record.message_count < 0
+    || header.messages !== undefined || (header.assets !== undefined && !Array.isArray(header.assets))) {
+    throw new TransferError(`conversation ${index + 1} arrived out of order or malformed`);
+  }
+  const assets = Array.isArray(header.assets) ? header.assets : [];
+  const pendingAssets = new Set();
+  for (const [assetIndex, asset] of assets.entries()) {
+    if (!plainObject(asset) || !Number.isSafeInteger(asset.payload_chars) || asset.payload_chars < 0
+      || (asset.base64 !== undefined && asset.base64 !== '') || asset.blob_sha !== undefined) {
+      throw new TransferError(`attachment ${assetIndex + 1} of conversation ${describeConversation(header, index)} has invalid metadata`);
+    }
+    asset.base64 = '';
+    if (asset.payload_chars > 0) pendingAssets.add(assetIndex);
+  }
+  transfer.conversations.push({ ...header, assets, messages: [] });
+  transfer.current = { index, expectedMessages: record.message_count, pendingAssets };
+}
+
+function addMessage(transfer, record) {
+  const current = transfer.current;
+  const c = current && transfer.conversations[current.index];
+  if (!current || record.conversation_index !== current.index || !plainObject(record.message)
+    || c.messages.length >= current.expectedMessages) {
+    throw new TransferError(`a message arrived out of order or for an unexpected conversation (record for conversation ${Number(record.conversation_index) + 1})`);
+  }
+  c.messages.push(record.message);
+}
+
+function applyRecords(transfer, records) {
+  if (!Array.isArray(records) || !records.length) throw new TransferError('a batch was empty or malformed');
+  for (const record of records) {
+    if (!plainObject(record)) throw new TransferError('a batch contained a malformed record');
+    if ('conversation' in record) beginConversation(transfer, record);
+    else if ('message' in record) addMessage(transfer, record);
+    else throw new TransferError('a batch contained an unknown record');
+  }
+}
+
+function validChunkNumbers(msg) {
+  return Number.isSafeInteger(msg.chunkIndex) && msg.chunkIndex >= 0
+    && Number.isSafeInteger(msg.totalChunks) && msg.totalChunks > 0
+    && msg.chunkIndex < msg.totalChunks
+    && Number.isSafeInteger(msg.totalChars) && msg.totalChars >= 0
+    && typeof msg.data === 'string';
+}
+
+function receiveBatchChunk(msg) {
+  const transfer = transferFor(msg);
+  if (!transfer) return transferLostResponse();
+  if (transfer.busy || transfer.currentAsset || !validChunkNumbers(msg)
+    || !Number.isSafeInteger(msg.batchIndex) || msg.batchIndex !== transfer.nextBatchIndex) {
+    return failTransfer(transfer, `The conversation batches reached the extension out of order. ${TRANSFER_RETRY}`);
+  }
+  if (msg.chunkIndex === 0) {
+    if (transfer.currentBatch) {
+      return failTransfer(transfer, `A conversation batch was interrupted. ${TRANSFER_RETRY}`);
+    }
+    transfer.currentBatch = { totalChunks: msg.totalChunks, totalChars: msg.totalChars, chunks: [], chars: 0 };
+  }
+  const batch = transfer.currentBatch;
+  if (!batch || batch.totalChunks !== msg.totalChunks || batch.totalChars !== msg.totalChars
+    || msg.chunkIndex !== batch.chunks.length || batch.chars + msg.data.length > batch.totalChars) {
+    return failTransfer(transfer, `The conversation batch was incomplete or out of order. ${TRANSFER_RETRY}`);
+  }
+  batch.chunks.push(msg.data);
+  batch.chars += msg.data.length;
+  if (batch.chunks.length < batch.totalChunks) return { ok: true };
+
+  try {
+    if (batch.chars !== batch.totalChars) throw new TransferError('a batch arrived with the wrong length');
+    let records;
+    try {
+      records = JSON.parse(batch.chunks.join(''));
+    } catch {
+      throw new TransferError('a batch could not be decoded');
+    }
+    transfer.currentBatch = null;
+    applyRecords(transfer, records);
+    transfer.nextBatchIndex++;
+  } catch (error) {
+    const detail = error instanceof TransferError ? ` (${error.message})` : '';
+    return failTransfer(transfer, `A conversation batch could not be decoded safely${detail}. ${TRANSFER_RETRY}`);
+  }
+  return { ok: true };
+}
+
+function base64Bytes(base64) {
+  let binary;
+  try {
+    binary = atob(base64);
+  } catch {
+    throw new TransferError('its data is not valid base64');
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Loaded once per transfer: which archived files already hold which bytes,
+// so unchanged attachments are not uploaded again. Null means attachments
+// stay in memory until sync() (no GitHub settings, or an empty repository
+// that cannot take blobs before its first commit).
+function transferUploadContext(transfer) {
+  transfer.uploads ??= (async () => {
+    const s = await settings();
+    if (!s.github_owner || !s.github_repo || !s.github_token) return null;
+    const { ref, baseTree, index } = await loadArchiveSnapshot();
+    if (!ref) return null;
+    const treeBlobs = new Map((baseTree?.tree || [])
+      .filter((item) => item?.type === 'blob' && typeof item.path === 'string' && typeof item.sha === 'string')
+      .map((item) => [item.path, item]));
+    const knownBlobs = new Map();
+    for (const entry of index.conversations) {
+      for (const asset of (Array.isArray(entry?.assets) ? entry.assets : [])) {
+        const item = treeBlobs.get(asset?.path);
+        if (!item || typeof asset.sha256 !== 'string') continue;
+        // The tree's own size guards against a file changed outside AI Archive.
+        if (item.size != null && Number(item.size) !== Number(asset.size)) continue;
+        knownBlobs.set(`${asset.sha256}:${Number(asset.size)}`, item.sha);
+      }
+    }
+    return { knownBlobs };
+  })();
+  return transfer.uploads;
+}
+
+async function stageAsset(transfer, asset, base64) {
+  const context = await transferUploadContext(transfer);
+  if (pendingTransfer !== transfer) return;
+  if (!context) {
+    asset.base64 = base64;
+    transfer.stats.kept++;
+    return;
+  }
+  const key = `${asset.sha256}:${Number(asset.size)}`;
+  const known = context.knownBlobs.get(key);
+  if (known) {
+    asset.blob_sha = known;
+    transfer.stats.reused++;
+    return;
+  }
+  const blob = await createBlob(base64, 'base64', transfer.abortController.signal);
+  if (typeof blob?.sha !== 'string' || !blob.sha) {
+    throw new Error('GitHub did not return a blob SHA for an attachment.');
+  }
+  asset.blob_sha = blob.sha;
+  context.knownBlobs.set(key, blob.sha);
+  transfer.stats.uploaded++;
+}
+
+function receiveAssetChunk(msg) {
+  const transfer = transferFor(msg);
+  if (!transfer) return transferLostResponse();
+  const current = transfer.current;
+  const c = current && transfer.conversations[current.index];
+  if (transfer.busy || transfer.currentBatch || !validChunkNumbers(msg)
+    || !Number.isSafeInteger(msg.conversationIndex) || !Number.isSafeInteger(msg.assetIndex)
+    || !current || msg.conversationIndex !== current.index
+    || c.messages.length !== current.expectedMessages) {
+    return failTransfer(transfer, `The attachment chunks reached the extension out of order. ${TRANSFER_RETRY}`);
+  }
+  const asset = c.assets[msg.assetIndex];
+  if (msg.chunkIndex === 0) {
+    if (transfer.currentAsset) {
+      return failTransfer(transfer, `An attachment transfer was interrupted. ${TRANSFER_RETRY}`);
+    }
+    if (!asset || !current.pendingAssets.has(msg.assetIndex) || msg.totalChars !== asset.payload_chars) {
+      return failTransfer(transfer, `The attachment metadata was missing, did not match, or was already received. ${TRANSFER_RETRY}`);
+    }
+    transfer.currentAsset = { assetIndex: msg.assetIndex, totalChunks: msg.totalChunks, chunks: [], chars: 0 };
+  }
+  const receiving = transfer.currentAsset;
+  if (!receiving || receiving.assetIndex !== msg.assetIndex || receiving.totalChunks !== msg.totalChunks
+    || msg.totalChars !== asset?.payload_chars || msg.chunkIndex !== receiving.chunks.length
+    || receiving.chars + msg.data.length > asset.payload_chars) {
+    return failTransfer(transfer, `The attachment chunks were incomplete or out of order. ${TRANSFER_RETRY}`);
+  }
+  receiving.chunks.push(msg.data);
+  receiving.chars += msg.data.length;
+  if (receiving.chunks.length < receiving.totalChunks) return { ok: true };
+
+  transfer.busy = true;
+  transfer.currentAsset = null;
+  const label = `"${String(asset.name || 'file').slice(0, 120)}"`;
+  return (async () => {
+    try {
+      if (receiving.chars !== asset.payload_chars) throw new TransferError('it arrived with the wrong length');
+      let base64 = receiving.chunks.join('');
+      receiving.chunks = null;
+      const bytes = base64Bytes(base64);
+      if (asset.size == null) asset.size = bytes.byteLength;
+      if (bytes.byteLength !== Number(asset.size)) {
+        throw new TransferError(`it arrived with ${bytes.byteLength} bytes instead of ${Number(asset.size)}`);
+      }
+      if (await sha256Hex(bytes) !== String(asset.sha256 || '').toLowerCase()) {
+        throw new TransferError('its contents do not match the checksum taken when it was downloaded');
+      }
+      if (pendingTransfer !== transfer) return transferLostResponse();
+      await stageAsset(transfer, asset, base64);
+      base64 = null;
+      if (pendingTransfer !== transfer) return transferLostResponse();
+      current.pendingAssets.delete(msg.assetIndex);
+      return { ok: true };
+    } catch (error) {
+      if (pendingTransfer !== transfer) return transferLostResponse();
+      if (error?.message === '__SYNC_CANCELLED__' || error?.name === 'AbortError') {
+        return failTransfer(transfer, 'Sync cancelled. Nothing was published.');
+      }
+      const message = error instanceof TransferError
+        ? `Attachment ${label} could not be received safely: ${error.message}. ${TRANSFER_RETRY}`
+        : `Attachment ${label} could not be uploaded to GitHub: ${String(error?.message || error)}`;
+      return failTransfer(transfer, message);
+    } finally {
+      transfer.busy = false;
+    }
+  })();
+}
+
+// Returns the complete sync payload of a finished transfer, or throws.
+function completeTransfer(msg) {
+  const transfer = pendingTransfer;
+  if (!transfer || transfer.id !== msg.transferId) throw new TransferError('no transfer with this ID is being received');
+  pendingTransfer = null;
+  if (transfer.mode === 'legacy') {
+    if (transfer.chunks.length !== transfer.total) throw new TransferError('chunks are missing');
+    return JSON.parse(transfer.chunks.join(''));
+  }
+  if (transfer.busy || transfer.currentBatch || transfer.currentAsset) throw new TransferError('a batch or attachment was still being received');
+  finishCurrentConversation(transfer);
+  if (!Number.isSafeInteger(msg.conversationCount) || msg.conversationCount !== transfer.conversations.length) {
+    throw new TransferError(`${transfer.conversations.length} of ${Number.isSafeInteger(msg.conversationCount) ? msg.conversationCount : 'an unknown number of'} conversations arrived`);
+  }
+  const metadata = plainObject(msg.metadata) ? msg.metadata : (transfer.metadata || {});
+  return {
+    skipped: Array.isArray(metadata.skipped) ? metadata.skipped : [],
+    unchangedIds: Array.isArray(metadata.unchangedIds) ? metadata.unchangedIds : [],
+    fullList: metadata.fullList === true,
+    listed: Number.isFinite(metadata.listed) ? metadata.listed : null,
+    conversations: transfer.conversations,
+  };
+}
+
+const TRANSFER_MESSAGES = {
+  syncTransferStart: (msg, sender) => startTransfer(msg, sender),
+  syncTransferBatchChunk: (msg) => receiveBatchChunk(msg),
+  syncTransferAssetChunk: (msg) => receiveAssetChunk(msg),
+  syncTransferKeepAlive: (msg) => {
+    if (transferFor(msg)) return { ok: true };
+    // The final handoff is being published to GitHub.
+    if (syncRunning && runningTransferId && msg.transferId === runningTransferId) return { ok: true };
+    return transferLostResponse();
+  },
+  syncTransferAbort: (msg) => {
+    if (pendingTransfer?.id === msg.transferId) failTransfer(pendingTransfer, null);
+    return { ok: true };
+  },
+};
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'syncProgress' && sender?.tab) {
     const { type, ...progress } = msg;
@@ -1191,159 +1613,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     cancelRequested = true;
     syncAbortController?.abort();
+    // Stop uploads of a sync still being received; the content script is
+    // cancelled too and publishes nothing.
+    if (pendingTransfer) failTransfer(pendingTransfer, null);
     broadcast({ stage: 'cancelled', message: 'Sync cancelled.' });
     sendResponse({ ok: true });
     return false;
   }
-  if (msg.type === 'syncTransferStart') {
-    if (syncRunning) {
-      sendResponse({ ok: false, error: 'Another archive sync is already running. Nothing was published; try again after it finishes.' });
-      return false;
+  if (Object.hasOwn(TRANSFER_MESSAGES, msg.type)) {
+    let result;
+    try {
+      result = TRANSFER_MESSAGES[msg.type](msg, sender);
+    } catch (error) {
+      result = failTransfer(pendingTransfer, `The sync transfer failed: ${String(error?.message || error)} ${TRANSFER_RETRY}`);
     }
-    if (typeof msg.transferId !== 'string' || !msg.transferId
-      || !Number.isSafeInteger(msg.conversationCount) || msg.conversationCount < 0
-      || !msg.metadata || typeof msg.metadata !== 'object' || Array.isArray(msg.metadata)) {
-      pendingTransfer = null;
-      sendResponse({ ok: false, error: 'The sync transfer could not be initialized safely. Nothing was published; sync again.' });
-      return false;
+    if (result && typeof result.then === 'function') {
+      result.then(sendResponse, (error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+      return true;
     }
-    pendingTransfer = {
-      id: msg.transferId,
-      mode: 'batches',
-      expectedConversations: msg.conversationCount,
-      metadata: {
-        skipped: Array.isArray(msg.metadata.skipped) ? msg.metadata.skipped : [],
-        unchangedIds: Array.isArray(msg.metadata.unchangedIds) ? msg.metadata.unchangedIds : [],
-        fullList: msg.metadata.fullList === true,
-        listed: Number.isFinite(msg.metadata.listed) ? msg.metadata.listed : null,
-      },
-      conversations: [],
-      nextBatchIndex: 0,
-      currentBatch: null,
-      currentAsset: null,
-    };
-    sendResponse({ ok: true });
-    return false;
-  }
-  if (msg.type === 'syncTransferBatchChunk') {
-    const transfer = pendingTransfer;
-    const validNumbers = Number.isSafeInteger(msg.batchIndex) && msg.batchIndex >= 0
-      && Number.isSafeInteger(msg.chunkIndex) && msg.chunkIndex >= 0
-      && Number.isSafeInteger(msg.totalChunks) && msg.totalChunks > 0
-      && msg.chunkIndex < msg.totalChunks;
-    if (!transfer || transfer.mode !== 'batches' || transfer.id !== msg.transferId
-      || !validNumbers || msg.batchIndex !== transfer.nextBatchIndex
-      || typeof msg.data !== 'string') {
-      pendingTransfer = null;
-      sendResponse({ ok: false, error: 'The conversation batches reached the extension out of order. Nothing was published; sync again.' });
-      return false;
-    }
-
-    if (msg.chunkIndex === 0) {
-      if (transfer.currentBatch) {
-        pendingTransfer = null;
-        sendResponse({ ok: false, error: 'A conversation batch was interrupted. Nothing was published; sync again.' });
-        return false;
-      }
-      transfer.currentBatch = { totalChunks: msg.totalChunks, chunks: [] };
-    }
-    const batch = transfer.currentBatch;
-    if (!batch || batch.totalChunks !== msg.totalChunks || msg.chunkIndex !== batch.chunks.length) {
-      pendingTransfer = null;
-      sendResponse({ ok: false, error: 'The conversation batch was incomplete or out of order. Nothing was published; sync again.' });
-      return false;
-    }
-
-    batch.chunks.push(msg.data);
-    if (batch.chunks.length === batch.totalChunks) {
-      try {
-        const conversations = JSON.parse(batch.chunks.join(''));
-        if (!Array.isArray(conversations) || !conversations.length
-          || transfer.conversations.length + conversations.length > transfer.expectedConversations) {
-          throw new Error('invalid batch shape');
-        }
-        transfer.conversations.push(...conversations);
-        transfer.currentBatch = null;
-        transfer.nextBatchIndex++;
-      } catch {
-        pendingTransfer = null;
-        sendResponse({ ok: false, error: 'A conversation batch could not be decoded safely. Nothing was published; sync again.' });
-        return false;
-      }
-    }
-    sendResponse({ ok: true });
-    return false;
-  }
-  if (msg.type === 'syncTransferAssetChunk') {
-    const transfer = pendingTransfer;
-    const validNumbers = Number.isSafeInteger(msg.conversationIndex) && msg.conversationIndex >= 0
-      && Number.isSafeInteger(msg.assetIndex) && msg.assetIndex >= 0
-      && Number.isSafeInteger(msg.chunkIndex) && msg.chunkIndex >= 0
-      && Number.isSafeInteger(msg.totalChunks) && msg.totalChunks > 0
-      && msg.chunkIndex < msg.totalChunks;
-    if (!transfer || transfer.mode !== 'batches' || transfer.id !== msg.transferId
-      || transfer.currentBatch || !validNumbers || typeof msg.data !== 'string') {
-      pendingTransfer = null;
-      sendResponse({ ok: false, error: 'The attachment chunks reached the extension out of order. Nothing was published; sync again.' });
-      return false;
-    }
-
-    if (msg.chunkIndex === 0) {
-      if (transfer.currentAsset) {
-        pendingTransfer = null;
-        sendResponse({ ok: false, error: 'An attachment transfer was interrupted. Nothing was published; sync again.' });
-        return false;
-      }
-      const conversation = transfer.conversations[msg.conversationIndex];
-      const asset = conversation?.assets?.[msg.assetIndex];
-      if (!asset || asset.base64) {
-        pendingTransfer = null;
-        sendResponse({ ok: false, error: 'The attachment metadata was missing or already populated. Nothing was published; sync again.' });
-        return false;
-      }
-      transfer.currentAsset = {
-        conversationIndex: msg.conversationIndex,
-        assetIndex: msg.assetIndex,
-        totalChunks: msg.totalChunks,
-        chunks: [],
-      };
-    }
-
-    const current = transfer.currentAsset;
-    if (!current || current.conversationIndex !== msg.conversationIndex
-      || current.assetIndex !== msg.assetIndex || current.totalChunks !== msg.totalChunks
-      || msg.chunkIndex !== current.chunks.length) {
-      pendingTransfer = null;
-      sendResponse({ ok: false, error: 'The attachment chunks were incomplete or out of order. Nothing was published; sync again.' });
-      return false;
-    }
-
-    current.chunks.push(msg.data);
-    if (current.chunks.length === current.totalChunks) {
-      const conversation = transfer.conversations[current.conversationIndex];
-      const asset = conversation?.assets?.[current.assetIndex];
-      if (!asset) {
-        pendingTransfer = null;
-        sendResponse({ ok: false, error: 'The attachment no longer matches its conversation. Nothing was published; sync again.' });
-        return false;
-      }
-      asset.base64 = current.chunks.join('');
-      transfer.currentAsset = null;
-    }
-    sendResponse({ ok: true });
-    return false;
-  }
-  if (msg.type === 'syncTransferAbort') {
-    if (pendingTransfer?.id === msg.transferId) pendingTransfer = null;
-    sendResponse({ ok: true });
+    sendResponse(result);
     return false;
   }
   if (msg.type === 'syncTransferChunk') {
     // Backward-compatible receiver for the previous whole-payload chunk format.
-    if (msg.index === 0) pendingTransfer = { id: msg.transferId, mode: 'legacy', total: msg.total, chunks: [] };
+    if (msg.index === 0) {
+      if (pendingTransfer && pendingTransfer.id !== msg.transferId && pendingTransfer.mode === 'stream') {
+        sendResponse(transferLostResponse());
+        return false;
+      }
+      pendingTransfer = { id: msg.transferId, mode: 'legacy', total: msg.total, chunks: [] };
+    }
     if (!pendingTransfer || pendingTransfer.mode !== 'legacy' || pendingTransfer.id !== msg.transferId || pendingTransfer.total !== msg.total
       || msg.index !== pendingTransfer.chunks.length || typeof msg.data !== 'string') {
-      pendingTransfer = null;
+      if (pendingTransfer?.mode === 'legacy') pendingTransfer = null;
       sendResponse({ ok: false, error: 'The sync data reached the extension out of order. Nothing was published; sync again.' });
       return false;
     }
@@ -1356,31 +1658,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // completed. Ignore duplicate handoffs rather than creating competing
     // commits against the same branch head.
     if (syncRunning) {
-      pendingTransfer = null;
+      if (msg.transferId != null && pendingTransfer?.id === msg.transferId) failTransfer(pendingTransfer, null);
       sendResponse({ ok: true, alreadyRunning: true });
       return false;
     }
 
     let payload = msg;
     if (msg.transferId != null) {
-      const transfer = pendingTransfer;
-      pendingTransfer = null;
       try {
-        if (!transfer || transfer.id !== msg.transferId) throw new Error('incomplete');
-        if (transfer.mode === 'batches') {
-          if (transfer.currentBatch || transfer.currentAsset
-            || transfer.conversations.length !== transfer.expectedConversations) throw new Error('incomplete');
-          payload = { ...transfer.metadata, conversations: transfer.conversations };
-        } else {
-          if (transfer.chunks.length !== transfer.total) throw new Error('incomplete');
-          payload = JSON.parse(transfer.chunks.join(''));
-        }
-      } catch {
-        const error = 'The sync data did not fully reach the extension (it may have restarted). Nothing was published; sync again.';
-        broadcast({ stage: 'error', error });
-        sendResponse({ ok: false, error });
+        payload = completeTransfer(msg);
+      } catch (error) {
+        const detail = error instanceof TransferError ? ` (${error.message})` : '';
+        const message = `The sync data did not fully reach the extension${detail}; it may have restarted. Nothing was published; sync again.`;
+        broadcast({ stage: 'error', error: message });
+        sendResponse({ ok: false, error: message });
         return false;
       }
+      runningTransferId = msg.transferId;
     }
 
     // The content script's fetching phase is over; from here the GitHub sync
@@ -1392,6 +1686,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       unchangedIds: Array.isArray(payload.unchangedIds) ? payload.unchangedIds : [],
       listed: Number.isFinite(payload.listed) ? payload.listed : null,
     })
+      .finally(() => {
+        if (runningTransferId === msg.transferId) runningTransferId = null;
+      })
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((e) => {
         if (e.name === 'AbortError' || e.message === '__SYNC_CANCELLED__') {

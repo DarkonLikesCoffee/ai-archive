@@ -1,5 +1,14 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.15 — streaming, verified sync handoff
+- Each conversation is handed to the background worker as soon as it has been fetched, then released, so the Claude tab no longer holds the whole account (and every attachment of it) until the end of the fetch. The handoff also starts before fetching, so a busy extension is reported at once.
+- Conversations travel as one JSON record per message. The largest JSON string built is a single message, never a whole conversation or archive. A message too large to serialize leaves only that conversation out of the sync, with its archived copy kept and the reason named.
+- The background checks every batch and attachment: missing, duplicated, reordered, resized or altered chunks, messages, conversations or files fail the transfer and nothing is published. Each attachment is checked against the size and SHA-256 taken when it was downloaded.
+- Attachments are uploaded as unreferenced Git blobs while the transfer is received, and bytes already in the archive are reused, so the worker holds one attachment at a time. Nothing reaches the branch until the final commit. A brand-new, empty repository keeps the previous in-memory path.
+- Binary payloads are also recognized under unexpected field names, as URL-safe base64, and as data URLs embedded in text. Extracted attachment text is not sent a third time, and looking for sandbox paths no longer serializes whole conversations.
+- A stray message from an older transfer no longer cancels the running one. Retrying from the same tab replaces an interrupted transfer, and a keepalive stops Chrome from stopping the worker during long downloads. A lost transfer is reported clearly.
+- A conversation whose Markdown would exceed GitHub's 100 MB file limit is reported and keeps its archived copy, instead of failing the whole commit.
+
 ## Extension v0.5.14 — isolate attachment payloads
 - Raw Claude message metadata no longer duplicates inline base64 binary content already extracted into assets.
 - Attachment bytes are transferred separately from conversation JSON in bounded chunks, so a single conversation with many large attachments does not need one enormous JSON string.
