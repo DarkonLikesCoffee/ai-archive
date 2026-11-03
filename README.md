@@ -1,5 +1,8 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.18 — upgraded Claude workspace file handling
+- Upgraded workspaces (`workspace_upgraded: true` or `is_wiggle_enabled: false`) no longer query the retired Wiggle sandbox file-list endpoint, which returns a misleading 404. Message-level Files API downloads continue normally; legacy sandbox collection remains enabled for conversations that still support it.
+
 ## Extension v0.5.17 — deterministic structured JSON
 - Structured tool inputs, tool results and unknown content blocks now serialize object keys in a stable order. Equivalent Claude responses no longer rewrite conversation Markdown solely because JSON properties arrived in a different order. Array order and actual values are preserved.
 
