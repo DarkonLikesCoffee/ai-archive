@@ -744,7 +744,7 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
-  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map(), incomplete = [], sandboxInfo = {}) {
+  async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map(), incomplete = [], sandboxInfo = {}, sandboxSupported = true) {
     const assets = [];
     const seen = new Set();
     const messageAssetFingerprints = new Set();
@@ -855,7 +855,6 @@
     // querying /wiggle/list-files for them returns a misleading 404 and marks
     // otherwise successfully exported conversations as incomplete. Keep the
     // legacy sandbox path for conversations that still advertise Wiggle.
-    const sandboxSupported = c.workspace_upgraded !== true && c.is_wiggle_enabled !== false;
     const { assets: sandbox, listStatus } = sandboxSupported
       ? await fetchSandboxFiles(org, conversationId, messages, directAssets.filter(Boolean), signal, incomplete, sandboxInfo)
       : { assets: [], listStatus: null };
@@ -1281,7 +1280,8 @@
     // Files that could not be archived; rendered as visible notes and recorded
     // in the index so the conversation is retried by later syncs.
     const incomplete = [];
-    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage, incomplete, sandboxInfo);
+    const sandboxSupported = c.workspace_upgraded !== true && c.is_wiggle_enabled !== false;
+    const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage, incomplete, sandboxInfo, sandboxSupported);
     return {
       external_id: c.uuid,
       title: c.name || 'Untitled conversation',
