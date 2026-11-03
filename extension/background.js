@@ -104,23 +104,54 @@ function retryAfterMs(response) {
 
 // Error messages keep the "GitHub <status>:" prefix that callers match on
 // (for example an expected 404 for a missing branch or file).
-function gitHubError(response, text, s) {
+// Never let a credential reach an error message, the popup or storage.
+function redactSecrets(text, token = '') {
+  let value = String(text ?? '');
+  if (token && token.length >= 8) value = value.split(token).join('<token>');
+  return value
+    .replace(/\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, '<token>')
+    .replace(/(authorization|bearer|token)(["']?\s*[:=]\s*["']?|\s+)[A-Za-z0-9_.\-]{16,}/gi, '$1$2<token>');
+}
+
+// GitHub's own explanation from an error body, bounded and on one line.
+function gitHubMessage(text, token) {
   let message = '';
-  try { message = String(JSON.parse(text)?.message || ''); } catch { message = String(text || ''); }
+  try {
+    const body = JSON.parse(text);
+    message = String(body?.message || '');
+    const details = Array.isArray(body?.errors) ? body.errors.map((item) => (typeof item === 'string' ? item : item?.message || item?.code || '')).filter(Boolean) : [];
+    if (details.length) message += ` (${details.join('; ')})`;
+  } catch {
+    message = String(text || '');
+  }
+  message = redactSecrets(message, token).replace(/\s+/g, ' ').trim();
+  return message.length > 600 ? `${message.slice(0, 600)}…` : message;
+}
+
+// GitHub answers a request body it will not process with HTTP 422 "Sorry, your
+// input was too large to process" (seen for a blob on a real account); a proxy
+// may answer 413. Other 422 responses are validation errors and stay errors.
+function isInputTooLarge(status, message) {
+  return status === 413 || (status === 422 && /input was too large to process/i.test(String(message || '')));
+}
+
+function gitHubError(response, text, s) {
+  const message = gitHubMessage(text, s?.github_token);
   const status = response.status;
+  const tagged = (error) => Object.assign(error, { status, githubMessage: message, inputTooLarge: isInputTooLarge(status, message) });
   const remaining = response.headers?.get?.('x-ratelimit-remaining');
   const reset = Number(response.headers?.get?.('x-ratelimit-reset'));
   if (status === 401) {
-    return new Error('GitHub 401: GitHub rejected the access token. Update the token in the extension popup. Nothing was published.');
+    return tagged(new Error('GitHub 401: GitHub rejected the access token. Update the token in the extension popup. Nothing was published.'));
   }
   if ((status === 403 || status === 429) && remaining === '0') {
     const when = Number.isFinite(reset) && reset > 0 ? ` it resets at ${new Date(reset * 1000).toISOString()}.` : ' try again later.';
-    return new Error(`GitHub ${status}: GitHub API rate limit reached;${when} Nothing was published; sync again after that.`);
+    return tagged(new Error(`GitHub ${status}: GitHub API rate limit reached;${when} Nothing was published; sync again after that.`));
   }
   if (status === 403 && !/rate limit/i.test(message)) {
-    return new Error(`GitHub 403: GitHub denied access to ${s.github_owner}/${s.github_repo}. The token needs read and write access to repository contents. Nothing was published. (${message.slice(0, 200)})`);
+    return tagged(new Error(`GitHub 403: GitHub denied access to ${s.github_owner}/${s.github_repo}. The token needs read and write access to repository contents. Nothing was published. (${message.slice(0, 200)})`));
   }
-  return new Error(`GitHub ${status}: ${String(text || '').slice(0, 400)}`);
+  return tagged(new Error(`GitHub ${status}: ${message || 'no error message'}`));
 }
 
 async function gh(path, opts = {}, allowAfterCancel = false) {
@@ -312,11 +343,66 @@ function escapeMarkdownLabel(value) {
     .replace(/([*_\x60!])/g, '\\$1');
 }
 
-// GitHub rejects any file over 100 MiB, so such an attachment can never be
-// archived; uploading it would fail every sync. It is left out with a note.
-const MAX_ARCHIVED_FILE_BYTES = 100 * 1024 * 1024;
+// Files reach GitHub through the Git blob REST endpoint as base64 inside a
+// JSON body: {"content":"<base64>","encoding":"base64"}. The documented blob
+// ceiling is 100 MB, but GitHub rejects request bodies well below that with
+// HTTP 422 "Sorry, your input was too large to process", and documents no
+// exact request limit. So the limit is set on the request, conservatively:
+// 40 MiB of JSON, which holds a file of up to 30 MiB (base64 adds a third).
+// Claude itself accepts uploads up to 30 MB, so ordinary attachments fit.
+// A larger file is left out with a visible note and the conversation is
+// marked incomplete; it is never uploaded only to be rejected.
+const MAX_BLOB_REQUEST_BYTES = 40 * 1024 * 1024;
+const BLOB_REQUEST_OVERHEAD_BYTES = 64;
+const MAX_ARCHIVED_FILE_BYTES = Math.floor((MAX_BLOB_REQUEST_BYTES - BLOB_REQUEST_OVERHEAD_BYTES) / 4) * 3;
+
+const base64RequestBytes = (size) => 4 * Math.ceil(Number(size) / 3) + BLOB_REQUEST_OVERHEAD_BYTES;
+
+function formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return 'unknown size';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+// An attachment GitHub's API cannot take: why, in words for the archive and
+// the popup. `remote` is GitHub's own refusal (HTTP 422/413); otherwise the
+// size check refused it before any request was made.
+function tooLargeReason(size, { remote = null } = {}) {
+  if (remote) {
+    return `GitHub rejected the upload as too large to process (HTTP ${remote.status}: "${String(remote.message || '').slice(0, 160)}")`;
+  }
+  return `larger than the ${formatBytes(MAX_ARCHIVED_FILE_BYTES)} AI Archive can upload through GitHub's API`;
+}
+
+class BlobTooLargeError extends Error {
+  constructor(message, { remote = null } = {}) {
+    super(message);
+    this.name = 'BlobTooLargeError';
+    this.remote = remote;
+  }
+}
 
 // UTF-8 size of a string, stopping as soon as it passes `limit`.
+// The commit message counts conversations whose archived copy changed, not
+// files: one conversation can add, update or delete many attachments.
+function syncCommitMessage(conversationCount, assetCount) {
+  if (!conversationCount) return 'Update AI Archive index';
+  const conversations = `Sync ${conversationCount} AI conversation${conversationCount === 1 ? '' : 's'}`;
+  return assetCount ? `${conversations} (${assetCount} asset${assetCount === 1 ? '' : 's'})` : conversations;
+}
+
+// Whether a Markdown file's blob request ({"content": "...", "encoding":
+// "utf-8"}, with JSON escapes) would be over the upload limit.
+function markdownTooLargeForUpload(markdown) {
+  const text = String(markdown ?? '');
+  // An escape is at most six bytes per character.
+  if (text.length * 6 + BLOB_REQUEST_OVERHEAD_BYTES <= MAX_BLOB_REQUEST_BYTES) return false;
+  return utf8LengthExceeds(JSON.stringify(text), MAX_BLOB_REQUEST_BYTES - BLOB_REQUEST_OVERHEAD_BYTES);
+}
+
 function utf8LengthExceeds(text, limit) {
   const value = String(text ?? '');
   if (value.length * 3 <= limit) return false;
@@ -340,8 +426,7 @@ function assetByteSize(raw) {
 function assetMarkdown(asset, path) {
   const label = escapeMarkdownLabel(asset.name || 'file');
   if (asset.omitted) {
-    const megabytes = Math.round(assetByteSize(asset) / (1024 * 1024));
-    return `**Not archived: ${label}** (${megabytes} MB; GitHub does not accept files over 100 MB)`;
+    return `**Not archived: ${label}** (${formatBytes(assetByteSize(asset))}; ${escapeMd(asset.omit_reason || tooLargeReason(assetByteSize(asset)))})`;
   }
   const rel = `assets/${String(path).split('/assets/').pop()}`;
   if (isImageAsset(asset)) return `![${label}](${rel})`;
@@ -484,7 +569,19 @@ function incompleteItems(c) {
       ...(item.message_external_id ? { message_external_id: String(item.message_external_id) } : {}),
       ...(item.file_uuid ? { file_uuid: String(item.file_uuid) } : {}),
       reason: String(item.reason || 'not archived').replace(/\s+/g, ' ').slice(0, 300),
+      // Files too large for GitHub's API: their identity, so the next sync
+      // knows the same bytes without uploading them again.
+      ...(item.too_large === true ? { too_large: true } : {}),
+      ...(item.too_large === true && /^[0-9a-f]{64}$/i.test(String(item.sha256 || '')) ? { sha256: String(item.sha256).toLowerCase() } : {}),
+      ...(item.too_large === true && Number.isSafeInteger(item.size) ? { size: item.size } : {}),
+      ...(item.too_large === true && item.github_rejected === true ? { github_rejected: true } : {}),
     }));
+}
+
+// The popup's short description of one missing file.
+function missingLabel(item) {
+  const name = item.name || 'files created by tools';
+  return item.too_large ? `${name} (${formatBytes(item.size)}, too large to upload to GitHub)` : name;
 }
 
 function notArchivedMarkdown(item) {
@@ -610,6 +707,7 @@ function normalizeAssetList(c, provider, accountSlug) {
   const usedPaths = new Set();
   const byKey = new Map();
   const assets = [];
+  const omissions = [];
   for (const raw of (c.assets || [])) {
     if (!raw?.sha256) continue;
     const size = assetByteSize(raw);
@@ -618,7 +716,9 @@ function normalizeAssetList(c, provider, accountSlug) {
     // GitHub's limit. Their size/hash metadata is enough to render the note.
     // An asset staged during the transfer carries the SHA of the Git blob that
     // already holds its bytes instead of the bytes themselves.
-    if (!raw.base64 && !raw.blob_sha && !omitted) continue;
+    // An asset GitHub refused keeps no bytes either; it must still be listed,
+    // noted and reported, never dropped silently.
+    if (!raw.base64 && !raw.blob_sha && !raw.upload_error && !omitted) continue;
     const path = assetPath(c, raw, provider, accountSlug, usedPaths);
     const asset = {
       ...raw,
@@ -628,12 +728,35 @@ function normalizeAssetList(c, provider, accountSlug) {
       ...(omitted ? { omitted: true, size } : {}),
     };
     if (omitted) delete asset.blob_sha;
+    // Within the size limit, but GitHub refused it (or refused these exact
+    // bytes in an earlier sync): left out with GitHub's reason.
+    if (!omitted && raw.upload_error) {
+      asset.omitted = true;
+      asset.size = size;
+      asset.base64 = '';
+      asset.omit_reason = String(raw.upload_error.reason || tooLargeReason(size));
+      delete asset.blob_sha;
+    }
+    if (asset.omitted) {
+      asset.omit_reason ??= tooLargeReason(size);
+      omissions.push({
+        kind: 'attachment',
+        name: String(raw.name || 'file'),
+        ...(raw.message_external_id || raw.message_external_ids?.[0] ? { message_external_id: String(raw.message_external_id || raw.message_external_ids[0]) } : {}),
+        ...(raw.file_uuid ? { file_uuid: String(raw.file_uuid) } : {}),
+        reason: `${formatBytes(size)}; ${asset.omit_reason}`,
+        too_large: true,
+        sha256: String(raw.sha256),
+        size,
+        ...(raw.upload_error?.github_rejected ? { github_rejected: true } : {}),
+      });
+    }
     assets.push(asset);
     if (raw.file_uuid) byKey.set(`id:${raw.file_uuid}`, asset);
     if (raw.name && !byKey.has(`name:${raw.name}`)) byKey.set(`name:${raw.name}`, asset);
     if (raw.source_path) byKey.set(`source:${raw.source_path}`, asset);
   }
-  return { assets, byKey };
+  return { assets, byKey, omissions };
 }
 
 function indexEntry(c, path, provider, account, assets) {
@@ -679,8 +802,22 @@ async function sha256(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Throws BlobTooLargeError, without sending anything, for a body over the
+// request limit, and when GitHub refuses the body as too large. Any other
+// failure (including other 422 validation errors) is thrown unchanged.
 async function createBlob(content, encoding = 'utf-8', signal = undefined) {
-  return gh('/git/blobs', { method: 'POST', body: JSON.stringify({ content, encoding }), ...(signal ? { signal } : {}) });
+  const body = JSON.stringify({ content, encoding });
+  if (utf8LengthExceeds(body, MAX_BLOB_REQUEST_BYTES)) {
+    throw new BlobTooLargeError(`the upload request would be over ${formatBytes(MAX_BLOB_REQUEST_BYTES)}`);
+  }
+  try {
+    return await gh('/git/blobs', { method: 'POST', body, ...(signal ? { signal } : {}) });
+  } catch (error) {
+    if (error?.inputTooLarge) {
+      throw new BlobTooLargeError(error.message, { remote: { status: error.status, message: error.githubMessage } });
+    }
+    throw error;
+  }
 }
 
 // GitHub's low-level Git Database endpoints (blobs/trees/commits) reject
@@ -873,25 +1010,73 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     }
     let changes = [];
     let changedConversations = 0;
+    let assetWrites = 0;
     let indexNeedsUpdate = false;
     const total = conversations.length;
+
+    // Attachments still held as bytes (a sync into a brand-new repository, or
+    // one handed over without the streaming upload) are uploaded before the
+    // Markdown is written, so one GitHub cannot take is noted in the
+    // conversation instead of failing the commit. Bytes already archived are
+    // reused, never uploaded again.
+    const unstaged = conversations.flatMap((c) => (Array.isArray(c?.assets) ? c.assets : []))
+      .filter((asset) => asset?.sha256 && asset.base64 && !asset.blob_sha && !asset.upload_error);
+    if (unstaged.length) {
+      if (!ref) {
+        await initializeEmptyRepository();
+        assertNotCancelled();
+        ({ ref, branch, baseCommit, baseTree, existingPaths, index } = await loadArchiveSnapshot());
+        if (!ref) throw Error('GitHub repository was initialized but no branch could be found.');
+      }
+      const context = uploadContextFromSnapshot({ baseTree, index });
+      let next = 0;
+      let firstStageError = null;
+      let staged = 0;
+      onProgress?.({ stage: 'uploading', current: 0, total: unstaged.length, changed: 0, message: 'Uploading attachments…' });
+      const stageWorker = async () => {
+        while (!firstStageError) {
+          const asset = unstaged[next++];
+          if (!asset) return;
+          try {
+            assertNotCancelled();
+            // Identical bytes in several conversations are uploaded once.
+            await stageAssetUpload(context, asset, asset.base64, syncAbortController?.signal);
+            assertNotCancelled();
+            if (asset.blob_sha || asset.upload_error) asset.base64 = '';
+            onProgress?.({ stage: 'uploading', current: ++staged, total: unstaged.length, changed: 0, message: 'Uploading attachments…' });
+          } catch (error) {
+            firstStageError ??= error;
+            return;
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(BLOB_UPLOAD_CONCURRENCY, unstaged.length) }, () => stageWorker()));
+      if (firstStageError) throw firstStageError;
+    }
 
     for (let i = 0; i < total; i++) {
       assertNotCancelled();
       const c = conversations[i];
       const path = conversationPath(c, provider, accountSlug);
       const normalizedAssets = normalizeAssetList(c, provider, accountSlug);
+      // A file too large for GitHub's API is not archived: the conversation
+      // says so where the file was, is reported as incomplete, and is
+      // checked again by every later sync.
+      if (normalizedAssets.omissions.length) {
+        const recorded = Array.isArray(c.incomplete) ? c.incomplete : [];
+        c.incomplete = [...recorded, ...normalizedAssets.omissions];
+      }
       const markdown = conversationMarkdown(c, provider, account, normalizedAssets.byKey, normalizedAssets.assets);
       const key = `${provider}:${account}:${c.external_id}`;
       const previous = map.get(key);
-      // GitHub rejects any file over 100 MiB, which would fail the commit of
-      // every other conversation too. Leave this one out, keep its archived
-      // copy, and say why; attachments are separate files and do not count.
-      if (utf8LengthExceeds(markdown, MAX_ARCHIVED_FILE_BYTES)) {
+      // A transcript GitHub's API cannot take would fail the commit of every
+      // other conversation too. Leave this one out, keep its archived copy,
+      // and say why; attachments are separate files and do not count.
+      if (markdownTooLargeForUpload(markdown)) {
         report.failed.push({
           id: String(c.external_id),
           title: c.title || String(c.external_id),
-          error: `its Markdown transcript is over GitHub's 100 MB file limit (${Math.round(markdown.length / (1024 * 1024))} million characters)`,
+          error: `its Markdown transcript (${formatBytes(markdown.length)} or more) is over the ${formatBytes(MAX_BLOB_REQUEST_BYTES)} upload limit for GitHub's API`,
           archived: Boolean(previous),
         });
         onProgress?.({ stage: 'checking', current: i + 1, total, changed: changedConversations });
@@ -922,7 +1107,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         }
       }
       if (missingItems.length) {
-        report.incomplete.push({ id: String(c.external_id), title: c.title || String(c.external_id), missing: missingItems.map((item) => item.name || 'files created by tools') });
+        report.incomplete.push({ id: String(c.external_id), title: c.title || String(c.external_id), missing: missingItems.map(missingLabel) });
       }
       if (JSON.stringify(previous?.incomplete || []) !== JSON.stringify(entry.incomplete || [])) indexNeedsUpdate = true;
       const currentAssetSignature = JSON.stringify(entry.assets);
@@ -967,6 +1152,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
           if (asset.omitted) continue;
           const previousAsset = previousAssets.find((a) => a.path === asset.path && a.sha256 === asset.sha256);
           if (!previousAsset || !existingPaths.has(asset.path)) {
+            assetWrites += 1;
             changes.push(asset.blob_sha
               ? { path: asset.path, sha: asset.blob_sha }
               : { path: asset.path, content: asset.base64, encoding: 'base64' });
@@ -1132,7 +1318,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     const commit = await gh('/git/commits', {
       method: 'POST',
       body: JSON.stringify({
-        message: `Sync ${changes.length} AI conversation${changes.length === 1 ? '' : 's'}`,
+        message: syncCommitMessage(changedConversations, assetWrites),
         tree: tree.sha,
         ...(baseCommit ? { parents: [baseCommit.sha] } : {}),
       }),
@@ -1398,6 +1584,79 @@ function receiveBatchChunk(msg) {
   return { ok: true };
 }
 
+// Which archived files already hold which bytes (so they are not uploaded
+// again), and which bytes GitHub already refused as too large (so they are
+// not sent again only to be refused).
+function uploadContextFromSnapshot({ baseTree, index }) {
+  const treeBlobs = new Map((baseTree?.tree || [])
+    .filter((item) => item?.type === 'blob' && typeof item.path === 'string' && typeof item.sha === 'string')
+    .map((item) => [item.path, item]));
+  const knownBlobs = new Map();
+  const rejected = new Map();
+  for (const entry of (Array.isArray(index?.conversations) ? index.conversations : [])) {
+    for (const asset of (Array.isArray(entry?.assets) ? entry.assets : [])) {
+      const item = treeBlobs.get(asset?.path);
+      if (!item || typeof asset.sha256 !== 'string') continue;
+      // The tree's own size guards against a file changed outside AI Archive.
+      if (item.size != null && Number(item.size) !== Number(asset.size)) continue;
+      knownBlobs.set(`${asset.sha256}:${Number(asset.size)}`, item.sha);
+    }
+    for (const item of (Array.isArray(entry?.incomplete) ? entry.incomplete : [])) {
+      if (item?.too_large === true && item.github_rejected === true && typeof item.sha256 === 'string' && Number.isSafeInteger(item.size)) {
+        // Stored as "<size>; <reason>" (see normalizeAssetList).
+        const reason = String(item.reason || '').replace(/^[^;]*;\s*/, '');
+        rejected.set(`${item.sha256}:${item.size}`, { reason: reason || 'GitHub rejected the upload as too large to process' });
+      }
+    }
+  }
+  return { knownBlobs, rejected };
+}
+
+// Uploads one attachment's bytes, or records why it cannot be archived.
+// Afterwards the asset carries `blob_sha` (uploaded now or already in the
+// archive) or `upload_error` (too large for GitHub's API); its base64 is no
+// longer needed either way. Any other GitHub failure is thrown, naming the
+// attachment, and stops the sync without publishing.
+async function stageAssetUpload(context, asset, base64, signal) {
+  const size = Number(asset.size);
+  const key = `${asset.sha256}:${size}`;
+  const known = context.knownBlobs.get(key);
+  if (known) {
+    asset.blob_sha = known;
+    return 'reused';
+  }
+  if (size > MAX_ARCHIVED_FILE_BYTES) {
+    asset.upload_error = { reason: tooLargeReason(size) };
+    return 'too-large';
+  }
+  const refused = context.rejected.get(key);
+  if (refused) {
+    asset.upload_error = { reason: refused.reason, github_rejected: true };
+    return 'too-large';
+  }
+  let blob;
+  try {
+    blob = await createBlob(base64, 'base64', signal);
+  } catch (error) {
+    if (error instanceof BlobTooLargeError) {
+      asset.upload_error = {
+        reason: error.remote ? tooLargeReason(size, { remote: error.remote }) : tooLargeReason(size),
+        ...(error.remote ? { github_rejected: true } : {}),
+      };
+      if (error.remote) context.rejected.set(key, { reason: asset.upload_error.reason });
+      return 'too-large';
+    }
+    if (error?.message === '__SYNC_CANCELLED__' || error?.name === 'AbortError') throw error;
+    throw Object.assign(new Error(`Attachment "${String(asset.name || 'file').slice(0, 120)}" (${formatBytes(size)}) could not be uploaded to GitHub: ${String(error?.message || error)}`), { cause: error });
+  }
+  if (typeof blob?.sha !== 'string' || !blob.sha) {
+    throw new Error(`GitHub did not return a blob SHA for attachment "${String(asset.name || 'file').slice(0, 120)}". Nothing was published; sync again.`);
+  }
+  asset.blob_sha = blob.sha;
+  context.knownBlobs.set(key, blob.sha);
+  return 'uploaded';
+}
+
 function base64Bytes(base64) {
   let binary;
   try {
@@ -1423,22 +1682,9 @@ function transferUploadContext(transfer) {
   transfer.uploads ??= (async () => {
     const s = await settings();
     if (!s.github_owner || !s.github_repo || !s.github_token) return null;
-    const { ref, baseTree, index } = await loadArchiveSnapshot();
-    if (!ref) return null;
-    const treeBlobs = new Map((baseTree?.tree || [])
-      .filter((item) => item?.type === 'blob' && typeof item.path === 'string' && typeof item.sha === 'string')
-      .map((item) => [item.path, item]));
-    const knownBlobs = new Map();
-    for (const entry of index.conversations) {
-      for (const asset of (Array.isArray(entry?.assets) ? entry.assets : [])) {
-        const item = treeBlobs.get(asset?.path);
-        if (!item || typeof asset.sha256 !== 'string') continue;
-        // The tree's own size guards against a file changed outside AI Archive.
-        if (item.size != null && Number(item.size) !== Number(asset.size)) continue;
-        knownBlobs.set(`${asset.sha256}:${Number(asset.size)}`, item.sha);
-      }
-    }
-    return { knownBlobs };
+    const snapshot = await loadArchiveSnapshot();
+    if (!snapshot.ref) return null;
+    return uploadContextFromSnapshot(snapshot);
   })();
   return transfer.uploads;
 }
@@ -1451,20 +1697,8 @@ async function stageAsset(transfer, asset, base64) {
     transfer.stats.kept++;
     return;
   }
-  const key = `${asset.sha256}:${Number(asset.size)}`;
-  const known = context.knownBlobs.get(key);
-  if (known) {
-    asset.blob_sha = known;
-    transfer.stats.reused++;
-    return;
-  }
-  const blob = await createBlob(base64, 'base64', transfer.abortController.signal);
-  if (typeof blob?.sha !== 'string' || !blob.sha) {
-    throw new Error('GitHub did not return a blob SHA for an attachment.');
-  }
-  asset.blob_sha = blob.sha;
-  context.knownBlobs.set(key, blob.sha);
-  transfer.stats.uploaded++;
+  const outcome = await stageAssetUpload(context, asset, base64, transfer.abortController.signal);
+  transfer.stats[outcome] = (transfer.stats[outcome] || 0) + 1;
 }
 
 function receiveAssetChunk(msg) {
@@ -1527,7 +1761,7 @@ function receiveAssetChunk(msg) {
       }
       const message = error instanceof TransferError
         ? `Attachment ${label} could not be received safely: ${error.message}. ${TRANSFER_RETRY}`
-        : `Attachment ${label} could not be uploaded to GitHub: ${String(error?.message || error)}`;
+        : `${String(error?.message || error)}${/Nothing was published/.test(String(error?.message)) ? '' : ` ${TRANSFER_RETRY}`}`;
       return failTransfer(transfer, message);
     } finally {
       transfer.busy = false;

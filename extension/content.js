@@ -470,7 +470,12 @@
     return results;
   }
 
-  const MAX_ARCHIVED_FILE_BYTES = 100 * 1024 * 1024;
+  // The largest file GitHub's API is asked to take: a blob request of 40 MiB
+  // of JSON holds base64 for about 30 MiB. Must match MAX_ARCHIVED_FILE_BYTES
+  // in background.js. Larger files are never base64-encoded or transferred;
+  // the background records them as not archived, with their name and size.
+  const MAX_BLOB_REQUEST_BYTES = 40 * 1024 * 1024;
+  const MAX_ARCHIVED_FILE_BYTES = Math.floor((MAX_BLOB_REQUEST_BYTES - 64) / 4) * 3;
 
   // Do not duplicate raw binary data in message metadata. The rendered message
   // and the separately materialized asset already preserve the user-visible

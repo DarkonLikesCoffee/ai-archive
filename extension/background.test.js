@@ -153,7 +153,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0 }) {
+function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null }) {
   const listeners = [];
   const requests = [];
   const baseSha = 'base-commit';
@@ -259,6 +259,8 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       });
     }
     if (pathname.endsWith('/git/blobs') && method === 'POST') {
+      const custom = blobResponder?.(requests.at(-1).body);
+      if (custom) return response(custom.body, custom.status, custom.headers || {});
       activeBlobRequests += 1;
       maxActiveBlobRequests = Math.max(maxActiveBlobRequests, activeBlobRequests);
       try {
@@ -303,6 +305,8 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
   conversationPath, indexEntry, sha256, archiveState, archiveAccounts, broadcast,
+  createBlob, gitHubError, syncCommitMessage, base64RequestBytes, formatBytes,
+  MAX_BLOB_REQUEST_BYTES, MAX_ARCHIVED_FILE_BYTES, BlobTooLargeError,
 };
 `, context, { filename: 'extension/background.js' });
 
@@ -1706,7 +1710,7 @@ test('an out-of-order or incomplete chunked handoff publishes nothing and says t
   assert.equal(unknown.send({ type: 'syncNormalized', transferId: 'never-sent' }, { tab: { id: 7 } }).ok, false);
 });
 
-test('an attachment over GitHub\'s 100 MB file limit is left out with a note instead of failing the sync', async () => {
+test('an attachment over the API upload limit is left out with a note instead of failing the sync', async () => {
   const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
   const [conversation] = sampleConversation();
   conversation.messages[0].files = [{ file_uuid: 'huge', file_name: 'screen recording.mov' }, { file_uuid: 'small', file_name: 'notes.txt' }];
@@ -1719,13 +1723,18 @@ test('an attachment over GitHub\'s 100 MB file limit is left out with a note ins
 
   const blobs = harness.requests.filter((r) => r.pathname.endsWith('/git/blobs') && r.method === 'POST').map((r) => r.body);
   const markdown = blobs.map((b) => b.content).find((c) => c.includes('AI_ARCHIVE_METADATA'));
-  assert.match(markdown, /\*\*Not archived: screen recording\.mov\*\* \(150 MB; GitHub does not accept files over 100 MB\)/);
+  assert.match(markdown, /\*\*Not archived: screen recording\.mov\*\* \(150\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/);
   assert.match(markdown, /\[notes\.txt\]\(assets\/[^)]*notes\.txt\)/);
   const tree = harness.requests.find((r) => r.pathname.endsWith('/git/trees') && r.method === 'POST').body.tree;
   assert.equal(tree.some((entry) => /recording/.test(entry.path)), false, 'the oversized file is never uploaded');
   assert.equal(tree.some((entry) => /notes\.txt$/.test(entry.path) && entry.sha), true);
   const index = JSON.parse(blobs.at(-1).content);
   assert.deepEqual(index.conversations[0].assets.map((a) => a.name), ['notes.txt'], 'the index lists only archived files');
+  // The conversation is marked incomplete, so it is reported and checked again.
+  assert.equal(result.partial, true);
+  assert.deepEqual([...result.report.incomplete[0].missing], ['screen recording.mov (150.0 MiB, too large to upload to GitHub)']);
+  assert.equal(index.conversations[0].incomplete[0].name, 'screen recording.mov');
+  assert.equal(index.conversations[0].incomplete[0].too_large, true);
 });
 
 // The shape of the owner's first real sync: Claude listed 11 conversations;
@@ -2015,7 +2024,7 @@ test('attachments are uploaded as Git blobs while the transfer is received and o
   assert.equal(byName('copy.png').sha, `existing-${archivedAsset.path}`, 'the reused file points at the archived blob');
   assert.equal(byName('huge.mov'), undefined, 'an oversized file is never written');
   const markdownBlob = blobPosts().find((request) => request.body.encoding === 'utf-8' && request.body.content.includes('# Sync test'));
-  assert.match(markdownBlob.body.content, /\*\*Not archived: huge\.mov\*\* \(150 MB; GitHub does not accept files over 100 MB\)/);
+  assert.match(markdownBlob.body.content, /\*\*Not archived: huge\.mov\*\* \(150\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/);
   assert.equal(blobPosts().filter((request) => request.body.content === fresh.base64).length, 1, 'no attachment is uploaded twice');
   const index = JSON.parse(blobPosts().find((request) => request.body.content.includes('"conversations"') && request.body.content.includes('format_version')).body.content);
   const entry = index.conversations.find((item) => item.id === 'conversation-123456');
@@ -2023,15 +2032,15 @@ test('attachments are uploaded as Git blobs while the transfer is received and o
   assert.equal(JSON.stringify(entry).includes('blob_sha'), false, 'transfer-only fields stay out of the index');
 });
 
-test('a conversation whose Markdown exceeds GitHub\'s file limit is reported and kept, and the others are still committed', async () => {
+test('a conversation whose Markdown exceeds the API upload limit is reported and kept, and the others are still committed', async () => {
   const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
   const [small] = sampleConversation();
-  // 35 million three-byte characters: about 105 MB of UTF-8.
+  // 15 million three-byte characters: about 45 MB of UTF-8, over the 40 MiB request limit.
   const huge = {
     ...small,
     external_id: 'conversation-huge',
     title: 'Enormous transcript',
-    messages: [{ external_id: 'huge-1', role: 'assistant', content: '€'.repeat(35 * 1000 * 1000), files: [], attachments: [] }],
+    messages: [{ external_id: 'huge-1', role: 'assistant', content: '€'.repeat(15 * 1000 * 1000), files: [], attachments: [] }],
   };
   const result = await harness.sync([huge, small], () => {});
   assert.equal(result.commit, 'new-commit');
@@ -2039,7 +2048,237 @@ test('a conversation whose Markdown exceeds GitHub\'s file limit is reported and
   assert.equal(result.partial, true);
   assert.equal(result.report.failed.length, 1);
   assert.equal(result.report.failed[0].id, 'conversation-huge');
-  assert.match(result.report.failed[0].error, /over GitHub's 100 MB file limit/);
+  assert.match(result.report.failed[0].error, /over the 40\.0 MiB upload limit for GitHub's API/);
   const blobs = harness.requests.filter((request) => request.method === 'POST' && request.pathname.endsWith('/git/blobs'));
   assert.ok(blobs.every((request) => request.body.content.length < 1024 * 1024), 'the oversized transcript is never uploaded');
+});
+
+// ---- GitHub API upload limits, refused attachments, commit messages ----
+
+const TOO_LARGE_422 = {
+  status: 422,
+  body: {
+    message: 'Sorry, your input was too large to process. Consider creating the blob in a local clone of the repository and then pushing it to GitHub.',
+    documentation_url: 'https://docs.github.com/rest/git/blobs#create-a-blob',
+    status: '422',
+  },
+};
+
+function fileAsset(name, text, messageId = 'message-1', extra = {}) {
+  const bytes = Buffer.from(text, 'utf8');
+  return { name, mime: 'text/plain', base64: bytes.toString('base64'), sha256: sha256Hex(bytes), size: bytes.length, source: 'message', message_external_id: messageId, ...extra };
+}
+
+function conversationWith(id, assets, { content = 'see attachments', title = `Conversation ${id}` } = {}) {
+  return {
+    external_id: id,
+    title,
+    model: 'test-model',
+    source_created_at: '2026-10-26T08:00:00.000Z',
+    source_updated_at: '2026-10-26T09:00:00.000Z',
+    message_count: 1,
+    messages: [{ external_id: `${id}-m1`, role: 'user', content, files: assets.map((asset) => ({ file_name: asset.name })), attachments: [] }],
+    assets: assets.map((asset) => ({ ...asset, message_external_id: `${id}-m1` })),
+  };
+}
+
+const blobPostsOf = (harness) => harness.requests.filter((request) => request.method === 'POST' && request.pathname.endsWith('/git/blobs'));
+const markdownOf = (harness, title) => blobPostsOf(harness).map((request) => request.body.content).find((content) => content.includes(`# ${title}`));
+const indexOf = (harness) => JSON.parse(blobPostsOf(harness).map((request) => request.body.content).findLast((content) => content.includes('"format_version"')));
+const emptyIndex = () => JSON.stringify({ version: 2, updated_at: '', conversations: [] });
+
+test('the upload limit is set on the base64 JSON request, not on the file size', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const { MAX_BLOB_REQUEST_BYTES, MAX_ARCHIVED_FILE_BYTES, base64RequestBytes, createBlob, BlobTooLargeError } = harness.hooks;
+  assert.equal(MAX_BLOB_REQUEST_BYTES, 40 * 1024 * 1024);
+  // The largest file whose request fits, and the first that does not.
+  assert.ok(base64RequestBytes(MAX_ARCHIVED_FILE_BYTES) <= MAX_BLOB_REQUEST_BYTES);
+  assert.ok(base64RequestBytes(MAX_ARCHIVED_FILE_BYTES + 3) > MAX_BLOB_REQUEST_BYTES);
+  assert.ok(MAX_ARCHIVED_FILE_BYTES > 29.9 * 1024 * 1024 && MAX_ARCHIVED_FILE_BYTES < 30.1 * 1024 * 1024);
+
+  // A request body of exactly the limit is sent; one byte more is refused
+  // locally, before any request reaches GitHub.
+  const fits = 'A'.repeat(MAX_BLOB_REQUEST_BYTES - JSON.stringify({ content: '', encoding: 'base64' }).length);
+  const blob = await createBlob(fits, 'base64');
+  assert.match(blob.sha, /^blob-/);
+  const before = harness.requests.length;
+  await assert.rejects(createBlob(`${fits}A`, 'base64'), (error) => error instanceof BlobTooLargeError && error.remote === null);
+  assert.equal(harness.requests.length, before, 'an over-limit blob is never sent');
+});
+
+test('an attachment within the limit is archived, and one over it is noted without any upload attempt', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const fits = fileAsset('slides.pdf', 'pdf bytes '.repeat(100000));
+  const tooBig = { ...fileAsset('recording.mov', 'stand-in bytes'), size: harness.hooks.MAX_ARCHIVED_FILE_BYTES + 1 };
+  const result = await harness.sync([conversationWith('c1', [fits, tooBig])], () => {});
+  assert.equal(result.commit, 'new-commit');
+  assert.equal(blobPostsOf(harness).filter((request) => request.body.encoding === 'base64').length, 1, 'only the file within the limit is uploaded');
+  assert.equal(blobPostsOf(harness)[0].body.content, fits.base64);
+  const markdown = markdownOf(harness, 'Conversation c1');
+  assert.match(markdown, /\[slides\.pdf\]\(assets\/[^)]*slides\.pdf\)/);
+  assert.match(markdown, /\*\*Not archived: recording\.mov\*\* \(30\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/);
+  assert.equal(result.partial, true);
+});
+
+test('GitHub\'s 422 "input was too large" leaves that attachment out, keeps the others, and still publishes', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    blobResponder: (body) => (body.content === refused.base64 ? TOO_LARGE_422 : null),
+  });
+  const refused = fileAsset('T_RICKS_Menu___Slider.html', '<html>'.repeat(200000));
+  const kept = fileAsset('notes.txt', 'kept notes');
+  const other = conversationWith('c2', [fileAsset('other.txt', 'another conversation')], { title: 'Other conversation' });
+  const result = await harness.sync([conversationWith('c1', [refused, kept], { title: 'Slider work' }), other], () => {});
+
+  assert.equal(result.commit, 'new-commit', 'one refused attachment does not abort the sync');
+  assert.equal(result.changed, 2);
+  assert.equal(blobPostsOf(harness).filter((request) => request.body.content === refused.base64).length, 1,
+    'a deterministic refusal is not retried');
+  const markdown = markdownOf(harness, 'Slider work');
+  assert.match(markdown, /\*\*Not archived: T\\_RICKS\\_Menu\\_\\_\\_Slider\.html\*\* \(1\.1 MiB; GitHub rejected the upload as too large to process \(HTTP 422: "Sorry, your input was too large to process\./);
+  assert.match(markdown, /\[notes\.txt\]\(assets\/[^)]*notes\.txt\)/, 'the other attachment of the conversation is archived');
+  assert.match(markdownOf(harness, 'Other conversation'), /\[other\.txt\]/);
+
+  const tree = harness.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/git/trees')).body.tree;
+  assert.equal(tree.some((entry) => /Slider\.html$/.test(entry.path)), false, 'the refused file is never claimed as archived');
+  assert.equal(tree.filter((entry) => /notes\.txt$|other\.txt$/.test(entry.path)).length, 2);
+
+  const entry = indexOf(harness).conversations.find((item) => item.id === 'c1');
+  assert.deepEqual(entry.assets.map((asset) => asset.name), ['notes.txt']);
+  assert.equal(entry.incomplete.length, 1);
+  assert.equal(entry.incomplete[0].name, 'T_RICKS_Menu___Slider.html');
+  assert.equal(entry.incomplete[0].github_rejected, true);
+  assert.equal(entry.incomplete[0].sha256, refused.sha256);
+  assert.equal(entry.incomplete[0].size, refused.size);
+  assert.equal(result.partial, true);
+  assert.deepEqual([...result.report.incomplete.map((item) => item.id)], ['c1']);
+  assert.deepEqual([...result.report.incomplete[0].missing], ['T_RICKS_Menu___Slider.html (1.1 MiB, too large to upload to GitHub)']);
+});
+
+test('a different 422 is a real error: it names the attachment and its size, and nothing is published', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    blobResponder: () => ({ status: 422, body: { message: 'Validation Failed', errors: [{ resource: 'Blob', code: 'invalid', field: 'content' }], documentation_url: 'https://docs.github.com/rest' } }),
+  });
+  const asset = fileAsset('data.csv', 'a,b\n'.repeat(1000));
+  await assert.rejects(harness.sync([conversationWith('c1', [asset])], () => {}),
+    /^Error: Attachment "data\.csv" \(3\.9 KiB\) could not be uploaded to GitHub: GitHub 422: Validation Failed \(invalid\)$/);
+  assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false);
+  assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST'), false);
+});
+
+test('archived bytes are reused instead of uploaded again, and bytes GitHub refused are not sent again', async () => {
+  const archived = fileAsset('logo.png', 'logo bytes');
+  const refused = fileAsset('huge.html', '<p>'.repeat(5000));
+  // The path the exporter gives this file, as in an archive it wrote itself.
+  const archivedPath = makeBackgroundSyncHarness({ indexText: emptyIndex() }).hooks
+    .normalizeAssetList(conversationWith('c1', [archived]), 'claude', 'personal').assets[0].path;
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [{
+    id: 'c1', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/c1.md', title: 'Old',
+    updated_at: '2026-10-01T00:00:00.000Z', format_version: 4,
+    assets: [{ path: archivedPath, sha256: archived.sha256, size: archived.size, name: 'logo.png' }],
+    incomplete: [{ kind: 'attachment', name: 'huge.html', reason: '14.6 KiB; GitHub rejected the upload as too large to process (HTTP 422: "Sorry, your input was too large to process.")', too_large: true, github_rejected: true, sha256: refused.sha256, size: refused.size }],
+  }] });
+  const harness = makeBackgroundSyncHarness({ indexText, blobResponder: () => null });
+  const result = await harness.sync([conversationWith('c1', [archived, refused], { title: 'Updated' })], () => {});
+  assert.equal(result.commit, 'new-commit');
+  const uploaded = blobPostsOf(harness).map((request) => request.body.content);
+  assert.equal(uploaded.includes(archived.base64), false, 'the archived logo is not uploaded again');
+  assert.equal(uploaded.includes(refused.base64), false, 'GitHub already refused these exact bytes');
+  const tree = harness.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/git/trees')).body.tree;
+  assert.equal(tree.some((entry) => entry.path === archivedPath), false, 'the archived logo stays as it is');
+  assert.match(markdownOf(harness, 'Updated'), /\*\*Not archived: huge\.html\*\* \(14\.6 KiB; GitHub rejected the upload as too large to process/);
+  assert.match(markdownOf(harness, 'Updated'), /!\[logo\.png\]\(assets\/[^)]*logo\.png\)|\[logo\.png\]/);
+
+  // The same bytes archived under another path (an older layout) are reused
+  // for the new path by their blob SHA, without another upload.
+  const movedIndex = JSON.stringify({ version: 2, updated_at: '', conversations: [{
+    id: 'c1', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/c1.md', title: 'Old',
+    updated_at: '2026-10-01T00:00:00.000Z', format_version: 4,
+    assets: [{ path: 'archive/conversations/claude/personal/assets/legacy/logo.png', sha256: archived.sha256, size: archived.size, name: 'logo.png' }],
+  }] });
+  const moved = makeBackgroundSyncHarness({ indexText: movedIndex });
+  await moved.sync([conversationWith('c1', [archived], { title: 'Moved' })], () => {});
+  assert.equal(blobPostsOf(moved).some((request) => request.body.content === archived.base64), false);
+  const movedTree = moved.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/git/trees')).body.tree;
+  assert.equal(movedTree.find((entry) => entry.path === archivedPath).sha, 'existing-archive/conversations/claude/personal/assets/legacy/logo.png');
+});
+
+test('a file that was unavailable before is archived by a later sync and the conversation is complete again', async () => {
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [{
+    id: 'c1', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/c1.md', title: 'Report',
+    updated_at: '2026-10-26T09:00:00.000Z', format_version: 4, assets: [],
+    incomplete: [{ kind: 'attachment', name: 'report.pdf', message_external_id: 'c1-m1', reason: 'Claude returned HTTP 404 for its download' }],
+  }] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const pdf = fileAsset('report.pdf', '%PDF finally available');
+  const result = await harness.sync([conversationWith('c1', [pdf], { title: 'Report' })], () => {});
+  assert.equal(result.commit, 'new-commit');
+  assert.equal(result.partial, false);
+  assert.equal(blobPostsOf(harness).filter((request) => request.body.content === pdf.base64).length, 1);
+  const entry = indexOf(harness).conversations.find((item) => item.id === 'c1');
+  assert.equal(entry.incomplete, undefined, 'the conversation is no longer marked incomplete');
+  assert.deepEqual(entry.assets.map((asset) => asset.name), ['report.pdf']);
+  assert.doesNotMatch(markdownOf(harness, 'Report'), /not archived/i);
+});
+
+test('a refused attachment received through the streaming transfer is noted, and the transfer still completes', async () => {
+  const refused = transferAsset('T_RICKS_Menu___Slider.html', '<div>'.repeat(30000));
+  const kept = transferAsset('ok.txt', 'fine');
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [{ id: 'old', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/old.md', assets: [] }] }),
+    blobResponder: (body) => (body.content === refused.base64 ? TOO_LARGE_422 : null),
+  });
+  assert.equal(harness.send({ type: 'syncTransferStart', transferId: 'refused' }).ok, true);
+  const conversation = { ...conversationWith('c1', [], { title: 'Streamed' }), assets: [refused, kept].map((asset) => ({ ...asset, message_external_id: 'c1-m1' })) };
+  const responses = await deliverAll(harness, streamTransferMessages('refused', [conversation], { chunkChars: 50000 }));
+  assert.ok(responses.every((response) => response.ok), JSON.stringify(responses.find((response) => !response.ok)));
+  const result = await harness.request({ type: 'syncNormalized', transferId: 'refused', conversationCount: 1, metadata: {} });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.partial, true);
+  assert.match(markdownOf(harness, 'Streamed'), /\*\*Not archived: T\\_RICKS\\_Menu\\_\\_\\_Slider\.html\*\* \(146\.5 KiB; GitHub rejected the upload as too large to process \(HTTP 422/);
+  assert.match(markdownOf(harness, 'Streamed'), /\[ok\.txt\]/);
+  assert.match(harness.storedValues().last_sync.message, /^Sync finished with problems: 1 conversation changed in 1 GitHub commit\..*archived with files missing .*T_RICKS_Menu___Slider\.html \(146\.5 KiB, too large to upload to GitHub\)/);
+});
+
+test('the commit message counts changed conversations, not files, deletions or assets', async () => {
+  const previousAsset = { path: 'archive/conversations/claude/personal/assets/x/old.png', sha256: 'e'.repeat(64), size: 3, name: 'old.png' };
+  const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [{
+    id: 'c1', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/c1-old-name.md', title: 'Old title',
+    updated_at: '2026-10-01T00:00:00.000Z', format_version: 4, assets: [previousAsset],
+  }] });
+  const harness = makeBackgroundSyncHarness({ indexText });
+  const ten = Array.from({ length: 10 }, (_, i) => conversationWith(`c${i + 1}`,
+    i < 9 ? [fileAsset(`a${i}.txt`, `first ${i}`), fileAsset(`b${i}.txt`, `second ${i}`)] : []));
+  const progress = [];
+  const result = await harness.sync(ten, (message) => progress.push(message));
+  assert.equal(result.changed, 10);
+  const commit = harness.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/git/commits')).body;
+  assert.equal(commit.message, 'Sync 10 AI conversations (18 assets)', 'the old file and its deleted asset do not count');
+  assert.match(progress.find((message) => message.stage === 'done').message, /^Sync complete: 10 conversations changed in 1 GitHub commit\./,
+    'the popup and the commit agree on the conversation count');
+
+  const { syncCommitMessage } = harness.hooks;
+  assert.equal(syncCommitMessage(1, 0), 'Sync 1 AI conversation');
+  assert.equal(syncCommitMessage(2, 1), 'Sync 2 AI conversations (1 asset)');
+  assert.equal(syncCommitMessage(0, 0), 'Update AI Archive index');
+});
+
+test('GitHub errors keep GitHub\'s own message, stay bounded, and never contain the token', async () => {
+  const { gitHubError } = makeBackgroundSyncHarness({ indexText: emptyIndex() }).hooks;
+  const settings = { github_owner: 'o', github_repo: 'r', github_token: 'github_pat_SECRET1234567890abcdefghij' };
+  const response = (status) => ({ status, headers: { get: () => null } });
+  const noisy = JSON.stringify({ message: `Bad things with github_pat_SECRET1234567890abcdefghij and ghp_${'x'.repeat(36)} ${'detail '.repeat(500)}`, documentation_url: 'https://docs.github.com/x' });
+  const error = gitHubError(response(500), noisy, settings);
+  assert.match(error.message, /^GitHub 500: Bad things with <token> and <token> detail/);
+  assert.equal(error.message.includes('SECRET'), false);
+  assert.ok(error.message.length < 700, `bounded: ${error.message.length}`);
+  assert.equal(error.message.includes('documentation_url'), false, 'GitHub\'s message, not its raw JSON');
+
+  const tooLarge = gitHubError(response(422), JSON.stringify(TOO_LARGE_422.body), settings);
+  assert.equal(tooLarge.inputTooLarge, true);
+  assert.match(tooLarge.message, /^GitHub 422: Sorry, your input was too large to process\. Consider creating the blob in a local clone of the repository and then pushing it to GitHub\.$/);
+  const validation = gitHubError(response(422), JSON.stringify({ message: 'Validation Failed', errors: [{ code: 'missing_field' }] }), settings);
+  assert.equal(validation.inputTooLarge, false, 'other 422 responses are not size errors');
+  assert.equal(gitHubError(response(413), 'Request Entity Too Large', settings).inputTooLarge, true);
 });

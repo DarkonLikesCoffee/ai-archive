@@ -108,7 +108,10 @@ function describeLastSync(record, now = Date.now()) {
   const label = record.stage === 'error' ? 'Last sync failed'
     : record.stage === 'cancelled' ? 'Last sync cancelled'
       : record.partial ? 'Last sync finished with problems' : 'Last sync';
-  const message = String(record.message || '').slice(0, 300);
+  // Long enough for a failure to name the attachment and GitHub's reason;
+  // the per-conversation report lists the rest.
+  const text = String(record.message || '');
+  const message = text.length > 900 ? `${text.slice(0, 900)}…` : text;
   return message ? `${label} ${when}: ${message}` : `${label} ${when}.`;
 }
 

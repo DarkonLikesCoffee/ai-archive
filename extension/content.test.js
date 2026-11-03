@@ -105,7 +105,7 @@ function createHarness(conversation, {
     } : {}),
     runtime: {
       lastError: null,
-      getManifest() { return { version: '0.5.15' }; },
+      getManifest() { return { version: '0.5.16' }; },
       onMessage: {
         addListener(listener) {
           listeners.push(listener);
@@ -2750,7 +2750,7 @@ test('a new sync clears the previous diagnostic report before work begins, inclu
   assert.equal(failure.stage, 'error', 'the malformed Claude list should fail before export');
   assert.deepEqual(JSON.parse(JSON.stringify(harness.storageState.last_sync_diagnostics.items)), [],
     'diagnostics from the previous sync must be removed even when the new sync fails before collecting conversations');
-  assert.equal(harness.storageState.last_sync_diagnostics.extension_version, '0.5.15');
+  assert.equal(harness.storageState.last_sync_diagnostics.extension_version, '0.5.16');
 });
 
 test('a sync stores a sanitized diagnostic for each conversation not archived completely, with nothing private in it', async () => {
@@ -2773,7 +2773,7 @@ test('a sync stores a sanitized diagnostic for each conversation not archived co
   for (const secret of [secretText, 'Base de datos', 'BD-GICD', 'SECRET-TOKEN', 'sig=', '99999999-8888', 'aaaaaaaa-bbbb']) {
     assert.equal(text.includes(secret), false, `diagnostics must not contain ${secret}`);
   }
-  assert.equal(stored.extension_version, '0.5.15');
+  assert.equal(stored.extension_version, '0.5.16');
   assert.equal(stored.items.length, 1);
   const [item] = stored.items;
   assert.equal(item.conversation_id, '11111111-2222-4333-8444-555555555555', 'the conversation ID is kept so the owner can match it');
@@ -3301,5 +3301,30 @@ test('a reply excerpt is handed off verbatim even when the quoted text looks lik
   const handoff = await harness.firstHandoff;
   assert.equal(handoff.conversations[0].messages[0].attachments[0].extracted_content, quoted);
   assert.equal(handoff.conversations[0].assets.length, 0, 'an excerpt is quoted inline, not archived as a file');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a file over the API upload limit is not base64-encoded or transferred, but its name, size and hash are', async () => {
+  const big = 'x'.repeat(31 * 1024 * 1024);
+  const conversation = {
+    uuid: 'big-file', name: 'Big file', current_leaf_message_uuid: 'u1',
+    chat_messages: [{
+      uuid: 'u1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'here' }],
+      files: [{ file_uuid: 'f-big', file_name: 'capture.mov', preview_url: 'https://files.example/capture.mov' }, { file_uuid: 'f-small', file_name: 'note.txt', preview_url: 'https://files.example/note.txt' }],
+    }],
+  };
+  const harness = createHarness(conversation, {
+    assetResponses: { 'https://files.example/capture.mov': { content: big }, 'https://files.example/note.txt': { content: 'small' } },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const [capture, note] = handoff.conversations[0].assets;
+  assert.equal(capture.name, 'capture.mov');
+  assert.equal(capture.size, big.length);
+  assert.equal(capture.sha256, sha256Hex(Buffer.from(big)));
+  assert.equal(capture.base64, '', 'no base64 is built for a file GitHub\'s API cannot take');
+  assert.equal(Buffer.from(note.base64, 'base64').toString(), 'small');
+  const assetChunks = harness.transferChunks.filter((chunk) => chunk.type === 'syncTransferAssetChunk');
+  assert.deepEqual([...new Set(assetChunks.map((chunk) => chunk.assetIndex))], [1], 'only the small file travels');
   harness.finishFirstHandoff({ ok: true });
 });

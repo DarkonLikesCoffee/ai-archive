@@ -17,20 +17,12 @@ const os = require('os');
 const path = require('path');
 
 const sourceExtensionDir = path.resolve(__dirname, '..', 'extension');
-// The extension under test is a copy whose only change is a lower size cap
-// for attachments (30 MiB instead of GitHub's 100 MiB): Playwright cannot pass
-// a single response over 100 MB through its DevTools pipe, so the cap's path
-// is exercised with a 31 MiB file. The real constant is unit-tested.
+// The extension runs unmodified, from a copy. Its upload limit (30 MiB files,
+// from a 40 MiB request limit for GitHub's API) is exercised with a 31 MiB
+// file, which Playwright can pass through its DevTools pipe.
 const TEST_FILE_CAP_MIB = 30;
 const extensionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-archive-extension-'));
 fs.cpSync(sourceExtensionDir, extensionDir, { recursive: true });
-{
-  const backgroundPath = path.join(extensionDir, 'background.js');
-  const original = fs.readFileSync(backgroundPath, 'utf8');
-  const patched = original.replace('const MAX_ARCHIVED_FILE_BYTES = 100 * 1024 * 1024;', `const MAX_ARCHIVED_FILE_BYTES = ${TEST_FILE_CAP_MIB} * 1024 * 1024;`);
-  if (patched === original) throw new Error('MAX_ARCHIVED_FILE_BYTES not found in background.js');
-  fs.writeFileSync(backgroundPath, patched);
-}
 const OWNER = 'me';
 const REPO = 'archive';
 const TOKEN = 'good-token';
@@ -49,6 +41,8 @@ function createFakeGitHub() {
   const refs = new Map();
   const requests = [];
   const failures = [];
+  let rejectBlobBodiesOver = 0;
+  const blobPosts = [];
   const sha = (value) => crypto.createHash('sha1').update(value).digest('hex');
   const putBlob = (buffer) => { const id = sha(Buffer.concat([Buffer.from('blob'), buffer])); blobs.set(id, buffer); return id; };
   const putTree = (entries) => { const id = sha(`tree${JSON.stringify([...entries].sort())}`); trees.set(id, new Map(entries)); return id; };
@@ -89,6 +83,11 @@ function createFakeGitHub() {
     if (method === 'GET' && (m = p.match(/^\/git\/blobs\/([0-9a-f]+)$/))) return blobs.has(m[1]) ? json(200, { sha: m[1], encoding: 'base64', content: blobs.get(m[1]).toString('base64') }) : json(404, { message: 'Not Found' });
     if (method === 'POST' && p === '/git/blobs') {
       if (!refs.size) return json(409, { message: 'Git Repository is empty.' });
+      blobPosts.push({ at: requests.length, chars: String(body.content || '').length });
+      // Like github.com for a body it will not process (seen on a real account).
+      if (rejectBlobBodiesOver && body.content.length > rejectBlobBodiesOver) {
+        return json(422, { message: 'Sorry, your input was too large to process. Consider creating the blob in a local clone of the repository and then pushing it to GitHub.', documentation_url: 'https://docs.github.com/rest/git/blobs#create-a-blob', status: '422' });
+      }
       return json(201, { sha: putBlob(Buffer.from(body.content, body.encoding === 'base64' ? 'base64' : 'utf8')) });
     }
     if (method === 'POST' && p === '/git/trees') {
@@ -125,7 +124,10 @@ function createFakeGitHub() {
     handle,
     requests,
     failures,
+    rejectBlobsOver(chars) { rejectBlobBodiesOver = chars; },
     head: () => refs.get('main'),
+    headMessage: () => commits.get(refs.get('main'))?.message,
+    blobPostSizesSince: (requestCount) => blobPosts.filter((post) => post.at > requestCount).map((post) => post.chars),
     commitCount() { let n = 0; let c = commits.get(refs.get('main')); while (c) { n++; c = c.parents[0] && commits.get(c.parents[0].sha); } return n; },
     files() {
       const head = refs.get('main');
@@ -461,9 +463,10 @@ function handleClaude(url) {
       last = await syncAll();
       files = github.files();
       const hugeMarkdown = Object.entries(files).find(([file, content]) => file.endsWith('.md') && content.toString().includes('Here is the recording'));
-      check('an attachment over 100 MB is left out with a note, and the sync publishes',
+      check('an attachment over the API upload limit is left out with a note, and the sync publishes',
         github.commitCount() === commitsBeforeHuge + 1 && /1 conversation changed/.test(last)
-        && hugeMarkdown && /\*\*Not archived: big-\d+\.bin\*\* \(31 MB; GitHub does not accept files over 100 MB\)/.test(hugeMarkdown[1].toString())
+        && /archived with files missing .*big-\d+\.bin \(31\.0 MiB, too large to upload to GitHub\)/.test(last)
+        && hugeMarkdown && /\*\*Not archived: big-\d+\.bin\*\* \(31\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/.test(hugeMarkdown[1].toString())
         && !Object.keys(files).some((file) => file.endsWith(`big-${hugeIndex}.bin`)), last);
     }
 
@@ -517,6 +520,51 @@ function handleClaude(url) {
       const blobPosts = github.requests.filter((r) => /^POST \S*\/git\/blobs$/.test(r)).length - blobPostsBefore;
       // 10 attachments + the Markdown + archive/index.json, each uploaded once.
       check('each new file is uploaded to GitHub exactly once', blobPosts === 12, `blob uploads=${blobPosts}`);
+    }
+
+    // GitHub refusing one attachment with HTTP 422 "input was too large to
+    // process" (here for any blob body over 3 MB): that file is noted, the
+    // conversation's other file and every other conversation are archived,
+    // and the commit message counts conversations, not files.
+    {
+      const refusedBytes = crypto.randomBytes(4 * 1024 * 1024);
+      const keptBytes = crypto.randomBytes(1024);
+      const otherBytes = crypto.randomBytes(2048);
+      const first = BIG_FILES.length;
+      BIG_FILES.push(refusedBytes, keptBytes, otherBytes);
+      addConversation('conv-refused', 'Slider menu', '2026-10-27T15:00:00Z', [
+        ['human', 'Here are the slider files', [
+          { file_uuid: 'refused', file_name: `big-${first}.bin`, preview_url: `/api/fake-assets/big-${first}.bin` },
+          { file_uuid: 'kept', file_name: `big-${first + 1}.bin`, preview_url: `/api/fake-assets/big-${first + 1}.bin` },
+        ]],
+        ['assistant', 'Got them.'],
+      ]);
+      addConversation('conv-after', 'Another chat', '2026-10-27T15:01:00Z', [
+        ['human', 'One more file', [{ file_uuid: 'other', file_name: `big-${first + 2}.bin`, preview_url: `/api/fake-assets/big-${first + 2}.bin` }]],
+        ['assistant', 'Thanks.'],
+      ]);
+      github.rejectBlobsOver(3 * 1024 * 1024);
+      const commitsBefore = github.commitCount();
+      last = await syncAll();
+      files = github.files();
+      const refusedMarkdown = Object.entries(files).find(([file]) => /Slider-menu--conv-refused-/.test(file))?.[1]?.toString() || '';
+      check('a 422 "too large" attachment does not stop the sync', github.commitCount() === commitsBefore + 1 && /2 conversations changed in 1 GitHub commit/.test(last), last.slice(0, 300));
+      check('the refused attachment is marked not archived, with GitHub\'s reason',
+        new RegExp(`\\*\\*Not archived: big-${first}\\.bin\\*\\* \\(4\\.0 MiB; GitHub rejected the upload as too large to process \\(HTTP 422`).test(refusedMarkdown)
+          && !Object.keys(files).some((file) => file.endsWith(`big-${first}.bin`)), refusedMarkdown.slice(-400));
+      check('the other attachment of that conversation and the other conversation are archived',
+        Object.entries(files).some(([file, content]) => file.endsWith(`big-${first + 1}.bin`) && content.equals(keptBytes))
+          && Object.entries(files).some(([file, content]) => file.endsWith(`big-${first + 2}.bin`) && content.equals(otherBytes)));
+      check('the popup names the refused file and its size', new RegExp(`big-${first}\\.bin \\(4\\.0 MiB, too large to upload to GitHub\\)`).test(last), last.slice(0, 400));
+      check('the commit message counts conversations, not files', github.headMessage() === 'Sync 2 AI conversations (2 assets)', github.headMessage());
+
+      // The next sync does not send the refused bytes to GitHub again.
+      const before = github.requests.length;
+      last = await syncAll();
+      check('bytes GitHub refused are not uploaded again by the next sync',
+        github.blobPostSizesSince(before).every((size) => size <= 3 * 1024 * 1024), github.blobPostSizesSince(before).join(','));
+      check('the conversation stays marked incomplete with the reason', /archived with files missing .*\(4\.0 MiB, too large to upload to GitHub\)/.test(last), last.slice(0, 400));
+      github.rejectBlobsOver(0);
     }
 
     check('no page errors', errors.length === 0, errors.join(' | '));

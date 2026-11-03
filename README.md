@@ -1,5 +1,13 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.16 — attachment upload limit and refused uploads
+- Attachments reach GitHub as base64 inside a JSON request to the Git blob API. GitHub refuses request bodies well below its documented 100 MB blob ceiling with HTTP 422 "Sorry, your input was too large to process". AI Archive now limits the request instead of the file: 40 MiB of JSON, which holds a file of up to 30 MiB (Claude's own upload limit is 30 MB).
+- A larger file is never encoded, transferred or uploaded. It stays visible in the conversation as **Not archived: name** with its size and the reason.
+- If GitHub still refuses an attachment with that specific 422, only that file is left out, with GitHub's reason; the conversation, its other files and every other conversation are archived. Any other 422 or GitHub error remains an error that publishes nothing.
+- Such a conversation is recorded as incomplete in `archive/index.json` and reported as "archived with files missing". Every later sync checks it again, but bytes GitHub already refused are not uploaded again, and files already in the archive are reused without being uploaded.
+- The GitHub commit message counts changed conversations, not files: `Sync 10 AI conversations (18 assets)`.
+- GitHub errors show GitHub's own message instead of truncated raw JSON, name the attachment and its size, stay bounded, and never contain the access token. The popup shows up to 900 characters of the last sync's message.
+
 ## Extension v0.5.15 — streaming, verified sync handoff
 - Each conversation is handed to the background worker as soon as it has been fetched, then released, so the Claude tab no longer holds the whole account (and every attachment of it) until the end of the fetch. The handoff also starts before fetching, so a busy extension is reported at once.
 - Conversations travel as one JSON record per message. The largest JSON string built is a single message, never a whole conversation or archive. A message too large to serialize leaves only that conversation out of the sync, with its archived copy kept and the reason named.
