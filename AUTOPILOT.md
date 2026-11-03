@@ -10,7 +10,7 @@ Continuously improve AI Archive toward a trustworthy, portable, maintainable per
 
 1. Read `CLAUDE.md`, this file, `ROADMAP.md`, `ARCHITECTURE.md`, `docs/archive-format-v1.md`, and the latest `docs/DEVELOPMENT_LOG.md`.
 2. Inspect the worktree, branch, recent commits and current CI. Preserve any uncommitted user work.
-3. Confirm you are on `development`. Never work directly on `master`.
+3. For Claude Code cloud sessions, select `development` as the base branch and work on the session-managed branch. Open/update a PR targeting `development` when a coherent slice is ready. Do not try to push directly to the protected/base branch. For non-cloud sessions, work on `development`. Never work on `master`.
 4. Identify the highest-priority unfinished roadmap item that can be completed safely with available tools and evidence.
 5. If a real-account/manual test is needed but unavailable, record it as blocked and select another useful task.
 
@@ -25,7 +25,7 @@ Repeat the following cycle for as long as the Claude Code session remains active
 5. **Verify.** Run targeted tests, then the full relevant suite/build. For synchronization or data-format changes, run archive round-trip and E2E tests where possible.
 6. **Review.** Inspect the full diff and ask: could this lose data, alter old archives, expose secrets, break an older format, or mask an error?
 7. **Document.** Update relevant docs and append an entry to `docs/DEVELOPMENT_LOG.md`.
-8. **Checkpoint.** Commit the completed slice. Push to `development` only if the work is verified, the remote branch has not advanced unexpectedly, and no sensitive data is included.
+8. **Checkpoint.** Commit the completed slice. In cloud sessions, push through the session branch and open/update a PR targeting `development`; in non-cloud sessions, push verified work to `development` only if the remote branch has not advanced unexpectedly and no sensitive data is included. The repository's `Auto-merge Claude cloud work into development` workflow merges same-repository PRs only after the exact tested head commit passes `Web CI`.
 9. **Continue.** Re-read the roadmap and choose the next highest-priority independent task. Do not ask the user what to do next unless a decision genuinely requires their preference or authority.
 
 Do not make a cosmetic change merely to keep the loop busy. If no safe, worthwhile task remains, perform a review of the next roadmap item, document findings, and stop with a clear handoff.
@@ -45,8 +45,8 @@ Do not make a cosmetic change merely to keep the loop busy. If no safe, worthwhi
 - Do not run destructive shell commands or commands whose effects you cannot explain.
 - Do not alter secrets, tokens, browser profiles, personal archives or user data.
 - Do not use the user's live Claude session or private archive as an unbounded test fixture.
-- Do not create or modify external resources, publish releases, open public issues, change repository settings or merge branches.
-- Pushing a verified code change to `development` is allowed; pushing to `master` is not.
+- Do not create or modify external resources, publish releases, open public issues, or change repository settings.
+- In cloud sessions, open PRs targeting `development` after verification; do not merge them yourself. CI-gated repository automation handles eligible merges. Never target or push to `master`.
 - Never claim live Claude compatibility based solely on mocks or unit tests.
 - If tests fail, investigate and fix the cause. Do not continue stacking unrelated features on a failing baseline.
 - If a failure cannot be resolved safely, document the exact command, failure, likely cause and next step; then work on a different independent task.
