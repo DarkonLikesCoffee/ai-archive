@@ -2,13 +2,11 @@
 
 ## Cloud development integration — 2026-11-03
 
-- Added `.github/workflows/auto-merge-development.yml`.
-- It listens for successful completion of the existing `Web CI` workflow on pull-request events.
-- It resolves PRs associated with the exact tested commit and only merges same-repository PRs whose base is `development` and whose head SHA matches the successful CI run.
-- Merge strategy is squash. It does not check out or execute PR code in the privileged workflow and does not use admin/bypass flags.
-- Updated `CLAUDE.md` and `AUTOPILOT.md`: Claude Code cloud sessions should use `development` as the base, work on their session branch, and open PRs targeting `development`; automation handles integration after CI.
-- `master` remains excluded.
-- **Not yet verified:** this workflow has not yet been exercised by a real Claude Code cloud PR. Confirm the workflow-run trigger, permissions and GitHub merge policy on the first test PR. If repository rules require review, the workflow will not bypass them.
+- Updated `CLAUDE.md` and `AUTOPILOT.md` so Claude Code cloud sessions use `development` as the PR base and never target `master`.
+- Confirmed `development` is not protected and `master` is the repository default branch.
+- An experimental `workflow_run` auto-merge workflow was briefly added, then removed: GitHub only loads `workflow_run` workflows from the default branch, so a workflow committed only to `development` would not run. Moving it to `master` would violate the user's explicit branch boundary.
+- Recommended integration path: GitHub native PR auto-merge, enabled in repository settings and used on PRs targeting `development`. It respects configured required checks/reviews and does not require a privileged workflow on `master`.
+- **Still requires setup/verification:** enable Allow auto-merge in repository settings and configure `Web CI` as a required check for `development` if the user wants merges to wait for CI. No repository settings or branch protection were changed by this work.
 - Existing `Web CI` covers extension syntax checks, extension unit tests, web unit tests and web production build. Browser E2E tests are not part of this CI workflow.
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
