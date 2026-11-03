@@ -453,7 +453,8 @@ async function disconnectGithubSettings() {
   knownArchiveAccounts = [];
   showSyncReport(null);
   $('lastSync').textContent = '';
-  $('accountText').textContent = '';
+  $('githubIdentity').textContent = 'Not connected';
+  $('githubRepository').textContent = '';
   status.className = 'status ok';
   status.textContent = 'GitHub settings and previous sync reports removed from this extension.';
   await refresh();
