@@ -1,5 +1,30 @@
 # AI Archive — autonomous development log
 
+## Session handoff — 2026-11-03 (read this first)
+
+Work from this session was submitted as separate PRs targeting `development`. All have GitHub squash auto-merge enabled. `Web CI` passed on each PR checked; GitHub showed DarkonLikesCoffee/ai-archive#82 as blocked anyway, so a required review or another merge rule is probably holding the merges. Each PR was checked to merge cleanly with the others (`git merge-tree`), and a local merge of #82–#85 passed 198 extension unit tests and 45/45 E2E checks.
+
+| PR | Content |
+|---|---|
+| #82 | GitHub 502 investigation and large-sync hardening (0.5.20): tree batches, tree verification, 5-attempt retry, step-named errors, index-size guard |
+| #83 | Restores the popup "Copy diagnostic report" button; repairs the extension E2E after the popup redesign |
+| #84 | `docs/TECHNICAL_AUDIT.md` |
+| #85 | Reports when a sync downloaded every conversation because the archive state could not be read |
+| #86 | Index v3 design proposal (sharded search caches) — **needs owner decision**; not implemented |
+| #87 | Extension E2E as a non-blocking CI job. Red until #83 merges (the failure is that known popup check) |
+| #88 | README: where the tokens are stored |
+
+Notes for the next session:
+- **Log order.** #83, #84 and #85 add log entries lower in this file, so parallel PRs would not conflict. Once all are merged, move them up so the newest comes first.
+- **Branch state.** Start from the latest `development`. Do not stack new work on unmerged PR branches.
+- **User verification pending.** Re-run the ~812-conversation sync on 0.5.20 and report the popup text if it fails; the message now names the step. The size of `archive/index.json` on GitHub tells how close the archive is to the 40 MiB index limit.
+- **Earlier pending item.** The user still has to confirm the files of the six upgraded-workspace conversations.
+- **Next tasks**, in order:
+  1. After #83 merges, check that `extension-e2e` is green on `development`.
+  2. ROADMAP P0.1: a read-only archive integrity verifier (index → files, SHA-256, sizes, orphans), tested with synthetic fixtures.
+  3. Implement index v3 only if #86 is approved.
+  4. Audit finding 8: restrict `fetchAsset` to known Claude hosts, after collecting sanitized evidence of real URL shapes.
+
 ## GitHub 502 on a large sync — 2026-11-03 (extension 0.5.20)
 
 **Problem.** A real ~812-conversation sync failed with `GitHub 502: Server Error`. Full analysis: `docs/investigations/2026-11-github-502-large-sync.md`.
