@@ -1603,14 +1603,14 @@ test('keeps every tool input field when the input is more than a bare command or
   assert.equal(sections[0], [
     '### Claude tool: artifacts',
     '',
-    '```json\\n{\\n  "command": "create",\\n  "id": "hello",\\n  "language": "python",\\n  "title": "Hello"\\n}```',
+    '```json\n{\n  "command": "create",\n  "id": "hello",\n  "language": "python",\n  "title": "Hello"\n}```',
     '',
     '**content**',
     '',
-    '```python\\ndef hello():\\n    print("hi")\\n\\n```',
+    '```python\ndef hello():\n    print("hi")\n\n```',
     '',
     '<!-- /tool -->',
-  ].join('\\n'), 'artifact content and metadata must survive');
+  ].join('\n'), 'artifact content and metadata must survive');
   assert.deepEqual(json(sections[1]), conversation.chat_messages[1].content[1].input);
   assert.deepEqual(json(sections[2]), { command: 'ls -la', description: 'List files' });
   assert.deepEqual(json(sections[3]), { code: 'console.log(1)', timeout: 30 });
