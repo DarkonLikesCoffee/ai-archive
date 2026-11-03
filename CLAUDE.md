@@ -10,7 +10,7 @@ The product's highest promise is **faithful preservation without silent data los
 
 ## Current verified baseline
 
-- Work on branch `development`; never merge to or push to `master` unless the user explicitly asks.
+- `development` is the integration branch. Claude Code cloud sessions should use `development` as their base branch, work on their session branch, and open a PR targeting `development`. The repository's CI-gated auto-merge workflow merges eligible same-repository PRs into `development` after the exact PR head commit passes `Web CI`. Do not attempt to push directly from a cloud session if its branch is session-managed. Never merge to or push to `master` unless the user explicitly asks.
 - Baseline when these instructions were written: commit `37a26a97005c7510b89c11fbbf8c3e85b9aabb46`.
 - Extension manifest version: `0.5.19`.
 - Web app package version: `0.6.15`.
@@ -52,7 +52,7 @@ For each task:
 4. Run the relevant tests, then the full test/build suite for meaningful changes.
 5. Inspect the final diff for correctness, accidental scope, secrets, generated files and unrelated formatting.
 6. Update documentation and `docs/DEVELOPMENT_LOG.md`.
-7. Commit focused, reviewable changes with descriptive messages. Push only to `development`, and only after relevant tests pass and the branch has been checked for remote updates. Never push to `master`.
+7. Commit focused, reviewable changes with descriptive messages. In a local/non-cloud environment, push only to `development` after relevant tests pass and the branch has been checked for remote updates. In Claude Code cloud sessions, push changes through the session branch and open a PR targeting `development`; do not try to bypass the session branch. The repository automation merges only after `Web CI` succeeds. Never push to `master`.
 
 ## Test commands
 
@@ -82,10 +82,11 @@ Do not claim a command passed unless you actually ran it and saw its exit status
 
 ## Autonomy and safety
 
-You are authorized to independently inspect, plan, edit, test, refactor in small increments, update docs, commit, and push verified work to `development`.
+You are authorized to independently inspect, plan, edit, test, refactor in small increments, update docs, commit, and submit verified work for integration into `development`. In cloud sessions, create/update a PR targeting `development`; CI-gated repository automation performs the merge.
 
 You are NOT authorized to:
 - push/merge to `master`, force-push, rewrite published history or delete branches;
+- bypass CI or merge a PR whose tested head commit differs from the commit being integrated;
 - delete or rewrite archived user data, bulk-migrate real archives, or run destructive operations;
 - change repository visibility, secrets, access permissions, billing, external accounts or infrastructure;
 - introduce a new backend, paid service, telemetry, analytics or external data transfer;
