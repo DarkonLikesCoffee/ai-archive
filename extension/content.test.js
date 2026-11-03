@@ -1603,7 +1603,7 @@ test('keeps every tool input field when the input is more than a bare command or
   assert.equal(sections[0], [
     '### Claude tool: artifacts',
     '',
-    '```json\n{\n  "command": "create",\n  "id": "hello",\n  "language": "python",\n  "title": "Hello"\n}```',
+    '```json\n{\n  "command": "create",\n  "id": "hello",\n  "language": "python",\n  "title": "Hello"\n}\n```',
     '',
     '**content**',
     '',
@@ -1663,7 +1663,7 @@ test('renders multi-line tool input fields as readable fences closed by an end m
   assert.equal(sections[0], [
     '### Claude tool: str_replace_based_edit_tool',
     '',
-    '```json\n{\n  "command": "create",\n  "language": "x`y",\n  "path": "/a.md"\n}```',
+    '```json\n{\n  "command": "create",\n  "language": "x`y",\n  "path": "/a.md"\n}\n```',
     '',
     '**file\\_text**',
     '',
@@ -3396,6 +3396,6 @@ test('serializes structured tool JSON deterministically without changing array o
     'equivalent objects with different insertion order must produce identical archived Markdown');
   assert.ok(first.indexOf('first row') < first.indexOf('second row'),
     'array entries must retain their original order');
-  assert.ok(first.includes('"nested": {\n        "first": 1,\n        "second": 2\n      }'),
+  assert.ok(first.includes('"nested": {\n          "first": 1,\n          "second": 2\n        }'),
     'nested object properties must be serialized in sorted order');
 });
