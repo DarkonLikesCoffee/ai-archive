@@ -44,3 +44,28 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  # Runs the unpacked extension in Chromium against the simulated Claude and
+  # GitHub services of e2e/extension-sync.e2e.cjs. Non-blocking until it has
+  # proven stable in CI: a failure is visible on the run but does not fail it.
+  extension-e2e:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.63.0
+          npx playwright install --with-deps chromium
+
+      - name: Run extension browser E2E
+        run: node e2e/extension-sync.e2e.cjs
