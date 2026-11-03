@@ -2682,6 +2682,41 @@ test('streams all 812 conversations through bounded batches without a monolithic
   harness.finishFirstHandoff({ ok: true });
 });
 
+test('upgraded Claude workspaces skip the retired Wiggle sandbox check and still archive Files API outputs', async () => {
+  const conversation = plainConversation('conv-upgraded-files-api', [
+    { type: 'tool_use', name: 'Write', input: { file_path: '/home/claude/work/project/index.html', content: '<h1>Generated</h1>' } },
+  ]);
+  conversation.workspace_upgraded = true;
+  conversation.is_wiggle_enabled = false;
+  conversation.chat_messages[1].files = [{
+    file_kind: 'blob',
+    download_source: 'files-api',
+    file_name: 'index.html',
+    file_uuid: 'generated-file-1',
+    size_bytes: 18,
+    success: true,
+    uuid: 'generated-file-1',
+  }];
+  const url = '/api/organizations/org-id/files/generated-file-1/contents';
+  const harness = createHarness(conversation, {
+    sandboxListStatus: 404,
+    assetResponses: { [url]: { content: '<h1>Generated</h1>', contentType: 'text/html' } },
+  });
+
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const [exported] = handoff.conversations;
+
+  assert.equal(harness.requests.some((request) => String(request).includes('/wiggle/list-files')), false,
+    'upgraded workspaces must not call the retired Wiggle endpoint');
+  assert.ok(harness.requests.includes(url), 'the message-level Files API download must still run');
+  assert.deepEqual(JSON.parse(JSON.stringify(exported.incomplete)), []);
+  assert.equal(exported.assets.length, 1);
+  assert.equal(exported.assets[0].name, 'index.html');
+  assert.equal(Buffer.from(exported.assets[0].base64, 'base64').toString('utf8'), '<h1>Generated</h1>');
+  harness.finishFirstHandoff({ ok: true });
+});
+
 test('a conversation whose sandbox file list is HTTP 404 is archived completely when no tool wrote files', async () => {
   const harness = createHarness(plainConversation('conv-404-plain'), { sandboxListStatus: 404 });
   harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
