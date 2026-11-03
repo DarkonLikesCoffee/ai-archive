@@ -203,15 +203,34 @@
   // separately as message attachments, so the note can say where they went.
   function stringifyContentBlock(value, archivedSources = null) {
     try {
+      // Claude may return the same JSON object with a different property order
+      // between requests. Since this JSON is embedded in Markdown, ordinary
+      // JSON.stringify() would then create a noisy archive diff. Sort object
+      // keys recursively, but keep array order because it can be meaningful.
+      // Shallow copies avoid duplicating large nested strings or payloads.
+      // Keep a mapping to original holders so binary redaction still recognizes
+      // the source objects collected by collectToolResultMedia().
+      const originalBySortedObject = new WeakMap();
       return JSON.stringify(value, function (key, item) {
+        const originalHolder = this && typeof this === 'object'
+          ? (originalBySortedObject.get(this) || this)
+          : this;
+
         // Avoid embedding base64 media data or other large inline payloads into
         // Markdown. Preserve metadata and make omitted data explicit.
-        const base64Data = key === 'data' && this?.type === 'base64';
+        const base64Data = key === 'data' && originalHolder?.type === 'base64';
         if (typeof item === 'string' && /^(data|base64|bytes)$/i.test(key)
           && (item.length > 256 || base64Data)) {
-          return archivedSources?.has(this)
+          return archivedSources?.has(originalHolder)
             ? `[omitted inline payload: ${item.length} characters; archived as a message attachment]`
             : `[omitted inline payload: ${item.length} characters]`;
+        }
+
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          const sorted = Object.create(null);
+          for (const property of Object.keys(item).sort()) sorted[property] = item[property];
+          originalBySortedObject.set(sorted, item);
+          return sorted;
         }
         return item;
       }, 2);

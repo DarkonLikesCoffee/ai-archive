@@ -1,5 +1,8 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.17 — deterministic structured JSON
+- Structured tool inputs, tool results and unknown content blocks now serialize object keys in a stable order. Equivalent Claude responses no longer rewrite conversation Markdown solely because JSON properties arrived in a different order. Array order and actual values are preserved.
+
 ## Extension v0.5.16 — attachment upload limit and refused uploads
 - Attachments reach GitHub as base64 inside a JSON request to the Git blob API. GitHub refuses request bodies well below its documented 100 MB blob ceiling with HTTP 422 "Sorry, your input was too large to process". AI Archive now limits the request instead of the file: 40 MiB of JSON, which holds a file of up to 30 MiB (Claude's own upload limit is 30 MB).
 - A larger file is never encoded, transferred or uploaded. It stays visible in the conversation as **Not archived: name** with its size and the reason.

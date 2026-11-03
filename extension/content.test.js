@@ -3328,3 +3328,75 @@ test('a file over the API upload limit is not base64-encoded or transferred, but
   assert.deepEqual([...new Set(assetChunks.map((chunk) => chunk.assetIndex))], [1], 'only the small file travels');
   harness.finishFirstHandoff({ ok: true });
 });
+
+
+test('serializes structured tool JSON deterministically without changing array order', async () => {
+  const makeConversation = (id, reverseKeys) => {
+    const nested = reverseKeys
+      ? { second: 2, first: 1 }
+      : { first: 1, second: 2 };
+    const rows = [
+      reverseKeys
+        ? { label: 'first row', z: 2, a: 1 }
+        : { a: 1, label: 'first row', z: 2 },
+      reverseKeys
+        ? { label: 'second row', z: 4, a: 3 }
+        : { a: 3, label: 'second row', z: 4 },
+    ];
+    const toolInput = reverseKeys
+      ? { rows, nested, title: 'stable output' }
+      : { title: 'stable output', nested, rows };
+    const toolResult = reverseKeys
+      ? { rows, nested, title: 'stable result' }
+      : { title: 'stable result', nested, rows };
+
+    return {
+      uuid: id,
+      name: 'Stable JSON output',
+      current_leaf_message_uuid: 'tool-result-message',
+      chat_messages: [
+        {
+          uuid: 'user-message',
+          parent_message_uuid: ROOT,
+          sender: 'human',
+          content: [{ type: 'text', text: 'Inspect this structure.' }],
+        },
+        {
+          uuid: 'assistant-message',
+          parent_message_uuid: 'user-message',
+          sender: 'assistant',
+          content: [{ type: 'tool_use', name: 'inspect', input: toolInput }],
+        },
+        {
+          uuid: 'tool-result-message',
+          parent_message_uuid: 'assistant-message',
+          sender: 'human',
+          content: [{
+            type: 'tool_result',
+            name: 'inspect',
+            content: [{ type: 'json', value: toolResult }],
+          }],
+        },
+      ],
+    };
+  };
+
+  const render = async (conversation) => {
+    const harness = createHarness(conversation);
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const handoff = await harness.firstHandoff;
+    const content = handoff.conversations[0].messages.map((message) => message.content).join('\\n');
+    harness.finishFirstHandoff({ ok: true });
+    return content;
+  };
+
+  const first = await render(makeConversation('stable-json-a', false));
+  const second = await render(makeConversation('stable-json-b', true));
+
+  assert.equal(first, second,
+    'equivalent objects with different insertion order must produce identical archived Markdown');
+  assert.ok(first.indexOf('first row') < first.indexOf('second row'),
+    'array entries must retain their original order');
+  assert.match(first, /"first": 1[\\s\\S]*"second": 2/,
+    'nested object properties must be serialized in sorted order');
+});
