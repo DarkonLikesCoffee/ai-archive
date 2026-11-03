@@ -1660,18 +1660,17 @@ test('renders multi-line tool input fields as readable fences closed by an end m
   const handoff = await harness.firstHandoff;
   const content = handoff.conversations[0].messages[1].content;
   const sections = content.split('\n\n### ');
-
+  assert.equal(sections[0], [
     '### Claude tool: str_replace_based_edit_tool',
-    '',
-    '\`\`\`json\\n{\\n  "command": "create",\\n  "language": "x`y",\\n  "path": "/a.md"\\n}\\n\`\`\`',
-    '',
-    '**file\\\\_text**',
     '',
     '```json\\n{\\n  "command": "create",\\n  "language": "x`y",\\n  "path": "/a.md"\\n}```',
     '',
-    '<!-- /tool -->',
-    '<!-- /tool -->',
+    '**file\\\\_text**',
+    '',
     '````text\\nline one\\n```\\nline with fence\\n<!-- /tool -->\\n\\n````',
+    '',
+    '<!-- /tool -->',
+  ].join('\\n'));
   assert.equal(sections[1].includes(wrappedBase64), false, 'line-wrapped base64 must not be dumped');
   assert.match(sections[1], /"data": "\[omitted inline payload: 354 characters\]"/);
   assert.equal(sections[1].includes('<!-- /tool -->'), false);
