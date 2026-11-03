@@ -153,7 +153,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null }) {
+function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [] }) {
   const listeners = [];
   const createdTrees = new Map();
   const blobContents = new Map();
@@ -325,7 +325,11 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
     Blob, Response, CompressionStream, crypto: webcrypto, btoa, atob, setTimeout, clearTimeout,
   };
   // Keep retry backoff instant in tests; the retry policy itself is unchanged.
-  const fastSource = backgroundSource.replace('const GITHUB_RETRY_BASE_DELAY_MS = 1000;', 'const GITHUB_RETRY_BASE_DELAY_MS = 1;');
+  let fastSource = backgroundSource.replace('const GITHUB_RETRY_BASE_DELAY_MS = 1000;', 'const GITHUB_RETRY_BASE_DELAY_MS = 1;');
+  for (const [from, to] of sourcePatches) {
+    assert.ok(fastSource.includes(from), `test patch target exists: ${from}`);
+    fastSource = fastSource.replace(from, to);
+  }
   vm.runInNewContext(`${fastSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
@@ -2458,4 +2462,29 @@ test('a tree GitHub built differently from the planned changes is never committe
   assert.ok(dropped);
   assert.equal(countRequests(harness, 'POST', '/git/commits'), 0);
   assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 0);
+});
+
+test('the index size is recorded, warned about near the request limit, and an oversized index fails before any upload', async () => {
+  const conversations = syntheticConversations(30);
+  const small = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const result = await small.sync(conversations, () => {});
+  const indexBytes = result.report.index_bytes;
+  assert.ok(Number.isSafeInteger(indexBytes) && indexBytes > 0, 'the outcome records the index size');
+
+  const warned = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    sourcePatches: [['const INDEX_WARN_BYTES = 20 * 1024 * 1024;', `const INDEX_WARN_BYTES = ${indexBytes - 1};`]],
+  });
+  const progress = [];
+  await warned.sync(conversations, (event) => progress.push(event));
+  assert.match(progress.at(-1).message, /The archive index \(archive\/index\.json\) is [\d.]+ KiB; syncs will stop working when it nears 40\.0 MiB/);
+
+  const blocked = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    sourcePatches: [['const MAX_BLOB_REQUEST_BYTES = 40 * 1024 * 1024;', `const MAX_BLOB_REQUEST_BYTES = ${indexBytes};`]],
+  });
+  await assert.rejects(blocked.sync(conversations, () => {}),
+    /^Error: The archive index \(archive\/index\.json\) would be [\d.]+ KiB, more than the [\d.]+ KiB GitHub's API accepts in one request\. No archive changes were published\./);
+  assert.equal(countRequests(blocked, 'POST', '/git/blobs'), 0, 'nothing is uploaded for a sync that cannot be published');
+  assert.equal(countRequests(blocked, 'PATCH', '/git/refs/heads/master'), 0);
 });

@@ -408,6 +408,10 @@ const MAX_BLOB_REQUEST_BYTES = 40 * 1024 * 1024;
 const BLOB_REQUEST_OVERHEAD_BYTES = 64;
 const MAX_ARCHIVED_FILE_BYTES = Math.floor((MAX_BLOB_REQUEST_BYTES - BLOB_REQUEST_OVERHEAD_BYTES) / 4) * 3;
 
+// archive/index.json is uploaded as one blob, so it shares the request limit.
+// Warn well before it is reached (see docs/TECHNICAL_AUDIT.md, finding 1).
+const INDEX_WARN_BYTES = 20 * 1024 * 1024;
+
 const base64RequestBytes = (size) => 4 * Math.ceil(Number(size) / 3) + BLOB_REQUEST_OVERHEAD_BYTES;
 
 function formatBytes(bytes) {
@@ -1348,19 +1352,33 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
     }
 
+    // The index is one blob carrying every conversation's search text; record
+    // its size so growth is visible before it reaches the request limit.
+    const indexJson = JSON.stringify(nextIndex, null, 2);
+    const indexBytes = new TextEncoder().encode(indexJson).byteLength;
+    report.index_bytes = indexBytes;
+    const indexNote = indexBytes >= INDEX_WARN_BYTES
+      ? ` The archive index (archive/index.json) is ${formatBytes(indexBytes)}; syncs will stop working when it nears ${formatBytes(MAX_BLOB_REQUEST_BYTES)}, the most GitHub's API accepts in one request.`
+      : '';
+
     // A sync that left any conversation out, or archived one with files
     // missing, is partial: the popup says so instead of "complete".
     const partial = report.failed.length > 0 || report.incomplete.length > 0 || report.keptPrevious.length > 0;
     const outcome = { report, partial };
     if (changedConversations === 0 && !indexNeedsUpdate && ref) {
       const head = partial ? 'Sync finished with problems: no archived conversation changed, so no GitHub commit was made.' : 'Everything is already up to date. No GitHub commit was needed.';
-      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: `${head}${skippedNote}`, ...outcome });
+      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: `${head}${skippedNote}${indexNote}`, ...outcome });
       return { total, changed: 0, commit: null, skipped: skipped.length, ...outcome };
     }
 
     const completionMessage = (partial ? 'Sync finished with problems: ' : 'Sync complete: ') + (changedConversations === 0
       ? 'the search cache was compacted; no conversation Markdown changed in 1 GitHub commit.'
-      : `${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`) + skippedNote;
+      : `${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`) + skippedNote + indexNote;
+
+    // Fail before uploading anything when the index cannot be uploaded at all.
+    if (utf8LengthExceeds(JSON.stringify({ content: indexJson, encoding: 'utf-8' }), MAX_BLOB_REQUEST_BYTES)) {
+      throw new Error(`The archive index (archive/index.json) would be ${formatBytes(indexBytes)}, more than the ${formatBytes(MAX_BLOB_REQUEST_BYTES)} GitHub's API accepts in one request. No archive changes were published. The archive is intact, but it needs a smaller index format before it can be updated; please report this.`);
+    }
 
     const treeEntries = new Array(changes.length);
     const uploadTotal = changes.filter((x) => !x.delete).length + 1;
@@ -1403,7 +1421,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     if (firstUploadError) throw firstUploadError;
     assertNotCancelled();
     assertNotCancelled();
-    const indexBlob = await createBlob(JSON.stringify(nextIndex, null, 2));
+    const indexBlob = await createBlob(indexJson);
     treeEntries.push({ path: 'archive/index.json', mode: '100644', type: 'blob', sha: indexBlob.sha });
     onProgress?.({ stage: 'uploading', current: uploadTotal, total: uploadTotal, changed: changedConversations });
 

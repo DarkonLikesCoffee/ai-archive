@@ -26,7 +26,8 @@ So the failure happened in the final GitHub phase of `sync()`, after all convers
 ### Candidates and their likelihood
 
 - **POST `/git/trees` (most likely).** 0.5.19 sent every change of the sync in one request. A sync that (re)writes ~812 conversations sends at least 813 entries (812 Markdown files + the index) plus every new attachment, spread over many nested directories. GitHub answers requests it cannot finish within its processing time limit with a `502`/`Server Error`-style response (from the GitHub REST troubleshooting documentation as remembered; docs.github.com was not reachable from this session, so this is unverified). Such a failure is deterministic for a given request size, so the three retries in 0.5.19 (1 s and 2 s apart) would all fail the same way. This fits a failure that appears only with a large sync.
-- **One of ~813 POST `/git/blobs`.** Each body is small; a transient GitHub 502 is possible, and with ~813 requests and only a 3-second retry window, one unlucky burst is enough to fail the whole sync.
+- **POST `/git/blobs` for `archive/index.json` (also plausible, size-dependent).** The index is uploaded as one blob carrying the gzip+base64 search text (up to 250,000 characters of text) of *every* archived conversation. For an archive of ~812 conversations it is plausibly several MB to tens of MB, and it grows with every conversation. A request that large is a second deterministic 502 candidate. It also has a hard ceiling: past the 40 MiB request limit every sync fails (see `docs/TECHNICAL_AUDIT.md`, finding 1). 0.5.20 records the index size in each sync's report (`report.index_bytes`), warns from 20 MiB, and fails before uploading anything, naming the index, when the index cannot be uploaded. It does **not** shrink the index, because that is a format change that needs a design.
+- **One of ~812 POST `/git/blobs` for Markdown.** Each body is small; a transient GitHub 502 is possible, and with ~813 requests and only a 3-second retry window, one unlucky burst is enough to fail the whole sync.
 - **GET `trees/<sha>?recursive=1`** of the existing archive. Possible for very large repositories; the response is bounded by GitHub's truncation limit and is already refused when `truncated` is set.
 - **POST `/git/commits`, GET ref**: small requests; only a transient 502.
 - **PATCH ref**: never retried. On error 0.5.19 reads the ref back; if the branch was unchanged it rethrew the bare `GitHub 502: Server Error`. Possible, but small and not size-dependent.
@@ -68,4 +69,5 @@ Consequence for the user: the archive is as it was before that sync; syncing aga
 ## Still needs the user's real-world verification
 
 - Re-run the large sync with 0.5.20. If it fails again, the popup message now names the failing step; please report that text (it contains no conversation content).
-- Whether GitHub's real limit was the tree request is a hypothesis until a real large sync succeeds with batching, or a new failure names another step.
+- Whether GitHub's real limit was the tree request or the index blob is a hypothesis until a real large sync succeeds with batching, or a new failure names another step (`uploading a file` right before the tree stage means the index).
+- The size of the real archive's `archive/index.json` (visible on GitHub) would show how close it is to the limit. Only the size is needed, never the content.
