@@ -32,7 +32,7 @@ function loadPopup({ tabs = {} } = {}) {
     chrome,
     document: {
       getElementById: element,
-      createElement(tag) { return { tagName: tag.toUpperCase(), value: '', textContent: '', disabled: false }; },
+      createElement(tag) { return { tagName: tag.toUpperCase(), value: '', textContent: '', disabled: false, children: [], append(...nodes) { this.children.push(...nodes); } }; },
     },
     GITHUB_OWNER: '',
     GITHUB_REPO: '',
