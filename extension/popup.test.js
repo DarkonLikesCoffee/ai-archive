@@ -14,7 +14,7 @@ function loadPopup({ tabs = {} } = {}) {
       elements.set(id, {
         id, value: '', checked: false, disabled: false, textContent: '', className: '', style: {},
         classList: { add() {}, remove() {}, toggle() {} },
-        children: [], replaceChildren(...nodes) { this.children = nodes; }, focus() {},
+        children: [], append(...nodes) { this.children.push(...nodes); }, replaceChildren(...nodes) { this.children = nodes; }, focus() {},
       });
     }
     return elements.get(id);
