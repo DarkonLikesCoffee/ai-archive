@@ -53,7 +53,7 @@ function createFakeGitHub() {
     requests.push(`${method} ${url.pathname}`);
     if (token !== TOKEN) return json(401, { message: 'Bad credentials' });
     const failure = failures.find((f) => f.method === method && url.pathname.endsWith(f.pathSuffix) && f.times > 0);
-    if (failure) { failure.times -= 1; return json(failure.status, { message: 'Injected failure' }); }
+    if (failure) { failure.times -= 1; return json(failure.status, { message: failure.message || 'Injected failure' }); }
 
     const prefix = `/repos/${OWNER}/${REPO}`;
     if (url.pathname === prefix) return json(200, { full_name: `${OWNER}/${REPO}`, permissions: { push: true } });
@@ -249,8 +249,12 @@ function handleClaude(url) {
       await popup.selectOption('#syncLimit', limit);
       await popup.click('#sync');
       await popup.waitForFunction(() => /^Last sync/.test(document.querySelector('#lastSync').textContent), null, { timeout: 120000 });
+      // The popup hides the summary line when it shows a per-conversation
+      // report; the full summary is kept with the stored outcome.
+      lastMessage = await popup.evaluate(async () => (await chrome.storage.local.get('last_sync')).last_sync?.message || '');
       return popup.locator('#lastSync').textContent();
     }
+    let lastMessage = '';
 
     // First sync into an empty repository.
     let last = await syncAll();
@@ -293,12 +297,12 @@ function handleClaude(url) {
     addConversation('conv-a', 'Trip planning', '2026-10-27T10:00:00Z', [['human', 'Plan a weekend in Porto'], ['assistant', 'Start at Ribeira.']]);
     const headBeforeFailure = github.head();
     const requestsBeforeFailure = github.requests.length;
-    github.failures.push({ method: 'POST', pathSuffix: '/git/trees', status: 500, times: 3 });
+    github.failures.push({ method: 'POST', pathSuffix: '/git/trees', status: 502, message: 'Server Error', times: 5 });
     last = await syncAll();
     check('a failing GitHub sync publishes nothing', github.head() === headBeforeFailure);
-    check('popup shows the failed sync', /^Last sync failed just now: GitHub 500/.test(last), last);
+    check('popup shows the failed sync and the step that failed', /^Last sync failed just now: GitHub 502: Server Error \[while building the archive tree; failed 5 attempts\] Nothing was published/.test(last), last);
     const treeAttempts = github.requests.slice(requestsBeforeFailure).filter((r) => r === `POST /repos/${OWNER}/${REPO}/git/trees`).length;
-    check('tree creation was retried before giving up', treeAttempts === 3, `tree POSTs=${treeAttempts}`);
+    check('tree creation was retried before giving up', treeAttempts === 5, `tree POSTs=${treeAttempts}`);
 
     // Retrying after the outage succeeds.
     last = await syncAll();
@@ -366,9 +370,18 @@ function handleClaude(url) {
     check('a PDF without a download URL leaves the conversation archived, with a visible note in its place',
       pdfMarkdown.includes('Explica el modelo E/R del PDF') && /\*\*Attachment not archived: BD-GICD-Tema2-MER\+DC\+UML\.pdf\*\* \(Claude did not provide a download link for this file\)/.test(pdfMarkdown)
       && pdfEntry.incomplete?.[0]?.name === 'BD-GICD-Tema2-MER+DC+UML.pdf');
+    // The popup shows the per-conversation report instead of the summary line.
+    const reportItems = () => popup.$$eval('#syncReport .report-item', (items) => items.map((item) => ({
+      title: item.querySelector('.report-title')?.textContent,
+      state: item.querySelector('.report-state')?.textContent,
+      details: [...item.querySelectorAll('.report-detail-line')].map((line) => line.textContent),
+    })));
+    const incompleteReport = await reportItems();
     check('the sync is reported as finished with problems, naming the incomplete conversation',
-      github.commitCount() === commitsBeforeReal + 1 && /^Last sync finished with problems just now: /.test(last)
-      && (await popup.locator('#syncReport li').allTextContents()).some((line) => line === 'Archived with files missing: Base de datos (conv-pdf) — BD-GICD-Tema2-MER+DC+UML.pdf'), last);
+      github.commitCount() === commitsBeforeReal + 1 && last === 'Last sync finished with problems just now.'
+      && incompleteReport.length === 1 && incompleteReport[0].title === 'Base de datos'
+      && incompleteReport[0].state === 'Conversation archived · attachments missing'
+      && incompleteReport[0].details.join() === 'BD-GICD-Tema2-MER+DC+UML.pdf', `${last} ${JSON.stringify(incompleteReport)}`);
     // Clipboard permission cannot be granted to an extension origin here, so
     // record what the real button handler writes.
     await popup.evaluate(() => { navigator.clipboard.writeText = async (text) => { window.__copied = text; }; });
@@ -387,7 +400,7 @@ function handleClaude(url) {
     check('the next sync retries the incomplete conversation instead of treating it as unchanged',
       retryRequests.filter((p) => p.endsWith('/chat_conversations/conv-pdf')).length === 1
       && !retryRequests.some((p) => p.endsWith('/chat_conversations/conv-no-sandbox'))
-      && /5 unchanged conversations were not downloaded again\. 1 conversation was archived with files missing/.test(last), last);
+      && /5 unchanged conversations were not downloaded again\. 1 conversation was archived with files missing/.test(lastMessage), lastMessage);
 
     // Real shape: an upload given only as a sandbox path ({ file_kind: 'blob',
     // path: '/mnt/user-data/uploads/…' }, no URL), not in the file list. It is
@@ -446,7 +459,7 @@ function handleClaude(url) {
     files = github.files();
     const bigPaths = Object.keys(files).filter((file) => /big-\d\.bin$/.test(file)).sort();
     check('a sync larger than one extension message (3 × 25 MB) publishes in one commit',
-      github.commitCount() === commitsBeforeBig + 1 && /3 conversations changed in 1 GitHub commit/.test(last), last);
+      github.commitCount() === commitsBeforeBig + 1 && /3 conversations changed in 1 GitHub commit/.test(lastMessage), lastMessage);
     check('large attachments are archived byte for byte',
       bigPaths.length === 3 && bigPaths.every((file) => BIG_FILES.some((bytes) => files[file].equals(bytes))), bigPaths.join(', '));
 
@@ -464,10 +477,10 @@ function handleClaude(url) {
       files = github.files();
       const hugeMarkdown = Object.entries(files).find(([file, content]) => file.endsWith('.md') && content.toString().includes('Here is the recording'));
       check('an attachment over the API upload limit is left out with a note, and the sync publishes',
-        github.commitCount() === commitsBeforeHuge + 1 && /1 conversation changed/.test(last)
-        && /archived with files missing .*big-\d+\.bin \(31\.0 MiB, too large to upload to GitHub\)/.test(last)
+        github.commitCount() === commitsBeforeHuge + 1 && /1 conversation changed/.test(lastMessage)
+        && /archived with files missing .*big-\d+\.bin \(31\.0 MiB, too large to upload to GitHub\)/.test(lastMessage)
         && hugeMarkdown && /\*\*Not archived: big-\d+\.bin\*\* \(31\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/.test(hugeMarkdown[1].toString())
-        && !Object.keys(files).some((file) => file.endsWith(`big-${hugeIndex}.bin`)), last);
+        && !Object.keys(files).some((file) => file.endsWith(`big-${hugeIndex}.bin`)), lastMessage);
     }
 
     // The shape of the conversation that failed on a real account with
@@ -509,7 +522,7 @@ function handleClaude(url) {
       const heavyAssets = Object.entries(files).filter(([file]) => file.includes('/assets/conv-heavy-'));
       const heavyMarkdown = Object.entries(files).find(([file]) => /Heavy-conversation--conv-heavy-/.test(file))?.[1]?.toString() || '';
       check('a conversation with ~48 MB of inline screenshots and four uploads publishes in one commit',
-        github.commitCount() === commitsBefore + 1 && /1 conversation changed/.test(last), last.slice(0, 300));
+        github.commitCount() === commitsBefore + 1 && /1 conversation changed/.test(lastMessage), lastMessage.slice(0, 300));
       check('every screenshot and upload of it is archived byte for byte',
         heavyAssets.length === 10
           && screenshots.every((bytes) => heavyAssets.some(([, content]) => content.equals(bytes)))
@@ -548,14 +561,15 @@ function handleClaude(url) {
       last = await syncAll();
       files = github.files();
       const refusedMarkdown = Object.entries(files).find(([file]) => /Slider-menu--conv-refused-/.test(file))?.[1]?.toString() || '';
-      check('a 422 "too large" attachment does not stop the sync', github.commitCount() === commitsBefore + 1 && /2 conversations changed in 1 GitHub commit/.test(last), last.slice(0, 300));
+      check('a 422 "too large" attachment does not stop the sync', github.commitCount() === commitsBefore + 1 && /2 conversations changed in 1 GitHub commit/.test(lastMessage), lastMessage.slice(0, 300));
       check('the refused attachment is marked not archived, with GitHub\'s reason',
         new RegExp(`\\*\\*Not archived: big-${first}\\.bin\\*\\* \\(4\\.0 MiB; GitHub rejected the upload as too large to process \\(HTTP 422`).test(refusedMarkdown)
           && !Object.keys(files).some((file) => file.endsWith(`big-${first}.bin`)), refusedMarkdown.slice(-400));
       check('the other attachment of that conversation and the other conversation are archived',
         Object.entries(files).some(([file, content]) => file.endsWith(`big-${first + 1}.bin`) && content.equals(keptBytes))
           && Object.entries(files).some(([file, content]) => file.endsWith(`big-${first + 2}.bin`) && content.equals(otherBytes)));
-      check('the popup names the refused file and its size', new RegExp(`big-${first}\\.bin \\(4\\.0 MiB, too large to upload to GitHub\\)`).test(last), last.slice(0, 400));
+      const refusedReport = JSON.stringify(await reportItems());
+      check('the popup names the refused file and its size', new RegExp(`big-${first}\\.bin \\(4\\.0 MiB, too large to upload to GitHub\\)`).test(refusedReport), refusedReport.slice(0, 400));
       check('the commit message counts conversations, not files', github.headMessage() === 'Sync 2 AI conversations (2 assets)', github.headMessage());
 
       // The next sync does not send the refused bytes to GitHub again.
@@ -563,7 +577,7 @@ function handleClaude(url) {
       last = await syncAll();
       check('bytes GitHub refused are not uploaded again by the next sync',
         github.blobPostSizesSince(before).every((size) => size <= 3 * 1024 * 1024), github.blobPostSizesSince(before).join(','));
-      check('the conversation stays marked incomplete with the reason', /archived with files missing .*\(4\.0 MiB, too large to upload to GitHub\)/.test(last), last.slice(0, 400));
+      check('the conversation stays marked incomplete with the reason', /archived with files missing .*\(4\.0 MiB, too large to upload to GitHub\)/.test(lastMessage), lastMessage.slice(0, 400));
       github.rejectBlobsOver(0);
     }
 

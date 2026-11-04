@@ -153,14 +153,17 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null }) {
+function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [] }) {
   const listeners = [];
+  const createdTrees = new Map();
+  const blobContents = new Map();
   const requests = [];
   const baseSha = 'base-commit';
   const concurrentSha = 'concurrent-commit';
   let masterRefReads = 0;
   let blobCount = 0;
   let injectedFailures = 0;
+  let failOnceMatches = 0;
   let cancelTriggered = false;
   let currentHeadSha = baseSha;
   let settingsReadCount = 0;
@@ -197,6 +200,20 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
     text: async () => JSON.stringify(body),
   });
 
+  // The branch's tree: every path the index references, minus `missingPaths`.
+  function baseTreeItems() {
+    let indexedPaths = [];
+    try {
+      const parsedIndex = JSON.parse(indexText || '{}');
+      indexedPaths = (parsedIndex.conversations || []).flatMap((entry) => [
+        entry.path,
+        ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : []),
+      ]).filter(Boolean);
+    } catch {}
+    const missing = new Set(missingPaths);
+    return new Map([...new Set(indexedPaths)].filter((path) => !missing.has(path)).map((path) => [path, `existing-${path}`]));
+  }
+
   const fetch = async (url, options = {}) => {
     const parsed = new URL(url);
     const pathname = parsed.pathname;
@@ -208,7 +225,8 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       listeners[0]({ type: 'cancelSync' }, {}, () => {});
     }
 
-    if (failOnce && injectedFailures < (failOnce.times || 1) && method === failOnce.method && pathname.endsWith(failOnce.pathSuffix)) {
+    if (failOnce && method === failOnce.method && pathname.endsWith(failOnce.pathSuffix) && (failOnceMatches += 1) > (failOnce.after || 0)
+      && injectedFailures < (failOnce.times || 1)) {
       injectedFailures += 1;
       if (failOnce.network) throw new TypeError('Failed to fetch');
       return response({ message: failOnce.message || 'Temporary injected failure' }, failOnce.status || 503, failOnce.headers || {});
@@ -226,19 +244,13 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       return response({ sha: baseSha, tree: { sha: 'base-tree' } });
     }
     if (pathname.endsWith('/git/trees/base-tree') && method === 'GET') {
-      let indexedPaths = [];
-      try {
-        const parsedIndex = JSON.parse(indexText || '{}');
-        indexedPaths = (parsedIndex.conversations || []).flatMap((entry) => [
-          entry.path,
-          ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : []),
-        ]).filter(Boolean);
-      } catch {}
-      const missing = new Set(missingPaths);
-      return response({
-        sha: 'base-tree',
-        tree: [...new Set(indexedPaths)].filter((path) => !missing.has(path)).map((path) => ({ path, type: 'blob', mode: '100644', sha: `existing-${path}` })),
-      });
+      return response({ sha: 'base-tree', tree: [...baseTreeItems()].map(([path, sha]) => ({ path, type: 'blob', mode: '100644', sha })) });
+    }
+    if (method === 'GET' && pathname.includes('/git/trees/')) {
+      const sha = decodeURIComponent(pathname.split('/git/trees/')[1]);
+      const tree = createdTrees.get(sha);
+      if (!tree) return response({ message: 'Not Found' }, 404);
+      return response({ sha, truncated: false, tree: [...tree].map(([path, blob]) => ({ path, type: 'blob', mode: '100644', sha: blob })) });
     }
     if (pathname.endsWith('/contents/archive/index.json') && method === 'GET') {
       if (indexText == null) return response({ message: 'Not Found' }, 404);
@@ -266,13 +278,26 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       try {
         if (blobDelayMs) await new Promise((resolve) => setTimeout(resolve, blobDelayMs));
         blobCount += 1;
+        blobContents.set(`blob-${blobCount}`, requests.at(-1).body);
         return response({ sha: `blob-${blobCount}` });
       } finally {
         activeBlobRequests -= 1;
       }
     }
     if (pathname.endsWith('/git/trees') && method === 'POST') {
-      return response({ sha: 'new-tree' });
+      // Applies the entries to the base tree like GitHub does (a null SHA
+      // deletes the path); `treeTamper` simulates GitHub building a different tree.
+      const body = requests.at(-1).body;
+      const base = body.base_tree === 'base-tree' ? baseTreeItems() : (createdTrees.get(body.base_tree) || new Map());
+      const entries = new Map(base);
+      for (const entry of body.tree) {
+        if (entry.sha === null) entries.delete(entry.path);
+        else entries.set(entry.path, entry.sha);
+      }
+      treeTamper?.(entries);
+      const sha = `tree-${createdTrees.size + 1}`;
+      createdTrees.set(sha, entries);
+      return response({ sha });
     }
     if (pathname.endsWith('/git/commits') && method === 'POST') {
       return response({ sha: 'new-commit' });
@@ -300,7 +325,11 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
     Blob, Response, CompressionStream, crypto: webcrypto, btoa, atob, setTimeout, clearTimeout,
   };
   // Keep retry backoff instant in tests; the retry policy itself is unchanged.
-  const fastSource = backgroundSource.replace('const GITHUB_RETRY_BASE_DELAY_MS = 1000;', 'const GITHUB_RETRY_BASE_DELAY_MS = 1;');
+  let fastSource = backgroundSource.replace('const GITHUB_RETRY_BASE_DELAY_MS = 1000;', 'const GITHUB_RETRY_BASE_DELAY_MS = 1;');
+  for (const [from, to] of sourcePatches) {
+    assert.ok(fastSource.includes(from), `test patch target exists: ${from}`);
+    fastSource = fastSource.replace(from, to);
+  }
   vm.runInNewContext(`${fastSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
@@ -317,6 +346,15 @@ globalThis.__testHooks = {
     storedValues: () => storedValues,
     hooks: context.__testHooks,
     requests,
+    // The tree and archive/index.json of the last commit this harness was asked to create.
+    endInjectedFailures() { failOnce = null; },
+    lastCommittedArchive() {
+      const commit = requests.filter((request) => request.method === 'POST' && request.pathname.endsWith('/git/commits')).at(-1);
+      const tree = commit && createdTrees.get(commit.body.tree);
+      if (!tree) return null;
+      const indexBlob = blobContents.get(tree.get('archive/index.json'));
+      return { tree, index: indexBlob ? JSON.parse(indexBlob.content) : null };
+    },
     send(message, sender = { tab: { id: 7 } }) {
       let response;
       listeners[0](message, sender, (value) => { response = value; });
@@ -643,14 +681,15 @@ test('conversation Markdown paths distinguish IDs that normalize to the same slu
 test('recovers after a persistent GitHub upload failure without publishing a partial archive', async () => {
   const harness = makeBackgroundSyncHarness({
     indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }),
-    // More consecutive failures than the retry budget: the sync must give up safely.
-    failOnce: { method: 'POST', pathSuffix: '/git/blobs', status: 503, times: 3 },
+    // As many consecutive failures as the retry budget: the sync must give up safely.
+    failOnce: { method: 'POST', pathSuffix: '/git/blobs', status: 503, times: 5 },
   });
 
   await assert.rejects(
     harness.sync(sampleConversation(), () => {}),
-    /GitHub 503:.*Temporary injected failure/,
+    /GitHub 503:.*Temporary injected failure \[while uploading a file; failed 5 attempts\] Nothing was published; the archive on GitHub is unchanged\./,
   );
+  assert.equal(harness.requests.filter((request) => request.method === 'POST' && request.pathname.endsWith('/git/blobs')).length, 5);
 
   assert.equal(
     harness.requests.some((request) => request.method === 'PATCH'),
@@ -1482,6 +1521,28 @@ test('a sync with unchanged conversations reports them and does not count them a
   assert.doesNotMatch(message, /not returned by Claude/);
 });
 
+test('a sync that could not read the archive state says every conversation was downloaded again', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const progress = [];
+  const result = await harness.sync(sampleConversation(), (event) => progress.push(event), [], {
+    fullList: true, listed: 1, unchangedIds: [], archiveStateError: 'GitHub 502: Server Error',
+  });
+  assert.equal(result.partial, false, 'a full download loses nothing, so the sync is not partial');
+  assert.equal(result.report.archiveStateError, 'GitHub 502: Server Error');
+  assert.match(progress.at(-1).message,
+    /The archive state could not be read \(GitHub 502: Server Error\), so every conversation was downloaded again instead of skipping unchanged ones\./);
+
+  const automatic = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const automaticProgress = [];
+  await automatic.sync(sampleConversation(), (event) => automaticProgress.push(event), [], { fullList: false, archiveStateError: 'GitHub 502: Server Error' });
+  assert.match(automaticProgress.at(-1).message, /so this automatic sync checked only the latest conversations\./);
+
+  const normal = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const normalProgress = [];
+  await normal.sync(sampleConversation(), (event) => normalProgress.push(event), [], { fullList: true, listed: 1 });
+  assert.doesNotMatch(normalProgress.at(-1).message, /archive state/);
+});
+
 test('records the exporter version for a previously archived conversation even when its Markdown is unchanged', async () => {
   // First sync writes the conversation; capture its index entry without the exporter version.
   const first = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
@@ -2162,7 +2223,7 @@ test('a different 422 is a real error: it names the attachment and its size, and
   });
   const asset = fileAsset('data.csv', 'a,b\n'.repeat(1000));
   await assert.rejects(harness.sync([conversationWith('c1', [asset])], () => {}),
-    /^Error: Attachment "data\.csv" \(3\.9 KiB\) could not be uploaded to GitHub: GitHub 422: Validation Failed \(invalid\)$/);
+    /^Error: Attachment "data\.csv" \(3\.9 KiB\) could not be uploaded to GitHub: GitHub 422: Validation Failed \(invalid\) \[while uploading a file\] Nothing was published; the archive on GitHub is unchanged\. Sync again to retry\.$/);
   assert.equal(harness.requests.some((request) => request.method === 'PATCH'), false);
   assert.equal(harness.requests.some((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST'), false);
 });
@@ -2281,4 +2342,171 @@ test('GitHub errors keep GitHub\'s own message, stay bounded, and never contain 
   const validation = gitHubError(response(422), JSON.stringify({ message: 'Validation Failed', errors: [{ code: 'missing_field' }] }), settings);
   assert.equal(validation.inputTooLarge, false, 'other 422 responses are not size errors');
   assert.equal(gitHubError(response(413), 'Request Entity Too Large', settings).inputTooLarge, true);
+});
+
+
+// ---- Large syncs and GitHub 502 "Server Error" responses ----
+// Synthetic conversations only: no real conversation text or identifiers.
+
+function syntheticConversations(count) {
+  return Array.from({ length: count }, (_, i) => {
+    const id = `synthetic-${String(i).padStart(4, '0')}-0000-0000-000000000000`;
+    return {
+      external_id: id,
+      title: `Synthetic conversation ${i}`,
+      model: 'test-model',
+      source_created_at: '2026-10-26T08:00:00.000Z',
+      source_updated_at: new Date(Date.UTC(2026, 9, 26, 9, 0, i)).toISOString(),
+      message_count: 1,
+      messages: [{ external_id: `${id}-m1`, role: 'user', content: `synthetic message ${i}`, files: [], attachments: [] }],
+      assets: [],
+    };
+  });
+}
+
+const SERVER_ERROR_502 = { status: 502, message: 'Server Error' };
+const countRequests = (harness, method, suffix) => harness.requests.filter((r) => r.method === method && r.pathname.endsWith(suffix)).length;
+
+function assertCompleteArchive(harness, conversations) {
+  const archive = harness.lastCommittedArchive();
+  assert.ok(archive?.index, 'a commit with an index was created');
+  const ids = archive.index.conversations.map((entry) => entry.id);
+  assert.equal(ids.length, conversations.length, 'every conversation is in the index exactly once');
+  assert.equal(new Set(ids).size, ids.length, 'no duplicated index entries');
+  assert.deepEqual([...ids].sort(), conversations.map((c) => c.external_id).sort());
+  for (const entry of archive.index.conversations) {
+    assert.ok(archive.tree.has(entry.path), `the committed tree holds ${entry.path}`);
+  }
+  const markdownPaths = [...archive.tree.keys()].filter((path) => path.endsWith('.md'));
+  assert.equal(markdownPaths.length, conversations.length, 'one Markdown file per conversation');
+}
+
+test('an 812-conversation sync builds its tree in chained batches and publishes one commit', async () => {
+  const conversations = syntheticConversations(812);
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const result = await harness.sync(conversations, () => {});
+  assert.equal(result.changed, 812);
+  const treePosts = harness.requests.filter((r) => r.method === 'POST' && r.pathname.endsWith('/git/trees'));
+  assert.equal(treePosts.length, Math.ceil(813 / 100), '812 Markdown files and the index, at most 100 entries per request');
+  assert.ok(treePosts.every((r) => r.body.tree.length <= 100));
+  assert.equal(treePosts[0].body.base_tree, 'base-tree');
+  for (let i = 1; i < treePosts.length; i++) {
+    assert.match(treePosts[i].body.base_tree, /^tree-/, 'each batch starts from the tree the previous batch returned');
+  }
+  assert.equal(countRequests(harness, 'POST', '/git/commits'), 1);
+  assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 1);
+  assertCompleteArchive(harness, conversations);
+});
+
+test('a transient 502 Server Error on any idempotent step of a large sync is retried and the sync completes once', async () => {
+  for (const failure of [
+    { method: 'GET', pathSuffix: '/git/trees/base-tree' },
+    { method: 'POST', pathSuffix: '/git/blobs', after: 300 },
+    { method: 'POST', pathSuffix: '/git/trees', after: 4 },
+    { method: 'POST', pathSuffix: '/git/commits' },
+  ]) {
+    const conversations = syntheticConversations(250);
+    const harness = makeBackgroundSyncHarness({
+      indexText: emptyIndex(),
+      failOnce: { ...failure, ...SERVER_ERROR_502, times: 4 },
+    });
+    const result = await harness.sync(conversations, () => {});
+    assert.equal(result.commit, 'new-commit', `${failure.method} ${failure.pathSuffix} recovers`);
+    assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 1);
+    assertCompleteArchive(harness, conversations);
+  }
+});
+
+test('a persistent 502 publishes nothing, names the failed step, and the next sync resumes without duplicates', async () => {
+  for (const [failure, operation] of [
+    [{ method: 'GET', pathSuffix: '/git/trees/base-tree' }, 'reading the archive file list'],
+    [{ method: 'POST', pathSuffix: '/git/blobs', after: 500 }, 'uploading a file'],
+    [{ method: 'POST', pathSuffix: '/git/trees', after: 2 }, 'building the archive tree'],
+    [{ method: 'POST', pathSuffix: '/git/commits' }, 'creating the sync commit'],
+  ]) {
+    const conversations = syntheticConversations(812);
+    const harness = makeBackgroundSyncHarness({
+      indexText: emptyIndex(),
+      // GitHub keeps failing (with parallel uploads, failures land on several
+      // files) until the outage ends below.
+      failOnce: { ...failure, ...SERVER_ERROR_502, times: Infinity },
+    });
+    const progress = [];
+    await assert.rejects(harness.sync(conversations, (event) => progress.push(event)), (error) => {
+      assert.match(error.message, new RegExp(`^GitHub 502: Server Error \\[while ${operation.replace(/[()]/g, '\\$&')}; failed 5 attempts\\] Nothing was published; the archive on GitHub is unchanged\\. Sync again to retry\\.$`));
+      return true;
+    });
+    assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 0, 'the branch is never moved after a failure');
+    assert.equal(progress.some((event) => event.stage === 'done'), false);
+
+    // The failed sync left the branch unchanged, so the retry starts from the
+    // same archive and publishes every conversation exactly once.
+    harness.endInjectedFailures();
+    const retry = await harness.sync(conversations, () => {});
+    assert.equal(retry.changed, 812);
+    assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 1);
+    assertCompleteArchive(harness, conversations);
+  }
+});
+
+test('a 502 on the branch update is never repeated blindly; an unchanged branch is reported and the retry succeeds', async () => {
+  const conversations = syntheticConversations(20);
+  const harness = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    failOnce: { method: 'PATCH', pathSuffix: '/git/refs/heads/master', ...SERVER_ERROR_502, times: 1 },
+  });
+  await assert.rejects(harness.sync(conversations, () => {}),
+    /^Error: GitHub 502: Server Error \[while publishing the sync commit \(branch update\)\] GitHub confirms the "master" branch is unchanged: nothing was published; sync again\.$/);
+  assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 1, 'the ref update is sent once');
+  const patchIndex = harness.requests.findIndex((r) => r.method === 'PATCH');
+  assert.ok(harness.requests.slice(patchIndex + 1).some((r) => r.method === 'GET' && r.pathname.endsWith('/git/ref/heads/master')),
+    'the branch head is read back to establish the outcome');
+
+  const retry = await harness.sync(conversations, () => {});
+  assert.equal(retry.commit, 'new-commit');
+  assertCompleteArchive(harness, conversations);
+});
+
+test('a tree GitHub built differently from the planned changes is never committed', async () => {
+  const conversations = syntheticConversations(150);
+  let dropped = null;
+  const harness = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    treeTamper: (entries) => {
+      // Lose one Markdown file in the last batch, as a misapplied request would.
+      if (!entries.has('archive/index.json')) return;
+      dropped = [...entries.keys()].find((path) => path.endsWith('.md'));
+      entries.delete(dropped);
+    },
+  });
+  await assert.rejects(harness.sync(conversations, () => {}),
+    /Archive integrity check failed: the tree GitHub built does not match this sync for 1 file\(s\).*No archive changes were published/);
+  assert.ok(dropped);
+  assert.equal(countRequests(harness, 'POST', '/git/commits'), 0);
+  assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 0);
+});
+
+test('the index size is recorded, warned about near the request limit, and an oversized index fails before any upload', async () => {
+  const conversations = syntheticConversations(30);
+  const small = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const result = await small.sync(conversations, () => {});
+  const indexBytes = result.report.index_bytes;
+  assert.ok(Number.isSafeInteger(indexBytes) && indexBytes > 0, 'the outcome records the index size');
+
+  const warned = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    sourcePatches: [['const INDEX_WARN_BYTES = 20 * 1024 * 1024;', `const INDEX_WARN_BYTES = ${indexBytes - 1};`]],
+  });
+  const progress = [];
+  await warned.sync(conversations, (event) => progress.push(event));
+  assert.match(progress.at(-1).message, /The archive index \(archive\/index\.json\) is [\d.]+ KiB; syncs will stop working when it nears 40\.0 MiB/);
+
+  const blocked = makeBackgroundSyncHarness({
+    indexText: emptyIndex(),
+    sourcePatches: [['const MAX_BLOB_REQUEST_BYTES = 40 * 1024 * 1024;', `const MAX_BLOB_REQUEST_BYTES = ${indexBytes};`]],
+  });
+  await assert.rejects(blocked.sync(conversations, () => {}),
+    /^Error: The archive index \(archive\/index\.json\) would be [\d.]+ KiB, more than the [\d.]+ KiB GitHub's API accepts in one request\. No archive changes were published\./);
+  assert.equal(countRequests(blocked, 'POST', '/git/blobs'), 0, 'nothing is uploaded for a sync that cannot be published');
+  assert.equal(countRequests(blocked, 'PATCH', '/git/refs/heads/master'), 0);
 });
