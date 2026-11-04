@@ -163,6 +163,24 @@ Enter the owner, repository, and the read-only token. Before the first sync, the
 - `node --test extension/*.test.js` and `cd web && npm test` run the unit tests; CI also builds the viewer.
 - `node e2e/extension-sync.e2e.cjs` runs the unpacked extension in headless Chromium against fake claude.ai and GitHub servers. It goes through popup setup (including a rejected token), a first sync into an empty repository, an unchanged incremental sync, a changed conversation, a GitHub outage that publishes nothing, and the retry, and inspects the commits and files the extension published. With `VIEWER_URL` set to a running viewer (see `web/README.md`), it also opens the synced archive in the viewer. It needs Playwright with a Chromium browser. CI runs it as the non-blocking `extension-e2e` job; a failure there is visible but does not fail the run. It does not replace a real sync: claude.ai's actual API responses and GitHub's real API are only modelled.
 
+### Checking an archive's integrity
+
+A read-only audit compares `archive/index.json` with the repository:
+- missing conversation or attachment files;
+- size and SHA-256 mismatches;
+- duplicate identities or paths;
+- broken attachment links;
+- unreferenced files;
+- malformed entries.
+
+It makes only GET requests to `api.github.com`, never repairs or deletes anything, and works with a read-only token:
+
+```bash
+GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> --markdown --hashes
+```
+
+`--markdown` downloads conversation files to check their links. `--hashes` downloads every attachment to verify its bytes, which is slow for large archives. The exit status is 0 when there are no errors, 1 when errors were found, and 2 when the audit could not run.
+
 ## Repository layout
 
 ```text
