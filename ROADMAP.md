@@ -18,11 +18,12 @@ A user should be able to export years of conversations from supported AI provide
 ## P0 — Trust and data integrity
 
 ### P0.1 Archive integrity verifier
-- [ ] Add a read-only integrity audit that walks the index and verifies every referenced conversation and asset exists.
-- [ ] Verify SHA-256 and recorded byte sizes where metadata exists.
-- [ ] Detect orphaned assets, duplicate identities/paths, broken Markdown asset references, missing index entries and malformed metadata.
-- [ ] Produce a human-readable report with severity and exact paths; never repair or delete automatically.
-- [ ] Add unit tests using synthetic fixtures and a documented invocation.
+- [x] Add a read-only integrity audit that walks the index and verifies every referenced conversation and asset exists. (`web/src/archiveIntegrity.js`)
+- [x] Verify SHA-256 and recorded byte sizes where metadata exists. (`--hashes`)
+- [x] Detect orphaned assets, duplicate identities/paths, broken Markdown asset references, missing index entries and malformed metadata. (Files under `archive/conversations/` that the index does not list are reported as unreferenced.)
+- [x] Produce a human-readable report with severity and exact paths; never repair or delete automatically.
+- [x] Add unit tests using synthetic fixtures and a documented invocation. (`web/src/archiveIntegrity.test.js`; `web/scripts/verify-archive.mjs`)
+- [ ] Run it against a real archive (user, read-only token) and review the findings.
 
 Acceptance: a deliberately corrupted fixture produces precise findings; a clean fixture produces zero errors; the tool never mutates the archive.
 
