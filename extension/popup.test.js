@@ -13,7 +13,12 @@ function loadPopup({ tabs = {} } = {}) {
     if (!elements.has(id)) {
       elements.set(id, {
         id, value: '', checked: false, disabled: false, textContent: '', className: '', style: {},
-        classList: { add() {}, remove() {}, toggle() {} },
+        classes: new Set(),
+        classList: {
+          add(name) { elements.get(id).classes.add(name); },
+          remove(name) { elements.get(id).classes.delete(name); },
+          toggle(name, force) { const set = elements.get(id).classes; if (force ?? !set.has(name)) set.add(name); else set.delete(name); },
+        },
         children: [], append(...nodes) { this.children.push(...nodes); }, replaceChildren(...nodes) { this.children = nodes; }, focus() {},
       });
     }
@@ -43,7 +48,10 @@ function loadPopup({ tabs = {} } = {}) {
 globalThis.__renderAccountOptions = renderAccountOptions;
 globalThis.__findExistingAccountName = findExistingAccountName;
 globalThis.__createArchiveAccount = createArchiveAccount;
-globalThis.__disconnectGithubSettings = disconnectGithubSettings;`, context);
+globalThis.__disconnectGithubSettings = disconnectGithubSettings;
+globalThis.__loadDiagnostics = loadDiagnostics;
+globalThis.__isCurrentDiagnosticReport = isCurrentDiagnosticReport;
+globalThis.__getLastDiagnostics = () => lastDiagnostics;`, context);
   return {
     describeRepoCheck: context.__describeRepoCheck,
     describeLastSync: context.__describeLastSync,
@@ -261,4 +269,29 @@ test('summarizes incomplete conversations without repeating long file-error mess
     details: ['ai-conversation-archive-main.zip (35.4 MiB, too large to upload to GitHub)'],
   }]);
   assert.deepEqual(JSON.parse(JSON.stringify(describeSyncReport(null))), []);
+});
+
+test('offers the diagnostic report of the current extension version and hides it otherwise', async () => {
+  const { refresh, element, storedSettings, getLastDiagnostics, disconnectGithubSettings } = loadPopup();
+  const button = element('copyDiagnostics');
+  Object.assign(storedSettings, {
+    github_owner: 'owner', github_repo: 'archive', github_token: 'secret', archive_account: 'logan',
+    last_sync_diagnostics: { extension_version: '0.5.16', items: [{ outcome: 'incomplete' }] },
+  });
+  await refresh();
+  assert.equal(button.classes.has('hidden'), false, 'a current report can be copied');
+  assert.equal(getLastDiagnostics().items.length, 1);
+
+  // A report written by another extension version is removed, not offered.
+  storedSettings.last_sync_diagnostics = { extension_version: '0.5.15', items: [{ outcome: 'failed' }] };
+  await refresh();
+  assert.equal(button.classes.has('hidden'), true);
+  assert.equal(getLastDiagnostics(), null);
+  assert.equal('last_sync_diagnostics' in storedSettings, false);
+
+  storedSettings.last_sync_diagnostics = { extension_version: '0.5.16', items: [{ outcome: 'failed' }] };
+  await refresh();
+  await disconnectGithubSettings();
+  assert.equal(button.classes.has('hidden'), true, 'disconnecting hides the report');
+  assert.equal(getLastDiagnostics(), null);
 });

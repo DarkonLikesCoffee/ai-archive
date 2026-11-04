@@ -65,9 +65,20 @@ function assertNotCancelled() {
   if (cancelRequested) throw new Error('__SYNC_CANCELLED__');
 }
 
-const GITHUB_MAX_ATTEMPTS = 3;
+// Five attempts back off for about 15 seconds in total (1 + 2 + 4 + 8 s,
+// each with +/-25% jitter so parallel uploads do not retry in lockstep). A
+// short GitHub incident is ridden out; a request GitHub keeps failing (for
+// example one it cannot process within its own time limit) still fails, and
+// is reported with the operation that failed.
+const GITHUB_MAX_ATTEMPTS = 5;
 const GITHUB_RETRY_BASE_DELAY_MS = 1000;
 const GITHUB_MAX_RETRY_AFTER_MS = 60000;
+// The new archive tree is built in chained requests of at most this many
+// entries (each request starts from the tree the previous one returned), so
+// a large sync never asks GitHub to build thousands of paths in one request.
+// Trees are content-addressed: the result is identical to a single request,
+// and a retried request cannot change it.
+const TREE_BATCH_SIZE = 100;
 
 // Only requests whose repetition cannot change the archive are retried:
 // reads, and Git object creation (blobs and trees are content-addressed; a
@@ -95,6 +106,43 @@ function waitForRetry(ms, signal) {
     }
     signal?.addEventListener?.('abort', onAbort, { once: true });
   });
+}
+
+// Which GitHub operation a request belongs to, so a failure says where the
+// sync stopped. Never includes paths or file names (they can carry titles).
+function gitHubOperation(path, method) {
+  const p = String(path || '');
+  if (method === 'PATCH' && p.startsWith('/git/refs/')) return 'publishing the sync commit (branch update)';
+  if (method === 'GET' && p.startsWith('/git/ref/')) return 'reading the branch head';
+  if (method === 'GET' && p.startsWith('/git/commits/')) return 'reading the branch commit';
+  if (method === 'GET' && p.startsWith('/git/trees/')) return 'reading the archive file list';
+  if (method === 'GET' && p.startsWith('/git/blobs/')) return 'reading a file from the archive';
+  if (method === 'GET' && p.startsWith('/contents/')) return 'reading the archive index';
+  if (method === 'POST' && p === '/git/blobs') return 'uploading a file';
+  if (method === 'POST' && p === '/git/trees') return 'building the archive tree';
+  if (method === 'POST' && p === '/git/commits') return 'creating the sync commit';
+  if (method === 'PUT' && p.startsWith('/contents/')) return 'initializing the repository';
+  return `${method} request`;
+}
+
+function isCancellation(error) {
+  return error?.name === 'AbortError' || error?.message === '__SYNC_CANCELLED__';
+}
+
+function annotateOperation(error, operation, attempts = 1) {
+  if (!error || isCancellation(error) || !operation || error.operation) return error;
+  try {
+    error.operation = operation;
+    error.attempts = attempts;
+    error.message = `${String(error.message || error)} [while ${operation}${attempts > 1 ? `; failed ${attempts} attempts` : ''}]`;
+  } catch {
+    // A frozen error keeps its own message.
+  }
+  return error;
+}
+
+function backoffMs(attempt) {
+  return Math.round(GITHUB_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5));
 }
 
 function retryAfterMs(response) {
@@ -173,6 +221,7 @@ async function gh(path, opts = {}, allowAfterCancel = false) {
   const signal = allowAfterCancel ? undefined : (requestSignal || controller?.signal);
   const method = String(opts.method || 'GET').toUpperCase();
   const retryable = isRetryableGitHubRequest(path, method);
+  const operation = gitHubOperation(path, method);
 
   for (let attempt = 1; ; attempt++) {
     let r;
@@ -184,8 +233,9 @@ async function gh(path, opts = {}, allowAfterCancel = false) {
       });
     } catch (error) {
       // Network failures (not cancellation) are transient for safe requests.
-      if (error?.name === 'AbortError' || !retryable || attempt >= GITHUB_MAX_ATTEMPTS) throw error;
-      await waitForRetry(GITHUB_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), signal);
+      if (error?.name === 'AbortError') throw error;
+      if (!retryable || attempt >= GITHUB_MAX_ATTEMPTS) throw annotateOperation(error, operation, attempt);
+      await waitForRetry(backoffMs(attempt), signal);
       if (!allowAfterCancel) assertNotCancelled();
       continue;
     }
@@ -197,8 +247,10 @@ async function gh(path, opts = {}, allowAfterCancel = false) {
     const secondaryLimit = (r.status === 403 || r.status === 429) && !exhausted
       && (r.status === 429 || /secondary rate limit/i.test(text));
     const transient = [500, 502, 503, 504].includes(r.status) || secondaryLimit;
-    const wait = retryAfterMs(r) ?? GITHUB_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
-    if (!retryable || !transient || attempt >= GITHUB_MAX_ATTEMPTS || wait > GITHUB_MAX_RETRY_AFTER_MS) throw error;
+    const wait = retryAfterMs(r) ?? backoffMs(attempt);
+    if (!retryable || !transient || attempt >= GITHUB_MAX_ATTEMPTS || wait > GITHUB_MAX_RETRY_AFTER_MS) {
+      throw annotateOperation(error, operation, attempt);
+    }
     await waitForRetry(wait, signal);
     if (!allowAfterCancel) assertNotCancelled();
   }
@@ -355,6 +407,10 @@ function escapeMarkdownLabel(value) {
 const MAX_BLOB_REQUEST_BYTES = 40 * 1024 * 1024;
 const BLOB_REQUEST_OVERHEAD_BYTES = 64;
 const MAX_ARCHIVED_FILE_BYTES = Math.floor((MAX_BLOB_REQUEST_BYTES - BLOB_REQUEST_OVERHEAD_BYTES) / 4) * 3;
+
+// archive/index.json is uploaded as one blob, so it shares the request limit.
+// Warn well before it is reached (see docs/TECHNICAL_AUDIT.md, finding 1).
+const INDEX_WARN_BYTES = 20 * 1024 * 1024;
 
 const base64RequestBytes = (size) => 4 * Math.ceil(Number(size) / 3) + BLOB_REQUEST_OVERHEAD_BYTES;
 
@@ -929,6 +985,49 @@ async function loadArchiveSnapshot() {
   return { ref, branch, baseCommit, baseTree, existingPaths, index };
 }
 
+// Builds the sync's tree from `entries` in chained requests of at most
+// TREE_BATCH_SIZE entries. Each request starts from the tree the previous one
+// returned, so applying the batches in order equals applying them at once.
+async function createTreeInBatches(entries, baseTreeSha, onBatch) {
+  let base = baseTreeSha || null;
+  let tree = null;
+  const batches = Math.max(1, Math.ceil(entries.length / TREE_BATCH_SIZE));
+  for (let batch = 0; batch < batches; batch++) {
+    assertNotCancelled();
+    const payload = { tree: entries.slice(batch * TREE_BATCH_SIZE, (batch + 1) * TREE_BATCH_SIZE) };
+    if (base) payload.base_tree = base;
+    tree = await gh('/git/trees', { method: 'POST', body: JSON.stringify(payload) });
+    if (typeof tree?.sha !== 'string' || !tree.sha) {
+      throw new Error('GitHub did not return a tree SHA while building the archive tree.');
+    }
+    base = tree.sha;
+    onBatch?.(batch + 1, batches);
+  }
+  return tree;
+}
+
+// Reads the tree that is about to be committed and checks that it holds
+// exactly what this sync wrote and deleted, and every file the next index
+// references. Nothing is published if GitHub built anything else.
+async function verifySyncTree(treeSha, entries, requiredPaths) {
+  const tree = await gh(`/git/trees/${encodeURIComponent(treeSha)}?recursive=1`);
+  if (!tree || tree.truncated || !Array.isArray(tree.tree)) {
+    throw new Error('The new GitHub archive tree is too large to verify safely. No archive changes were published.');
+  }
+  const blobs = new Map(tree.tree.filter((item) => item?.type === 'blob').map((item) => [item.path, item.sha]));
+  const wrong = [];
+  for (const entry of entries) {
+    if (entry.sha === null ? blobs.has(entry.path) : blobs.get(entry.path) !== entry.sha) wrong.push(entry.path);
+  }
+  for (const path of requiredPaths) {
+    if (!blobs.has(path)) wrong.push(path);
+  }
+  if (wrong.length) {
+    const unique = [...new Set(wrong)];
+    throw new Error(`Archive integrity check failed: the tree GitHub built does not match this sync for ${unique.length} file(s) (${unique.slice(0, 3).join(', ')}). No archive changes were published; sync again.`);
+  }
+}
+
 // After a full sync, archived conversations that Claude.ai did not list at
 // all were either deleted there or missing from an incomplete list. Their
 // archived copies are kept either way; say so instead of staying silent.
@@ -988,6 +1087,9 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
   cancelRequested = false;
   syncAbortController = new AbortController();
   activeProgressCallback = onProgress;
+  // Set just before the branch ref update. A failure before it cannot have
+  // changed the archive: blobs, trees and commits are unreferenced until then.
+  let publishing = false;
   try {
     const s = await settings();
     // Keep a consistent settings snapshot for this sync and avoid a storage read
@@ -1256,19 +1358,33 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
     }
 
+    // The index is one blob carrying every conversation's search text; record
+    // its size so growth is visible before it reaches the request limit.
+    const indexJson = JSON.stringify(nextIndex, null, 2);
+    const indexBytes = new TextEncoder().encode(indexJson).byteLength;
+    report.index_bytes = indexBytes;
+    const indexNote = indexBytes >= INDEX_WARN_BYTES
+      ? ` The archive index (archive/index.json) is ${formatBytes(indexBytes)}; syncs will stop working when it nears ${formatBytes(MAX_BLOB_REQUEST_BYTES)}, the most GitHub's API accepts in one request.`
+      : '';
+
     // A sync that left any conversation out, or archived one with files
     // missing, is partial: the popup says so instead of "complete".
     const partial = report.failed.length > 0 || report.incomplete.length > 0 || report.keptPrevious.length > 0;
     const outcome = { report, partial };
     if (changedConversations === 0 && !indexNeedsUpdate && ref) {
       const head = partial ? 'Sync finished with problems: no archived conversation changed, so no GitHub commit was made.' : 'Everything is already up to date. No GitHub commit was needed.';
-      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: `${head}${skippedNote}`, ...outcome });
+      onProgress?.({ stage: 'done', total, changed: 0, commit: null, message: `${head}${skippedNote}${indexNote}`, ...outcome });
       return { total, changed: 0, commit: null, skipped: skipped.length, ...outcome };
     }
 
     const completionMessage = (partial ? 'Sync finished with problems: ' : 'Sync complete: ') + (changedConversations === 0
       ? 'the search cache was compacted; no conversation Markdown changed in 1 GitHub commit.'
-      : `${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`) + skippedNote;
+      : `${changedConversations} conversation${changedConversations === 1 ? '' : 's'} changed in 1 GitHub commit.`) + skippedNote + indexNote;
+
+    // Fail before uploading anything when the index cannot be uploaded at all.
+    if (utf8LengthExceeds(JSON.stringify({ content: indexJson, encoding: 'utf-8' }), MAX_BLOB_REQUEST_BYTES)) {
+      throw new Error(`The archive index (archive/index.json) would be ${formatBytes(indexBytes)}, more than the ${formatBytes(MAX_BLOB_REQUEST_BYTES)} GitHub's API accepts in one request. No archive changes were published. The archive is intact, but it needs a smaller index format before it can be updated; please report this.`);
+    }
 
     const treeEntries = new Array(changes.length);
     const uploadTotal = changes.filter((x) => !x.delete).length + 1;
@@ -1311,14 +1427,16 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     if (firstUploadError) throw firstUploadError;
     assertNotCancelled();
     assertNotCancelled();
-    const indexBlob = await createBlob(JSON.stringify(nextIndex, null, 2));
+    const indexBlob = await createBlob(indexJson);
     treeEntries.push({ path: 'archive/index.json', mode: '100644', type: 'blob', sha: indexBlob.sha });
     onProgress?.({ stage: 'uploading', current: uploadTotal, total: uploadTotal, changed: changedConversations });
 
-    onProgress?.({ stage: 'creating-tree', current: 0, total: 1, changed: changedConversations });
-    const treePayload = { tree: treeEntries };
-    if (baseTree?.sha) treePayload.base_tree = baseTree.sha;
-    const tree = await gh('/git/trees', { method: 'POST', body: JSON.stringify(treePayload) });
+    onProgress?.({ stage: 'creating-tree', current: 0, total: Math.max(1, Math.ceil(treeEntries.length / TREE_BATCH_SIZE)), changed: changedConversations });
+    const tree = await createTreeInBatches(treeEntries, baseTree?.sha, (current, batches) => {
+      onProgress?.({ stage: 'creating-tree', current, total: batches, changed: changedConversations });
+    });
+    await verifySyncTree(tree.sha, treeEntries, referencedPaths);
+    assertNotCancelled();
 
     onProgress?.({ stage: 'creating-commit', current: 0, total: 1, changed: changedConversations });
     const commit = await gh('/git/commits', {
@@ -1341,6 +1459,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     if (baseCommit && latestRef?.object?.sha !== baseCommit.sha) {
       throw new Error('The GitHub branch changed during this sync. Nothing was published; run sync again to include the latest archive.');
     }
+    publishing = true;
     try {
       await gh(`/git/refs/heads/${branch}`, { method: 'PATCH', body: JSON.stringify({ sha: commit.sha, force: false }) });
     } catch (publishError) {
@@ -1376,6 +1495,13 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       if (baseCommit && observedRef?.object?.sha === baseCommit.sha) {
         // The original head is still present, so the attempted update did not
         // become visible. Preserve the original error (including cancellation).
+        // The update itself is not repeated automatically: a new sync rebuilds
+        // and re-verifies everything against the then-current branch.
+        if (!isCancellation(publishError)) {
+          try {
+            publishError.message = `${String(publishError.message || publishError)} GitHub confirms the "${branch}" branch is unchanged: nothing was published; sync again.`;
+          } catch {}
+        }
         throw publishError;
       }
 
@@ -1388,6 +1514,15 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
 
     onProgress?.({ stage: 'done', current: 1, total: 1, changed: changedConversations, commit: commit.sha, message: completionMessage, ...outcome });
     return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length, ...outcome };
+  } catch (error) {
+    // Say plainly that a failure before the branch update left the archive as
+    // it was, so a GitHub error mid-sync is not mistaken for possible data loss.
+    if (!publishing && !isCancellation(error) && error instanceof Error && !/published/i.test(String(error.message))) {
+      try {
+        error.message = `${error.message} Nothing was published; the archive on GitHub is unchanged. Sync again to retry.`;
+      } catch {}
+    }
+    throw error;
   } finally {
     syncRunning = false;
     syncAbortController = null;

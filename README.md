@@ -1,5 +1,12 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.20 — large-sync GitHub reliability
+- The new archive tree is built in chained requests of at most 100 entries instead of one request for the whole sync, so a large sync (hundreds of conversations) no longer depends on GitHub processing thousands of paths in a single request. The result is the same single commit.
+- Before the branch is moved, the extension reads the new tree back and checks that it holds exactly the files this sync wrote and deleted, plus every file the index references; otherwise nothing is published.
+- Idempotent GitHub requests (reads, blob/tree/commit creation) are retried up to 5 times over about 15 seconds with jittered backoff. The branch update itself is still never repeated automatically.
+- Each sync records the size of `archive/index.json` and warns from 20 MiB. The index is uploaded as one request, and GitHub's API takes at most 40 MiB per request. An index too large to upload now fails before anything is uploaded, with a message naming the index, instead of a generic size error.
+- A GitHub failure now names the step that failed (for example `GitHub 502: Server Error [while building the archive tree; failed 5 attempts]`) and states that nothing was published when the branch was not moved.
+
 ## Extension v0.5.18 — upgraded Claude workspace file handling
 - Upgraded workspaces (`workspace_upgraded: true` or `is_wiggle_enabled: false`) no longer query the retired Wiggle sandbox file-list endpoint, which returns a misleading 404. Message-level Files API downloads continue normally; legacy sandbox collection remains enabled for conversations that still support it.
 
