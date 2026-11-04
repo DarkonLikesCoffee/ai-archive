@@ -53,7 +53,7 @@ function createFakeGitHub() {
     requests.push(`${method} ${url.pathname}`);
     if (token !== TOKEN) return json(401, { message: 'Bad credentials' });
     const failure = failures.find((f) => f.method === method && url.pathname.endsWith(f.pathSuffix) && f.times > 0);
-    if (failure) { failure.times -= 1; return json(failure.status, { message: 'Injected failure' }); }
+    if (failure) { failure.times -= 1; return json(failure.status, { message: failure.message || 'Injected failure' }); }
 
     const prefix = `/repos/${OWNER}/${REPO}`;
     if (url.pathname === prefix) return json(200, { full_name: `${OWNER}/${REPO}`, permissions: { push: true } });
@@ -297,12 +297,12 @@ function handleClaude(url) {
     addConversation('conv-a', 'Trip planning', '2026-10-27T10:00:00Z', [['human', 'Plan a weekend in Porto'], ['assistant', 'Start at Ribeira.']]);
     const headBeforeFailure = github.head();
     const requestsBeforeFailure = github.requests.length;
-    github.failures.push({ method: 'POST', pathSuffix: '/git/trees', status: 500, times: 3 });
+    github.failures.push({ method: 'POST', pathSuffix: '/git/trees', status: 502, message: 'Server Error', times: 5 });
     last = await syncAll();
     check('a failing GitHub sync publishes nothing', github.head() === headBeforeFailure);
-    check('popup shows the failed sync', /^Last sync failed just now: GitHub 500/.test(last), last);
+    check('popup shows the failed sync and the step that failed', /^Last sync failed just now: GitHub 502: Server Error \[while building the archive tree; failed 5 attempts\] Nothing was published/.test(last), last);
     const treeAttempts = github.requests.slice(requestsBeforeFailure).filter((r) => r === `POST /repos/${OWNER}/${REPO}/git/trees`).length;
-    check('tree creation was retried before giving up', treeAttempts === 3, `tree POSTs=${treeAttempts}`);
+    check('tree creation was retried before giving up', treeAttempts === 5, `tree POSTs=${treeAttempts}`);
 
     // Retrying after the outage succeeds.
     last = await syncAll();

@@ -1,5 +1,50 @@
 # AI Archive — autonomous development log
 
+## Session handoff — 2026-11-03 (read this first)
+
+Work from this session was submitted as separate PRs targeting `development`. All have GitHub squash auto-merge enabled. `Web CI` passed on each PR checked; GitHub showed DarkonLikesCoffee/ai-archive#82 as blocked anyway, so a required review or another merge rule is probably holding the merges. Each PR was checked to merge cleanly with the others (`git merge-tree`), and a local merge of #82–#85 passed 198 extension unit tests and 45/45 E2E checks.
+
+| PR | Content |
+|---|---|
+| #82 | GitHub 502 investigation and large-sync hardening (0.5.20): tree batches, tree verification, 5-attempt retry, step-named errors, index-size guard |
+| #83 | Restores the popup "Copy diagnostic report" button; repairs the extension E2E after the popup redesign |
+| #84 | `docs/TECHNICAL_AUDIT.md` |
+| #85 | Reports when a sync downloaded every conversation because the archive state could not be read |
+| #86 | Index v3 design proposal (sharded search caches) — **needs owner decision**; not implemented |
+| #87 | Extension E2E as a non-blocking CI job. Red until #83 merges (the failure is that known popup check) |
+| #88 | README: where the tokens are stored |
+| #89 | Read-only archive integrity verifier (ROADMAP P0.1) and the `web/scripts/verify-archive.mjs` command |
+
+Notes for the next session:
+- **Log order.** #83, #84 and #85 add log entries lower in this file, so parallel PRs would not conflict. Once all are merged, move them up so the newest comes first.
+- **Branch state.** Start from the latest `development`. Do not stack new work on unmerged PR branches.
+- **User verification pending.** Run `web/scripts/verify-archive.mjs` (from #89) against the real archive with a read-only token. Re-run the ~812-conversation sync on 0.5.20 and report the popup text if it fails; the message now names the step. The size of `archive/index.json` on GitHub tells how close the archive is to the 40 MiB index limit.
+- **Earlier pending item.** The user still has to confirm the files of the six upgraded-workspace conversations.
+- **Next tasks**, in order:
+  1. After #83 merges, check that `extension-e2e` is green on `development`.
+  2. ROADMAP P0.2: work out which index fields can be rebuilt from Markdown and asset files (design and dry-run only); the verifier from #89 can check any rebuilt index.
+  3. Implement index v3 only if #86 is approved.
+  4. Audit finding 8: restrict `fetchAsset` to known Claude hosts, after collecting sanitized evidence of real URL shapes.
+
+## GitHub 502 on a large sync — 2026-11-03 (extension 0.5.20)
+
+**Problem.** A real ~812-conversation sync failed with `GitHub 502: Server Error`. Full analysis: `docs/investigations/2026-11-github-502-large-sync.md`.
+
+**Findings (confirmed from code).**
+- The bare message can only come from the final `sync()` phase (after Claude fetch and transfer); other phases wrap or swallow GitHub errors differently.
+- The exact failed request could not be established: 0.5.19 errors did not name the operation. Most likely candidate: the single POST `/git/trees` carrying every change (≥813 entries), which is size-dependent and would fail all 3 retries. Hypothesis, not proven.
+- No partial publication or data loss was possible: all objects stay unreferenced until the branch PATCH, and a failed PATCH is verified by reading the branch back.
+
+**Follow-up.** The index blob (all conversations' gzip search text in one request) is a second size-dependent 502 candidate and has a hard 40 MiB ceiling. Each sync now records `report.index_bytes`, warns from 20 MiB, and fails early with a message naming the index. Shrinking the index needs a format design (`docs/TECHNICAL_AUDIT.md` finding 1c).
+
+**Changes.** Chained tree batches of ≤100 entries (`createTreeInBatches`); read-back verification of the new tree before committing (`verifySyncTree`); 5-attempt jittered retry budget for idempotent requests; errors name the step and attempt count and state when nothing was published. Ref PATCH is still never retried; no multi-commit publication.
+
+**Tests.** `node --test extension/*.test.js` 195/195 pass (6 new tests, including index size: 812-conversation batching, transient and persistent 502 on each idempotent step with resume-without-duplicates, PATCH 502, tampered tree). `node e2e/extension-sync.e2e.cjs`: the updated outage checks pass (5 tree attempts, step named in the popup). The E2E later fails at "the sync is reported as finished with problems … #copyDiagnostics" — **this failure is pre-existing**: it fails identically on unmodified `development` (42065b9), apparently since the popup redesign. `cd web && npm test` 80/80 pass; `npm run build` succeeds.
+
+**User verification needed.** Re-run the large sync on 0.5.20; if it fails, report the popup text (now names the step).
+
+**Next task.** Fix the pre-existing E2E popup diagnostics failure (`#copyDiagnostics` never becomes visible after a partial sync), then the AUTOPILOT technical audit (`docs/TECHNICAL_AUDIT.md`).
+
 ## Cloud development integration — 2026-11-03
 
 - Updated `CLAUDE.md` and `AUTOPILOT.md` so Claude Code cloud sessions use `development` as the PR base and never target `master`.
