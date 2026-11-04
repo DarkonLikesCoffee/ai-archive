@@ -1303,19 +1303,26 @@
 
   // Incremental sync: ask the background which conversations are already
   // archived completely by the current exporter. Any failure (no settings,
-  // GitHub unavailable, an older background) means a full fetch, as before.
+  // GitHub unavailable, an older background) means a full fetch, as before;
+  // its reason is passed on so the sync outcome can say why nothing was
+  // skipped as unchanged.
   function getArchivedState() {
     return new Promise((resolve) => {
+      const failed = (reason) => resolve({ state: null, error: String(reason || 'unknown error').slice(0, 300) });
       try {
         chrome.runtime.sendMessage({ type: 'getArchiveState' }, (response) => {
-          if (chrome.runtime.lastError || !response?.ok || !Array.isArray(response.conversations)) {
-            resolve(null);
+          if (chrome.runtime.lastError) {
+            failed(chrome.runtime.lastError.message || 'the extension did not answer');
             return;
           }
-          resolve(new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])));
+          if (!response?.ok || !Array.isArray(response.conversations)) {
+            failed(response?.error || 'the extension returned no archive state');
+            return;
+          }
+          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), error: null });
         });
-      } catch {
-        resolve(null);
+      } catch (error) {
+        failed(error?.message || error);
       }
     });
   }
@@ -1499,7 +1506,9 @@
       // whose archived copy is complete and whose Claude update time has not
       // changed; they stay exactly as archived. An explicit "Latest N" sync always
       // re-downloads those N, which is how a user forces a refresh.
-      const archived = limit === 'all' ? await getArchivedState() : null;
+      const archivedState = limit === 'all' ? await getArchivedState() : null;
+      const archived = archivedState?.state || null;
+      const archiveStateError = archivedState?.error ? sanitizeError(archivedState.error) : null;
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
       if (automatic && !(archived && archived.size)) limit = String(AUTO_SYNC_LIMIT);
       const candidates = limit === 'all' ? listData : listData.slice(0, Number(limit));
@@ -1581,7 +1590,10 @@
         // Keep the content-script lock until the background sync has actually
         // finished; otherwise another startSync message can trigger a second fetch
         // while the first batch is still being committed to GitHub.
-        result = await transfer.finish({ skipped, unchangedIds, fullList: limit === 'all', listed: listData.length });
+        result = await transfer.finish({
+          skipped, unchangedIds, fullList: limit === 'all', listed: listData.length,
+          ...(archiveStateError ? { archiveStateError } : {}),
+        });
       } catch (e) {
         await transfer.abort();
         throw e;
