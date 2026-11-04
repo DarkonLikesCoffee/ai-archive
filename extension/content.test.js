@@ -3451,3 +3451,31 @@ test('serializes structured tool JSON deterministically without changing array o
   assert.ok(nestedStart >= 0 && firstKey > nestedStart && secondKey > firstKey,
     'nested object properties must be serialized in sorted order');
 });
+
+test('a sync whose only problem is a file over the upload limit still stores a diagnostic report', async () => {
+  // Over MAX_ARCHIVED_FILE_BYTES (40 MiB of JSON holds about 30 MiB of bytes).
+  const limit = Math.floor((40 * 1024 * 1024 - 64) / 4) * 3;
+  const assetUrl = 'https://files.example/recording.mp4';
+  const conversation = plainConversation('11111111-2222-4333-8444-555555555555');
+  conversation.chat_messages[0].files = [{ file_name: 'Private lecture recording.mp4', preview_url: assetUrl, mime_type: 'video/mp4' }];
+  const harness = createHarness(conversation, {
+    storage: {},
+    assetResponses: { [assetUrl]: { content: 'x'.repeat(limit + 1), contentType: 'video/mp4' } },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  const [asset] = handoff.conversations[0].assets;
+  assert.equal(asset.size, limit + 1, 'the oversized file reached the background as metadata only');
+  assert.equal(asset.base64, '', 'no bytes were transferred for it');
+
+  const stored = harness.storageState.last_sync_diagnostics;
+  assert.equal(stored.extension_version, '0.5.16', 'the report carries the running extension version');
+  assert.equal(stored.items.length, 1, 'the popup offers a report for this sync');
+  const [item] = stored.items;
+  assert.equal(item.outcome, 'incomplete');
+  assert.deepEqual(JSON.parse(JSON.stringify(item.problems)), [{
+    kind: 'attachment', reason: 'over the upload limit', message_id: 'u1', file_extension: 'mp4', size: limit + 1, limit,
+  }]);
+  assert.equal(JSON.stringify(stored).includes('Private lecture'), false, 'no file names in the report');
+  harness.finishFirstHandoff({ ok: true });
+});
