@@ -4,6 +4,20 @@ Date: 2026-11-03. Base: `development` at 42065b9 (extension 0.5.19, web 0.6.15),
 
 Scope: read-only review of `extension/background.js` (sync, GitHub, transfer), `extension/content.js` (Claude fetch, incremental sync, diagnostics), `extension/popup.js`, the web viewer's GitHub and attachment code, CI and tests. No private data was used. **Confirmed** means verified in code or with a test; **Hypothesis** means plausible and not yet reproduced.
 
+## Status (updated 2026-11-04)
+
+| Finding | Status |
+|---|---|
+| 1a/1b index size measured, warned and named in the error | Done in #82 (merged) |
+| 1c index v3 design | Proposed in #86; needs owner decision |
+| 2 failed large sync restarts from zero | Open design question for the owner |
+| 3 archive-state fallback reported | #85 |
+| 4 popup hides summary when a report exists | Product question, unchanged |
+| 5 diagnostics button | Done in #83 (merged) |
+| 6 browser E2E in CI | #87 (non-blocking job) |
+| 7 token storage guidance | #88 |
+| 8 `fetchAsset` host restriction | Open; needs sanitized evidence of real URL shapes |
+
 ## Ranked findings
 
 ### 1. P1 — `archive/index.json` has a hard size ceiling that would block every sync — Confirmed (limit), Hypothesis (when it is reached)
