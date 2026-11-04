@@ -2,6 +2,24 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Sync correctness and atomicity review — 2026-11-04 (extension 0.5.23, ROADMAP P0.3)
+
+- **Scope.** Every failure path from Claude discovery to the branch update, mapped to its user-visible outcome and covering test in `docs/design/sync-failure-modes.md`. The core invariant holds: nothing changes before the single non-force PATCH, and a failed PATCH is resolved by reading the branch back.
+- **Gaps confirmed** (a test was written first and failed for each):
+  1. **P0, data hidden.** With `archive/index.json` missing on a branch that already holds conversation files, a sync started a new index listing only the conversations it had synced, hiding all others from the viewer. Files were not deleted. Now `loadArchiveSnapshot` refuses when the tree has conversation Markdown but no index.
+  2. **Misleading outcome.** A branch update GitHub refused with 422 because the branch moved in between was reported as `PublicationUncertainError`. It is now a definite "Nothing was published; sync again", and is still never forced or retried.
+  3. **Wasted download.** Archive problems that block every sync (missing or corrupt index, truncated tree) are now flagged `blocksSync`. The Claude tab stops before downloading anything instead of fetching every conversation and failing at the end. Passing GitHub errors still fall back to a full fetch.
+- **Paths verified with new tests, no defect found:**
+  - a PATCH failure whose outcome cannot be read back (uncertain; never claims success or "nothing published");
+  - a truncated base tree (refused before upload);
+  - cancelling during tree or commit creation (nothing published; the retry succeeds).
+- **Test harness changes.** The fake base tree now includes `archive/index.json` when an index exists, as GitHub's would. The tampered-tree test hook now fires once, as originally intended.
+- **Tests.**
+  - `node --test extension/*.test.js`: 211/211.
+  - `cd web && npm test` and `npm run build` pass.
+  - `node e2e/extension-sync.e2e.cjs`: 48/48.
+- **Next task.** ROADMAP P1.2, diagnostics: make reports privacy-safe and useful, with categories source-unavailable, fetch-failed, transfer-failed, validation-failed and upload-refused, and add diagnostic items for attachments GitHub refuses (422).
+
 ## Skip repeated downloads of recorded oversized files — 2026-11-04 (extension 0.5.22, ROADMAP P1.3)
 
 - **Problem.** Confirmed on the real archive: 7 attachments over the limit, in 4 incomplete conversations, are downloaded in full (more than 210 MiB) on every sync, then left out.

@@ -68,6 +68,7 @@ function createHarness(conversation, {
   storage = null,
   archiveState = null,
   archiveOversized = [],
+  archiveStateResponse = null,
   handoffChunkChars = null,
   rejectChunkAt = -1,
   restartBackgroundAtChunk = -1,
@@ -121,7 +122,7 @@ function createHarness(conversation, {
           if (message.stage === 'cancelled') resolveCancelledProgress(message);
         }
         if (message.type === 'getArchiveState') {
-          callback?.(archiveState ? { ok: true, conversations: archiveState, oversized: archiveOversized } : { ok: false, error: 'not configured in test' });
+          callback?.(archiveStateResponse || (archiveState ? { ok: true, conversations: archiveState, oversized: archiveOversized } : { ok: false, error: 'not configured in test' }));
           return Promise.resolve();
         }
         if (TRANSFER_TYPES.has(message.type)) {
@@ -3551,4 +3552,18 @@ test('unknown size, changed file and misleading or ambiguous sizes always downlo
     assert.equal(asset.size, 'stand-in bytes'.length, `${name}: size comes from the bytes actually received`);
     assert.equal(handoff.oversizedDownloadsSkipped ?? 0, 0, name);
   }
+});
+
+test('an archive problem that blocks every sync stops the sync before any conversation is downloaded', async () => {
+  const conv = plainConversation(BIG_ID);
+  const message = 'archive/index.json is missing, but the archive already contains 3 conversation file(s). No archive changes were published.';
+  const harness = createHarness(conv, {
+    conversationListResponse: [{ uuid: BIG_ID, name: 'x', updated_at: '2026-10-20T08:00:00Z' }],
+    archiveStateResponse: { ok: false, error: message, blocksSync: true },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const progress = await harness.errorProgress;
+  assert.equal(progress.error, message);
+  assert.equal(harness.requests.some((url) => url.includes(`/chat_conversations/${BIG_ID}`)), false, 'no conversation was downloaded');
+  assert.equal(harness.handoffs.length, 0, 'nothing was handed to the background');
 });

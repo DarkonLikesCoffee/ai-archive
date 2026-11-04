@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Archive — Claude Sync",
-  "version": "0.5.22",
+  "version": "0.5.23",
   "description": "Sync Claude.ai conversations, active branches, tool calls, inline images, and portable files to a private GitHub repository used as your AI Archive.",
   "permissions": [
     "storage"

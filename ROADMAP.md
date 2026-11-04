@@ -36,10 +36,10 @@ Acceptance: a deliberately corrupted fixture produces precise findings; a clean 
 Acceptance: recovery behavior is documented, tested against historical format fixtures and cannot silently overwrite canonical content.
 
 ### P0.3 Sync correctness and atomicity review
-- [ ] Audit every failure path from Claude discovery through download, transfer, Git object creation and branch publication.
-- [ ] Verify incomplete exports cannot overwrite complete archived versions.
-- [ ] Verify cancellation, lost responses, concurrent branch changes and retry behavior.
-- [ ] Add regression tests for each confirmed gap.
+- [x] Audit every failure path from Claude discovery through download, transfer, Git object creation and branch publication. (`docs/design/sync-failure-modes.md`)
+- [x] Verify incomplete exports cannot overwrite complete archived versions.
+- [x] Verify cancellation, lost responses, concurrent branch changes and retry behavior.
+- [x] Add regression tests for each confirmed gap. (0.5.23: missing index on a non-empty archive refused; a branch update refused with 422 reported as not published; blocking archive problems stop the Claude tab before downloading)
 
 Acceptance: each failure mode has a test and documented user-visible outcome; no false-success state remains.
 

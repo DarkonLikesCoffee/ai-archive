@@ -943,6 +943,13 @@ function syncReportSummary(report) {
   return text;
 }
 
+// A problem with the archive itself that every sync would hit until it is
+// fixed. The Claude tab stops before downloading anything when the archive
+// state reports one (see getArchivedState in content.js).
+function archiveBlocked(message) {
+  return Object.assign(new Error(message), { blocksSync: true });
+}
+
 // Read the branch head, its full tree, and archive/index.json exactly as a
 // sync sees them. Shared by sync() and the incremental-sync archive state.
 async function loadArchiveIndex(ref) {
@@ -956,11 +963,11 @@ async function loadArchiveIndex(ref) {
     // limited sync would then publish an index containing only selected chats.
     if (typeof indexContent !== 'string' || (!indexContent && indexFile.sha)) {
       if (!indexFile.sha) {
-        throw new Error('GitHub returned no readable content or blob SHA for archive/index.json. No archive changes were published.');
+        throw archiveBlocked('GitHub returned no readable content or blob SHA for archive/index.json. No archive changes were published.');
       }
       const blob = await gh(`/git/blobs/${encodeURIComponent(indexFile.sha)}`);
       if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
-        throw new Error('GitHub could not return the full archive/index.json blob. No archive changes were published.');
+        throw archiveBlocked('GitHub could not return the full archive/index.json blob. No archive changes were published.');
       }
       indexContent = blob.content;
     }
@@ -972,10 +979,10 @@ async function loadArchiveIndex(ref) {
       // Never silently replace a corrupt index with a partial one. The index is
       // the web app's navigation/search catalogue; rebuilding it from a limited
       // sync could make every unselected conversation disappear from the UI.
-      throw new Error('archive/index.json is invalid JSON. Restore or repair it before syncing; no archive changes were published.');
+      throw archiveBlocked('archive/index.json is invalid JSON. Restore or repair it before syncing; no archive changes were published.');
     }
     if (!parsedIndex || !Array.isArray(parsedIndex.conversations)) {
-      throw new Error('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
+      throw archiveBlocked('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
     }
     index = parsedIndex;
   }
@@ -990,9 +997,20 @@ async function loadArchiveSnapshot() {
   let baseCommit = ref ? await gh(`/git/commits/${ref.object.sha}`) : null;
   let baseTree = baseCommit ? await gh(`/git/trees/${baseCommit.tree.sha}?recursive=1`) : null;
   if (baseTree?.truncated) {
-    throw new Error('The GitHub archive tree is too large to verify safely. No archive changes were published.');
+    throw archiveBlocked('The GitHub archive tree is too large to verify safely. No archive changes were published.');
   }
   let existingPaths = new Set((baseTree?.tree || []).map((item) => item.path));
+
+  // Without archive/index.json a sync starts a new index. On a branch that
+  // already holds conversations, that index would list only the conversations
+  // of this sync and hide every other one; refuse instead.
+  if (ref && !existingPaths.has('archive/index.json')) {
+    const conversationFiles = (baseTree?.tree || []).filter((item) => item?.type === 'blob'
+      && /^archive\/conversations\/.+\.md$/.test(String(item.path)) && !String(item.path).includes('/assets/')).length;
+    if (conversationFiles) {
+      throw archiveBlocked(`archive/index.json is missing, but the archive already contains ${conversationFiles} conversation file(s). A sync now would publish an index without them. Restore archive/index.json from the repository history (or rebuild it; see docs/design/index-rebuild.md) before syncing. No archive changes were published.`);
+    }
+  }
 
   const index = await loadArchiveIndex(ref);
   return { ref, branch, baseCommit, baseTree, existingPaths, index };
@@ -1524,6 +1542,12 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         return { total, changed: changedConversations, commit: commit.sha, skipped: skipped.length, ...outcome };
       }
 
+      // GitHub answered 422 ("Update is not a fast forward") and the branch now
+      // points elsewhere: the update was refused, so this commit is not on it.
+      if (publishError?.status === 422 && observedRef?.object?.sha && observedRef.object.sha !== commit.sha
+        && (!baseCommit || observedRef.object.sha !== baseCommit.sha)) {
+        throw new Error(`GitHub refused the branch update because the "${branch}" branch changed during this sync (${String(publishError.message || publishError).slice(0, 200)}). Nothing was published; sync again to include the latest archive.`);
+      }
       if (baseCommit && observedRef?.object?.sha === baseCommit.sha) {
         // The original head is still present, so the attempted update did not
         // become visible. Preserve the original error (including cancellation).
@@ -2001,7 +2025,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'getArchiveState') {
     archiveSyncState()
       .then(({ conversations, oversized }) => sendResponse({ ok: true, conversations, oversized }))
-      .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }));
+      .catch((e) => sendResponse({ ok: false, error: e?.message || String(e), ...(e?.blocksSync ? { blocksSync: true } : {}) }));
     return true;
   }
   if (msg.type === 'getSyncState') {
