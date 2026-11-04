@@ -28,9 +28,9 @@ A user should be able to export years of conversations from supported AI provide
 Acceptance: a deliberately corrupted fixture produces precise findings; a clean fixture produces zero errors; the tool never mutates the archive.
 
 ### P0.2 Index rebuild and archive recovery design
-- [ ] Determine whether all required index fields can be reconstructed from canonical Markdown and asset files.
-- [ ] Document fields that cannot be reconstructed and why.
-- [ ] Design a dry-run-first index rebuild with backup, validation and explicit apply step.
+- [x] Determine whether all required index fields can be reconstructed from canonical Markdown and asset files. (`docs/design/index-rebuild.md`; tested against real exporter output in `web/src/indexRebuild.test.js`)
+- [x] Document fields that cannot be reconstructed and why. (`exporter_version`, `format_version`, `incomplete[]` details; MIME type and preview/search text are approximate)
+- [x] Design a dry-run-first index rebuild with backup, validation and explicit apply step. (Dry run implemented: `verify-archive.mjs --rebuild-dry-run`; apply is designed only and awaits review)
 - [ ] Do not implement destructive repair until the design is reviewed and tested.
 
 Acceptance: recovery behavior is documented, tested against historical format fixtures and cannot silently overwrite canonical content.

@@ -179,7 +179,7 @@ It makes only GET requests to `api.github.com`, never repairs or deletes anythin
 GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> --markdown --hashes
 ```
 
-`--markdown` downloads conversation files to check their links. `--hashes` downloads every attachment to verify its bytes, which is slow for large archives. The exit status is 0 when there are no errors, 1 when errors were found, and 2 when the audit could not run.
+`--rebuild-dry-run` also rebuilds the index from the conversation files. It reports where that rebuild differs from the current index and what an apply would lose, and it writes nothing (see `docs/design/index-rebuild.md`). `--markdown` downloads conversation files to check their links. `--hashes` downloads every attachment to verify its bytes, which is slow for large archives. The exit status is 0 when there are no errors, 1 when errors were found, and 2 when the audit could not run.
 
 ## Repository layout
 
