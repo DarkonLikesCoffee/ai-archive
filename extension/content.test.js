@@ -2484,6 +2484,20 @@ test('falls back to a full fetch when the archive state is unavailable', async (
   const handoff = await harness.firstHandoff;
   assert.equal(handoff.conversations.length, 1);
   assert.equal(handoff.unchangedIds.length, 0);
+  assert.equal(handoff.archiveStateError, 'not configured in test', 'the reason for the full fetch reaches the background');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a readable archive state passes no fallback reason', async () => {
+  const conv = { uuid: 'only', name: 'Only', current_leaf_message_uuid: 'm', chat_messages: [{ uuid: 'm', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'x' }] }] };
+  const harness = createHarness(conv, {
+    conversationListResponse: [{ uuid: 'only', name: 'Only', updated_at: '2026-10-20T08:00:00Z' }],
+    archiveState: [],
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.equal(handoff.conversations.length, 1);
+  assert.equal(handoff.archiveStateError, null);
   harness.finishFirstHandoff({ ok: true });
 });
 
