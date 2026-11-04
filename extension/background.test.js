@@ -153,7 +153,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [] }) {
+function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [], extraTreePaths = [], baseTreeTruncated = false }) {
   const listeners = [];
   const createdTrees = new Map();
   const blobContents = new Map();
@@ -165,6 +165,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
   let injectedFailures = 0;
   let failOnceMatches = 0;
   let cancelTriggered = false;
+  let refReadsFail = false;
   let currentHeadSha = baseSha;
   let settingsReadCount = 0;
   let activeBlobRequests = 0;
@@ -211,7 +212,8 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       ]).filter(Boolean);
     } catch {}
     const missing = new Set(missingPaths);
-    return new Map([...new Set(indexedPaths)].filter((path) => !missing.has(path)).map((path) => [path, `existing-${path}`]));
+    return new Map([...new Set([...indexedPaths, ...extraTreePaths, ...(indexText == null ? [] : ['archive/index.json'])])]
+      .filter((path) => !missing.has(path)).map((path) => [path, `existing-${path}`]));
   }
 
   const fetch = async (url, options = {}) => {
@@ -236,6 +238,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       return response({ message: 'Not Found' }, 404);
     }
     if (pathname.endsWith('/git/ref/heads/master') && method === 'GET') {
+      if (refReadsFail) throw new TypeError('Failed to fetch');
       masterRefReads += 1;
       const sha = advanceBranchOnRecheck && masterRefReads > 1 ? concurrentSha : currentHeadSha;
       return response({ ref: 'refs/heads/master', object: { sha } });
@@ -244,7 +247,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       return response({ sha: baseSha, tree: { sha: 'base-tree' } });
     }
     if (pathname.endsWith('/git/trees/base-tree') && method === 'GET') {
-      return response({ sha: 'base-tree', tree: [...baseTreeItems()].map(([path, sha]) => ({ path, type: 'blob', mode: '100644', sha })) });
+      return response({ sha: 'base-tree', truncated: baseTreeTruncated, tree: [...baseTreeItems()].map(([path, sha]) => ({ path, type: 'blob', mode: '100644', sha })) });
     }
     if (method === 'GET' && pathname.includes('/git/trees/')) {
       const sha = decodeURIComponent(pathname.split('/git/trees/')[1]);
@@ -308,6 +311,15 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
         const error = new Error('The response was interrupted after GitHub accepted the update');
         error.name = 'AbortError';
         throw error;
+      }
+      if (patchOutcome === 'non-fast-forward') {
+        // Someone else moved the branch after the last check.
+        currentHeadSha = concurrentSha;
+        return response({ message: 'Update is not a fast forward' }, 422);
+      }
+      if (patchOutcome === 'error-then-unreadable') {
+        refReadsFail = true;
+        return response({ message: 'Server Error' }, 502);
       }
       if (patchOutcome === 'abort-before-apply') {
         const error = new Error('The request was aborted before GitHub applied the update');
@@ -2511,8 +2523,8 @@ test('a tree GitHub built differently from the planned changes is never committe
   const harness = makeBackgroundSyncHarness({
     indexText: emptyIndex(),
     treeTamper: (entries) => {
-      // Lose one Markdown file in the last batch, as a misapplied request would.
-      if (!entries.has('archive/index.json')) return;
+      // Lose one Markdown file once, as a misapplied request would.
+      if (dropped || !entries.has('archive/index.json')) return;
       dropped = [...entries.keys()].find((path) => path.endsWith('.md'));
       entries.delete(dropped);
     },
@@ -2561,4 +2573,81 @@ test('the archive state lists recorded oversized files for the current account o
   const state = await harness.hooks.archiveSyncState();
   assert.deepEqual(JSON.parse(JSON.stringify(state.oversized)), [{ id: 'c1', file_uuid: 'u1', size: limit + 1, sha256: 'a'.repeat(64) }]);
   assert.deepEqual(JSON.parse(JSON.stringify(state.conversations)), [], 'incomplete conversations are still never skipped');
+});
+
+// ---- P0.3 failure paths ----
+
+test('a branch update GitHub refused because the branch moved is reported as not published', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex(), patchOutcome: 'non-fast-forward' });
+  await assert.rejects(harness.sync(sampleConversation(), () => {}), (error) => {
+    assert.notEqual(error.name, 'PublicationUncertainError', 'a 422 rejection is a definite outcome');
+    assert.match(error.message, /^GitHub refused the branch update because the "master" branch changed during this sync \(GitHub 422: Update is not a fast forward.*\)\. Nothing was published; sync again to include the latest archive\.$/);
+    return true;
+  });
+  assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 1, 'never retried or forced');
+  assert.ok(harness.requests.every((request) => request.body?.force !== true), 'never forced');
+});
+
+test('a failed branch update whose outcome cannot be read back is reported as uncertain, never as success or failure', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex(), patchOutcome: 'error-then-unreadable' });
+  const progress = [];
+  await assert.rejects(harness.sync(sampleConversation(), (event) => progress.push(event)), (error) => {
+    assert.equal(error.name, 'PublicationUncertainError');
+    assert.match(error.message, /its outcome could not be verified\. Check the "master" branch on GitHub before retrying/);
+    assert.doesNotMatch(error.message, /Nothing was published/, 'the archive may have changed, so this must not be claimed');
+    return true;
+  });
+  assert.equal(progress.some((event) => event.stage === 'done'), false);
+});
+
+test('a base tree GitHub truncated is refused before anything is uploaded', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex(), baseTreeTruncated: true });
+  await assert.rejects(harness.sync(sampleConversation(), () => {}), /The GitHub archive tree is too large to verify safely\. No archive changes were published\./);
+  assert.equal(countRequests(harness, 'POST', '/git/blobs'), 0);
+  assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 0);
+});
+
+test('cancelling while the tree or the commit is built publishes nothing, and a retry succeeds', async () => {
+  for (const cancelAt of [{ method: 'POST', pathSuffix: '/git/trees' }, { method: 'POST', pathSuffix: '/git/commits' }]) {
+    const conversations = syntheticConversations(150);
+    const harness = makeBackgroundSyncHarness({ indexText: emptyIndex(), cancelAt });
+    await assert.rejects(harness.sync(conversations, () => {}), (error) => error.message === '__SYNC_CANCELLED__' || error.name === 'AbortError');
+    assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 0, `${cancelAt.pathSuffix}: never published`);
+    const retry = await harness.sync(conversations, () => {});
+    assert.equal(retry.commit, 'new-commit');
+    assertCompleteArchive(harness, conversations);
+  }
+});
+
+test('a missing index on a branch that already holds conversations is refused instead of starting a new index', async () => {
+  const harness = makeBackgroundSyncHarness({
+    indexText: null,
+    extraTreePaths: ['archive/conversations/claude/personal/Old--conv-old-1234.md'],
+  });
+  await assert.rejects(harness.sync(sampleConversation(), () => {}),
+    /^Error: archive\/index\.json is missing, but the archive already contains 1 conversation file\(s\)\. A sync now would publish an index without them\. Restore archive\/index\.json from the repository history \(or rebuild it; see docs\/design\/index-rebuild\.md\) before syncing\. No archive changes were published\.$/);
+  assert.equal(countRequests(harness, 'POST', '/git/blobs'), 0);
+  assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 0);
+  await assert.rejects(harness.archiveState(), /archive\/index\.json is missing/, 'incremental state refuses too');
+
+  // A branch with no conversations yet (for example only the initial commit) still starts a new index.
+  const fresh = makeBackgroundSyncHarness({ indexText: null, extraTreePaths: ['.ai-archive-init'] });
+  assert.equal((await fresh.sync(sampleConversation(), () => {})).commit, 'new-commit');
+});
+
+test('the archive state flags problems that block every sync, so the Claude tab can stop early', async () => {
+  const blocked = makeBackgroundSyncHarness({ indexText: null, extraTreePaths: ['archive/conversations/claude/personal/Old--conv-old-1234.md'] });
+  const response = await blocked.request({ type: 'getArchiveState' });
+  assert.equal(response.ok, false);
+  assert.equal(response.blocksSync, true);
+  assert.match(response.error, /archive\/index\.json is missing/);
+
+  const corrupt = makeBackgroundSyncHarness({ indexText: '{not json' });
+  assert.equal((await corrupt.request({ type: 'getArchiveState' })).blocksSync, true);
+
+  // A passing problem (GitHub unavailable) is not flagged: the sync still runs as a full fetch.
+  const transient = makeBackgroundSyncHarness({ indexText: emptyIndex(), failOnce: { method: 'GET', pathSuffix: '/git/trees/base-tree', status: 502, message: 'Server Error', times: Infinity } });
+  const unavailable = await transient.request({ type: 'getArchiveState' });
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.blocksSync, undefined);
 });

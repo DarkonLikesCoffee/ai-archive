@@ -1376,6 +1376,10 @@
             failed(chrome.runtime.lastError.message || 'the extension did not answer');
             return;
           }
+          if (response?.ok === false && response.blocksSync === true) {
+            resolve({ state: null, error: String(response.error || 'the archive cannot be synced').slice(0, 600), blocksSync: true });
+            return;
+          }
           if (!response?.ok || !Array.isArray(response.conversations)) {
             failed(response?.error || 'the extension returned no archive state');
             return;
@@ -1574,6 +1578,9 @@
       // changed; they stay exactly as archived. An explicit "Latest N" sync always
       // re-downloads those N, which is how a user forces a refresh.
       const archivedState = limit === 'all' ? await getArchivedState() : null;
+      // The archive itself must be fixed first (for example a missing index):
+      // every sync would fail, so do not download anything.
+      if (archivedState?.blocksSync) throw new Error(archivedState.error);
       const archived = archivedState?.state || null;
       knownOversizedFiles = archivedState?.oversized || null;
       skippedOversizedDownloads = 0;

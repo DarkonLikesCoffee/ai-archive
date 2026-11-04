@@ -1,5 +1,11 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.23 — sync failure review
+- If `archive/index.json` is missing while the archive already holds conversations, syncing is refused, naming the problem. Before, a sync started a new index that listed only the conversations it had just synced, hiding all the others. Restore the index from the repository history, or see `docs/design/index-rebuild.md`.
+- Archive problems that would make every sync fail (a missing or corrupt index, or a tree too large for GitHub to return in full) now stop a sync before anything is downloaded from Claude.
+- When GitHub refuses the final branch update because someone else updated the branch at the same moment, the sync now says plainly that nothing was published. Before, it reported an uncertain outcome.
+- Every failure path and its tested outcome: `docs/design/sync-failure-modes.md`.
+
 ## Extension v0.5.22 — no repeated downloads of recorded oversized files
 - A file the archive already recorded as over the upload limit is not downloaded again when Claude's response confirms its exact recorded size: a 200 with an exact `Content-Length`, no compression or range, and no conflicting declared size. The download is cancelled after the headers. The file keeps its earlier identity (SHA-256) and stays marked "Not archived", and the archive is unchanged. Any missing, compressed, ambiguous or different size means a normal download. The sync summary says how many downloads were skipped.
 
