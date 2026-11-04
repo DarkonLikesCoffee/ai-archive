@@ -67,6 +67,7 @@ function createHarness(conversation, {
   cancelOnFirstDigest = false,
   storage = null,
   archiveState = null,
+  archiveOversized = [],
   handoffChunkChars = null,
   rejectChunkAt = -1,
   restartBackgroundAtChunk = -1,
@@ -75,6 +76,8 @@ function createHarness(conversation, {
 } = {}) {
   const listeners = [];
   const requests = [];
+  const bodyReads = [];
+  const bodyCancels = [];
   const handoffs = [];
   const transferChunks = [];
   let background = loadReceivingBackground();
@@ -118,7 +121,7 @@ function createHarness(conversation, {
           if (message.stage === 'cancelled') resolveCancelledProgress(message);
         }
         if (message.type === 'getArchiveState') {
-          callback?.(archiveState ? { ok: true, conversations: archiveState } : { ok: false, error: 'not configured in test' });
+          callback?.(archiveState ? { ok: true, conversations: archiveState, oversized: archiveOversized } : { ok: false, error: 'not configured in test' });
           return Promise.resolve();
         }
         if (TRANSFER_TYPES.has(message.type)) {
@@ -173,12 +176,17 @@ function createHarness(conversation, {
       try {
         const delay = configured.delayMs ?? downloadDelayMs;
         if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        // Header names are case-insensitive; only configured headers exist.
+        const headers = Object.fromEntries(Object.entries({
+          'content-type': configured.contentType, ...(configured.headers || {}),
+        }).filter(([, value]) => value != null).map(([name, value]) => [name.toLowerCase(), String(value)]));
         return {
           ok: status >= 200 && status < 300,
           status,
           json: async () => ({}),
-          arrayBuffer: async () => bytes.slice().buffer,
-          headers: { get: () => configured.contentType || null },
+          arrayBuffer: async () => { bodyReads.push(requestUrl); return bytes.slice().buffer; },
+          body: { cancel: async () => { bodyCancels.push(requestUrl); } },
+          headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
         };
       } finally {
         activeDownloads -= 1;
@@ -289,6 +297,8 @@ function createHarness(conversation, {
   return {
     onMessage: listeners[0],
     requests,
+    bodyReads,
+    bodyCancels,
     transferChunks,
     storageState,
     handoffs,
@@ -3478,4 +3488,67 @@ test('a sync whose only problem is a file over the upload limit still stores a d
   }]);
   assert.equal(JSON.stringify(stored).includes('Private lecture'), false, 'no file names in the report');
   harness.finishFirstHandoff({ ok: true });
+});
+
+// ---- Oversized files already recorded in the archive (ROADMAP P1.3) ----
+const OVERSIZE_LIMIT = Math.floor((40 * 1024 * 1024 - 64) / 4) * 3;
+const RECORDED_SIZE = OVERSIZE_LIMIT + 1000;
+const RECORDED_SHA = 'ab'.repeat(32);
+const BIG_ID = '11111111-2222-4333-8444-555555555555';
+const BIG_URL = 'https://files.example/lecture.mp4';
+
+async function syncWithRecordedOversizedFile({ headers = {}, status = 200, file = {}, oversized, limit = 'all', archive = true } = {}) {
+  const conversation = plainConversation(BIG_ID);
+  conversation.chat_messages[0].files = [{ file_uuid: 'file-big', file_name: 'lecture.mp4', preview_url: BIG_URL, mime_type: 'video/mp4', ...file }];
+  const harness = createHarness(conversation, {
+    storage: {},
+    conversationListResponse: [{ uuid: BIG_ID, name: 'Big', updated_at: '2026-10-20T08:00:00Z' }],
+    archiveState: archive ? [] : null,
+    archiveOversized: oversized ?? [{ id: BIG_ID, file_uuid: 'file-big', size: RECORDED_SIZE, sha256: RECORDED_SHA }],
+    // A small stand-in body: a test that reads it gets a different identity.
+    assetResponses: { [BIG_URL]: { status, content: 'stand-in bytes', contentType: 'video/mp4', headers } },
+  });
+  harness.onMessage({ type: 'startSync', limit }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  harness.finishFirstHandoff({ ok: true });
+  return { harness, handoff, asset: handoff.conversations[0].assets[0] };
+}
+const standInSha = createHash('sha256').update('stand-in bytes').digest('hex');
+
+test('known size: a recorded oversized file whose exact size Claude confirms is not downloaded again', async () => {
+  const { harness, handoff, asset } = await syncWithRecordedOversizedFile({ headers: { 'Content-Length': String(RECORDED_SIZE) } });
+  assert.deepEqual(harness.bodyReads, [], 'the body was never read');
+  assert.deepEqual(harness.bodyCancels, [BIG_URL], 'the download was cancelled after the headers');
+  assert.equal(asset.size, RECORDED_SIZE);
+  assert.equal(asset.sha256, RECORDED_SHA, 'the identity of the earlier full download is kept');
+  assert.equal(asset.base64, '', 'no bytes: it is still left out of the archive');
+  assert.equal(asset.file_uuid, 'file-big');
+  assert.equal(handoff.oversizedDownloadsSkipped, 1);
+  const [item] = harness.storageState.last_sync_diagnostics.items;
+  assert.equal(item.problems[0].reason, 'over the upload limit', 'still reported as not archived');
+});
+
+test('unknown size, changed file and misleading or ambiguous sizes always download the file', async () => {
+  const cases = {
+    'no Content-Length': { headers: {} },
+    'a compressed response': { headers: { 'Content-Length': String(RECORDED_SIZE), 'Content-Encoding': 'gzip' } },
+    'a partial response': { status: 206, headers: { 'Content-Length': String(RECORDED_SIZE), 'Content-Range': `bytes 0-${RECORDED_SIZE - 1}/*` } },
+    'a range header on a 200': { headers: { 'Content-Length': String(RECORDED_SIZE), 'Content-Range': 'bytes 0-1/2' } },
+    'a non-numeric Content-Length': { headers: { 'Content-Length': `${RECORDED_SIZE}, ${RECORDED_SIZE}` } },
+    'a changed file (other size)': { headers: { 'Content-Length': String(RECORDED_SIZE + 1) } },
+    'a size now within the limit': { headers: { 'Content-Length': '1000' }, oversized: [{ id: BIG_ID, file_uuid: 'file-big', size: 1000, sha256: RECORDED_SHA }] },
+    'Claude declaring another size': { headers: { 'Content-Length': String(RECORDED_SIZE) }, file: { size_bytes: RECORDED_SIZE + 7 } },
+    'a record for another file': { headers: { 'Content-Length': String(RECORDED_SIZE) }, oversized: [{ id: BIG_ID, file_uuid: 'other-file', size: RECORDED_SIZE, sha256: RECORDED_SHA }] },
+    'a record of another conversation': { headers: { 'Content-Length': String(RECORDED_SIZE) }, oversized: [{ id: 'other-conversation', file_uuid: 'file-big', size: RECORDED_SIZE, sha256: RECORDED_SHA }] },
+    'a malformed record': { headers: { 'Content-Length': String(RECORDED_SIZE) }, oversized: [{ id: BIG_ID, file_uuid: 'file-big', size: RECORDED_SIZE, sha256: 'not-a-hash' }] },
+    'a Latest N sync (no archive state)': { headers: { 'Content-Length': String(RECORDED_SIZE) }, limit: '10' },
+    'an unreadable archive state': { headers: { 'Content-Length': String(RECORDED_SIZE) }, archive: false },
+  };
+  for (const [name, options] of Object.entries(cases)) {
+    const { harness, handoff, asset } = await syncWithRecordedOversizedFile(options);
+    assert.deepEqual(harness.bodyReads, [BIG_URL], `${name}: downloaded`);
+    assert.equal(asset.sha256, standInSha, `${name}: identity comes from the bytes actually received`);
+    assert.equal(asset.size, 'stand-in bytes'.length, `${name}: size comes from the bytes actually received`);
+    assert.equal(handoff.oversizedDownloadsSkipped ?? 0, 0, name);
+  }
 });
