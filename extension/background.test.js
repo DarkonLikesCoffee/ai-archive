@@ -333,7 +333,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
   vm.runInNewContext(`${fastSource}
 globalThis.__testHooks = {
   sync, assetPath, normalizeAssetList, conversationMarkdown,
-  conversationPath, indexEntry, sha256, archiveState, archiveAccounts, broadcast,
+  conversationPath, indexEntry, sha256, archiveState, archiveSyncState, archiveAccounts, broadcast,
   createBlob, gitHubError, syncCommitMessage, base64RequestBytes, formatBytes,
   MAX_BLOB_REQUEST_BYTES, MAX_ARCHIVED_FILE_BYTES, BlobTooLargeError,
 };
@@ -2547,4 +2547,18 @@ test('the index size is recorded, warned about near the request limit, and an ov
     /^Error: The archive index \(archive\/index\.json\) would be [\d.]+ KiB, more than the [\d.]+ KiB GitHub's API accepts in one request\. No archive changes were published\./);
   assert.equal(countRequests(blocked, 'POST', '/git/blobs'), 0, 'nothing is uploaded for a sync that cannot be published');
   assert.equal(countRequests(blocked, 'PATCH', '/git/refs/heads/master'), 0);
+});
+
+test('the archive state lists recorded oversized files for the current account only', async () => {
+  const limit = makeBackgroundSyncHarness({ indexText: emptyIndex() }).hooks.MAX_ARCHIVED_FILE_BYTES;
+  const item = (extra) => ({ kind: 'attachment', name: 'f', reason: 'r', too_large: true, file_uuid: 'u1', sha256: 'a'.repeat(64), size: limit + 1, ...extra });
+  const entry = (id, account, incomplete) => ({ id, provider: 'claude', account, path: `archive/conversations/claude/${account}/${id}.md`, assets: [], incomplete, exporter_version: 1, updated_at: '2026-10-01T00:00:00Z' });
+  const index = { version: 2, conversations: [
+    entry('c1', 'personal', [item(), item({ file_uuid: 'u2', github_rejected: true, size: 4 * 1024 * 1024 }), item({ file_uuid: 'u3', sha256: 'bad' }), item({ file_uuid: undefined }), item({ file_uuid: 'u4', size: limit })]),
+    entry('c2', 'work', [item()]),
+  ] };
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify(index) });
+  const state = await harness.hooks.archiveSyncState();
+  assert.deepEqual(JSON.parse(JSON.stringify(state.oversized)), [{ id: 'c1', file_uuid: 'u1', size: limit + 1, sha256: 'a'.repeat(64) }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(state.conversations)), [], 'incomplete conversations are still never skipped');
 });

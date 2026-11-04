@@ -500,6 +500,11 @@ function handleClaude(url) {
         github.commitCount() === commitsBeforeRepeat
         && github.blobPostSizesSince(requestsBeforeRepeat).every((chars) => chars < TEST_FILE_CAP_MIB * 1024 * 1024),
         `commits ${commitsBeforeRepeat}→${github.commitCount()}`);
+      // Claude's response states the exact size the archive recorded, so the
+      // repeat sync cancels the download after the headers and still produces
+      // byte-identical Markdown and index (hence no commit above).
+      check('a repeat sync does not download the recorded oversized file again',
+        /1 attachment over the upload limit was not downloaded again/.test(lastMessage), lastMessage.slice(0, 400));
     }
 
     // The shape of the conversation that failed on a real account with

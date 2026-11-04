@@ -2,6 +2,11 @@
   const ASSET_DOWNLOAD_CONCURRENCY = 3;
   let currentAbortController = null;
   let syncing = false;
+  // Oversized files the archive already recorded (conversation ID -> file
+  // UUID -> { size, sha256 }), from the archive state of an "all" sync, and the
+  // downloads of them that this sync skipped. See fetchAsset.
+  let knownOversizedFiles = null;
+  let skippedOversizedDownloads = 0;
 
   async function getOrg(signal) {
     const r = await fetch('/api/organizations', { credentials: 'include', signal });
@@ -584,7 +589,33 @@
     return buffer.byteLength > MAX_ARCHIVED_FILE_BYTES ? '' : bytesToBase64(buffer);
   }
 
-  async function fetchAsset(url, name, mime, signal) {
+  // The archive's record of an oversized file of this conversation, by the
+  // file's Claude UUID, or null.
+  function knownOversizedFile(conversationId, fileUuid) {
+    if (!knownOversizedFiles || !conversationId || !fileUuid) return null;
+    return knownOversizedFiles.get(String(conversationId))?.get(String(fileUuid)) || null;
+  }
+
+  // A file the archive already recorded as over the upload limit (its UUID,
+  // exact size and SHA-256, from an earlier full download) is not downloaded
+  // again only when this response proves it is still exactly that size before
+  // its body is read: HTTP 200, no content or transfer coding that would make
+  // Content-Length differ from the file size, no range, an exact decimal
+  // Content-Length equal to the recorded size, and no other size Claude
+  // declares that disagrees. Anything missing or ambiguous means a normal
+  // download. The file is still left out of the archive either way.
+  function canSkipOversizedDownload(response, known, declaredSize) {
+    if (!known || response.status !== 200) return false;
+    const header = (name) => response.headers?.get?.(name) ?? null;
+    const encoding = String(header('content-encoding') ?? 'identity').trim().toLowerCase();
+    if (encoding !== 'identity' || header('content-range') != null) return false;
+    const length = String(header('content-length') ?? '').trim();
+    if (!/^\d{1,16}$/.test(length) || Number(length) !== known.size) return false;
+    if (declaredSize != null && Number(declaredSize) !== known.size) return false;
+    return known.size > MAX_ARCHIVED_FILE_BYTES;
+  }
+
+  async function fetchAsset(url, name, mime, signal, { known = null, declaredSize = null } = {}) {
     const label = safeAssetName(name);
     if (!url) {
       throw new Error(`Cannot download attachment "${label}": no download URL was provided.`);
@@ -592,6 +623,19 @@
     try {
       const r = await fetch(url, { credentials: 'include', signal });
       if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
+      if (canSkipOversizedDownload(r, known, declaredSize)) {
+        try { await r.body?.cancel?.(); } catch {}
+        skippedOversizedDownloads += 1;
+        // The same identity as the earlier full download, still with no bytes:
+        // it is noted as not archived exactly as before.
+        return {
+          name: label,
+          mime: mime || r.headers.get('content-type') || 'application/octet-stream',
+          base64: '',
+          size: known.size,
+          sha256: known.sha256,
+        };
+      }
       const buffer = await r.arrayBuffer();
       if (!buffer.byteLength) throw new Error('the download returned an empty file');
       return {
@@ -612,6 +656,14 @@
   // archived" note (and the conversation marked incomplete) instead of
   // keeping the whole conversation out of the archive. Any other failure
   // (network, 5xx, 403, 429) skips the conversation so a later sync retries it.
+  // A size Claude states for a file (several key names are seen), or null.
+  function declaredFileSize(file) {
+    for (const key of ['size_bytes', 'file_size', 'size']) {
+      if (Number.isSafeInteger(file?.[key]) && file[key] >= 0) return file[key];
+    }
+    return null;
+  }
+
   const UNAVAILABLE_STATUSES = new Set([404, 410]);
   const isUnavailable = (error) => UNAVAILABLE_STATUSES.has(error?.status);
 
@@ -813,7 +865,10 @@
       ASSET_DOWNLOAD_CONCURRENCY,
       async ({ message, file, url, name, messageExternalIds, messageReferences }) => {
         try {
-          const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal);
+          const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal, {
+            known: knownOversizedFile(conversationId, file.file_uuid || file.uuid),
+            declaredSize: declaredFileSize(file),
+          });
           return { asset, message, file, messageExternalIds, messageReferences };
         } catch (e) {
           if (!isUnavailable(e)) throw e;
@@ -1101,7 +1156,10 @@
 
         const url = `/api/organizations/${encodeURIComponent(org)}/files/${encodeURIComponent(fileApiId)}/contents`;
         try {
-          downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal);
+          downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal, {
+            known: knownOversizedFile(conversationId, fileApiId),
+            declaredSize: declaredFileSize(file),
+          });
           const linked = {
             ...downloaded,
             source: 'message',
@@ -1133,7 +1191,10 @@
         for (const candidate of downloaded ? [] : sandboxPathForms(file.path)) {
           const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(candidate)}`;
           try {
-            downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || null, signal);
+            downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || null, signal, {
+              known: knownOversizedFile(conversationId, fileId),
+              declaredSize: declaredFileSize(file),
+            });
             attempts.push({ via: 'sandbox-path', form: candidate.startsWith('/') ? 'absolute' : 'relative', status: 200 });
             byPathCache.set(filePath, downloaded);
             break;
@@ -1319,7 +1380,13 @@
             failed(response?.error || 'the extension returned no archive state');
             return;
           }
-          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), error: null });
+          const oversized = new Map();
+          for (const item of Array.isArray(response.oversized) ? response.oversized : []) {
+            if (!item || !/^[0-9a-f]{64}$/.test(String(item.sha256)) || !Number.isSafeInteger(item.size) || !item.id || !item.file_uuid) continue;
+            if (!oversized.has(String(item.id))) oversized.set(String(item.id), new Map());
+            oversized.get(String(item.id)).set(String(item.file_uuid), { size: item.size, sha256: String(item.sha256) });
+          }
+          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, error: null });
         });
       } catch (error) {
         failed(error?.message || error);
@@ -1508,6 +1575,8 @@
       // re-downloads those N, which is how a user forces a refresh.
       const archivedState = limit === 'all' ? await getArchivedState() : null;
       const archived = archivedState?.state || null;
+      knownOversizedFiles = archivedState?.oversized || null;
+      skippedOversizedDownloads = 0;
       const archiveStateError = archivedState?.error ? sanitizeError(archivedState.error) : null;
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
       if (automatic && !(archived && archived.size)) limit = String(AUTO_SYNC_LIMIT);
@@ -1609,6 +1678,7 @@
         result = await transfer.finish({
           skipped, unchangedIds, fullList: limit === 'all', listed: listData.length,
           ...(archiveStateError ? { archiveStateError } : {}),
+          ...(skippedOversizedDownloads ? { oversizedDownloadsSkipped: skippedOversizedDownloads } : {}),
         });
       } catch (e) {
         await transfer.abort();
@@ -1623,6 +1693,7 @@
     } finally {
       syncing = false;
       currentAbortController = null;
+      knownOversizedFiles = null;
     }
   }
 

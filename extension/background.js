@@ -920,6 +920,9 @@ function syncReportSummary(report) {
   let text = '';
   if (report.listed != null) text += ` Claude listed ${plural(report.listed, 'conversation', 'conversations')}.`;
   if (report.unchanged) text += ` ${plural(report.unchanged, 'unchanged conversation was', 'unchanged conversations were')} not downloaded again.`;
+  if (report.oversizedDownloadsSkipped) {
+    text += ` ${plural(report.oversizedDownloadsSkipped, 'attachment over the upload limit was', 'attachments over the upload limit were')} not downloaded again: Claude reported the exact size already recorded in the archive.`;
+  }
   if (report.archiveStateError) {
     text += report.fullList
       ? ` The archive state could not be read (${report.archiveStateError}), so every conversation was downloaded again instead of skipping unchanged ones.`
@@ -1066,25 +1069,44 @@ async function archiveAccounts() {
 }
 
 async function archiveState() {
+  return (await archiveSyncState()).conversations;
+}
+
+// The archive state for an incremental sync: the conversations that may be
+// skipped (see archiveState), and the oversized files this account's archive
+// recorded with the identity of an earlier full download, so the Claude tab
+// can avoid downloading them again (see canSkipOversizedDownload in content.js).
+async function archiveSyncState() {
   if (!syncRunning) cancelRequested = false;
   const s = await settings();
   if (!s.github_owner || !s.github_repo || !s.github_token) throw Error('Configure GitHub settings in the extension popup first.');
   const account = s.archive_account?.trim() || 'personal';
   const { index, existingPaths } = await loadArchiveSnapshot();
-  return index.conversations
+  const oversized = [];
+  for (const entry of index.conversations) {
+    if (entry?.provider !== 'claude' || entry.account !== account || entry.id == null) continue;
+    for (const item of Array.isArray(entry.incomplete) ? entry.incomplete : []) {
+      if (item?.too_large !== true || item.github_rejected === true || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
+      if (!/^[0-9a-f]{64}$/.test(String(item.sha256)) || !Number.isSafeInteger(item.size) || item.size <= MAX_ARCHIVED_FILE_BYTES) continue;
+      oversized.push({ id: String(entry.id), file_uuid: item.file_uuid, size: item.size, sha256: item.sha256 });
+    }
+  }
+  const conversations = index.conversations
     .filter((entry) => entry?.provider === 'claude' && entry.account === account
       && entry.exporter_version === EXPORTER_VERSION && entry.updated_at
       && !(Array.isArray(entry.incomplete) && entry.incomplete.length)
       && [entry.path, ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : [])]
         .every((path) => path && existingPaths.has(path)))
     .map((entry) => ({ id: entry.id, updated_at: entry.updated_at }));
+  return { conversations, oversized };
 }
 
-async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null } = {}) {
+async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null, oversizedDownloadsSkipped = 0 } = {}) {
   const unchanged = Array.isArray(unchangedIds) ? unchangedIds.map(String) : [];
   const failedItems = Array.isArray(skipped) ? skipped : [];
   const report = {
     listed: fullList && Number.isFinite(listed) ? listed : null,
+    ...(Number.isSafeInteger(oversizedDownloadsSkipped) && oversizedDownloadsSkipped > 0 ? { oversizedDownloadsSkipped } : {}),
     ...(typeof archiveStateError === 'string' && archiveStateError ? { archiveStateError: archiveStateError.slice(0, 300), fullList } : {}),
     committed: [],
     unchanged: unchanged.length,
@@ -1941,6 +1963,7 @@ function completeTransfer(msg) {
     fullList: metadata.fullList === true,
     listed: Number.isFinite(metadata.listed) ? metadata.listed : null,
     archiveStateError: typeof metadata.archiveStateError === 'string' ? metadata.archiveStateError.slice(0, 300) : null,
+    oversizedDownloadsSkipped: Number.isSafeInteger(metadata.oversizedDownloadsSkipped) && metadata.oversizedDownloadsSkipped > 0 ? metadata.oversizedDownloadsSkipped : 0,
     conversations: transfer.conversations,
   };
 }
@@ -1976,8 +1999,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type === 'getArchiveState') {
-    archiveState()
-      .then((conversations) => sendResponse({ ok: true, conversations }))
+    archiveSyncState()
+      .then(({ conversations, oversized }) => sendResponse({ ok: true, conversations, oversized }))
       .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }));
     return true;
   }
@@ -2072,6 +2095,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       unchangedIds: Array.isArray(payload.unchangedIds) ? payload.unchangedIds : [],
       listed: Number.isFinite(payload.listed) ? payload.listed : null,
       archiveStateError: typeof payload.archiveStateError === 'string' ? payload.archiveStateError : null,
+      oversizedDownloadsSkipped: Number.isSafeInteger(payload.oversizedDownloadsSkipped) ? payload.oversizedDownloadsSkipped : 0,
     })
       .finally(() => {
         if (runningTransferId === msg.transferId) runningTransferId = null;

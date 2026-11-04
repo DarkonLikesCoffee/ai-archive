@@ -2,6 +2,25 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Skip repeated downloads of recorded oversized files — 2026-11-04 (extension 0.5.22, ROADMAP P1.3)
+
+- **Problem.** Confirmed on the real archive: 7 attachments over the limit, in 4 incomplete conversations, are downloaded in full (more than 210 MiB) on every sync, then left out.
+- **Analysis** (`docs/design/oversized-downloads.md`):
+  - HTTP headers can establish a file's *size* before its body is read, but only for a strict 200 with an exact decimal `Content-Length`, no content coding and no range.
+  - They cannot establish its *identity*. The SHA-256 drives deduplication, message matching and asset path collisions, and it is recorded in the index.
+  - Four approaches compared: A, skip by `Content-Length` alone (loses identity); B, skip only a file the archive already recorded, when its exact size is confirmed; C, skip such conversations (changes invariant 9); D, stream-hash (saves no bandwidth).
+- **Implemented B.**
+  - The background's `getArchiveState` also returns the recorded oversized files: file UUID, size and SHA-256, excluding GitHub-refused files.
+  - `canSkipOversizedDownload` / `fetchAsset` in `content.js` cancel the body only when every condition holds. The skipped asset carries the recorded identity and no bytes, so it is still not archived, and the Markdown and index are byte-identical.
+  - Any missing, compressed, ambiguous, changed or conflicting size downloads as before. Retry behaviour is unchanged: the conversation is still re-fetched every sync.
+- **Tests.**
+  - `node --test extension/*.test.js`: 204/204, including a test of which recorded files the archive state lists. New: the known-size case, and 13 must-download cases (unknown size, changed file, misleading or ambiguous sizes, mismatched records, no archive state).
+  - Harness change: mocked downloads now answer per header name and record body reads and cancels.
+  - `node e2e/extension-sync.e2e.cjs`: 48/48. The repeat sync of a 31 MiB file skips the download and makes no commit.
+- **Live verification pending.** Do Claude's real download endpoints send `Content-Length` without compression? If not, behaviour is as before. After a 0.5.22 sync, the summary should say "7 attachments over the upload limit were not downloaded again".
+- **Residual risk (documented).** If Claude ever served different bytes of exactly the same size under the same file UUID, the recorded SHA-256 of that not-archived file would be stale. No archived bytes are affected.
+- **Next task.** ROADMAP P0.3, the sync correctness and atomicity review.
+
 ## Oversized attachments after the real 0.5.20 sync — 2026-11-04 (extension 0.5.21)
 
 **User report.** The real sync on 0.5.20 succeeded with no 502.
