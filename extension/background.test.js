@@ -1793,7 +1793,7 @@ test('an attachment over the API upload limit is left out with a note instead of
   assert.deepEqual(index.conversations[0].assets.map((a) => a.name), ['notes.txt'], 'the index lists only archived files');
   // The conversation is marked incomplete, so it is reported and checked again.
   assert.equal(result.partial, true);
-  assert.deepEqual([...result.report.incomplete[0].missing], ['screen recording.mov (150.0 MiB, too large to upload to GitHub)']);
+  assert.deepEqual([...result.report.incomplete[0].missing], ["screen recording.mov (150.0 MiB, over AI Archive's 30.0 MiB upload limit)"]);
   assert.equal(index.conversations[0].incomplete[0].name, 'screen recording.mov');
   assert.equal(index.conversations[0].incomplete[0].too_large, true);
 });
@@ -2181,6 +2181,44 @@ test('an attachment within the limit is archived, and one over it is noted witho
   assert.equal(result.partial, true);
 });
 
+test('an oversized file is recorded in the index and Markdown, and a repeat sync neither uploads it nor commits again', async () => {
+  const first = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const limit = first.hooks.MAX_ARCHIVED_FILE_BYTES;
+  const fits = fileAsset('slides.pdf', 'pdf bytes');
+  const tooBig = { ...fileAsset('recording.mov', 'stand-in bytes'), size: limit + 1, base64: '' };
+  const conversation = () => conversationWith('c1', [fits, tooBig]);
+  const result = await first.sync([conversation()], () => {});
+  assert.equal(result.partial, true);
+
+  const index = indexOf(first);
+  const [entry] = index.conversations;
+  assert.deepEqual(entry.assets.map((asset) => asset.name), ['slides.pdf'], 'only archived files are listed as assets');
+  assert.deepEqual(JSON.parse(JSON.stringify(entry.incomplete)), [{
+    kind: 'attachment', name: 'recording.mov', message_external_id: 'c1-m1',
+    reason: `30.0 MiB; larger than the 30.0 MiB AI Archive can upload through GitHub's API`,
+    too_large: true, sha256: tooBig.sha256, size: limit + 1,
+  }], 'the index keeps the name, size and SHA-256 of the file it could not archive');
+  assert.match(markdownOf(first, 'Conversation c1'), /\*\*Not archived: recording\.mov\*\* \(30\.0 MiB; /);
+  assert.match(result.report.incomplete[0].missing[0], /^recording\.mov \(31,457,233 bytes, over AI Archive's 31,457,232-byte upload limit\)$/,
+    'the report does not call a file one byte over the limit "30.0 MiB, larger than 30.0 MiB"');
+
+  // The same export again, against the archive the first sync produced.
+  const repeat = makeBackgroundSyncHarness({ indexText: JSON.stringify(index) });
+  const again = await repeat.sync([conversation()], () => {});
+  assert.equal(again.commit, null, 'nothing changed, so nothing is committed');
+  assert.equal(blobPostsOf(repeat).length, 0, 'the oversized file (and everything else) is not uploaded again');
+  assert.equal(again.report.incomplete.length, 1, 'it is still reported as incomplete');
+});
+
+test('the report names the upload limit for oversized files and GitHub for refused ones', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const limit = harness.hooks.MAX_ARCHIVED_FILE_BYTES;
+  const big = { ...fileAsset('big.zip', 'x'), size: 40 * 1024 * 1024, base64: '' };
+  const result = await harness.sync([conversationWith('c1', [big])], () => {});
+  assert.deepEqual(JSON.parse(JSON.stringify(result.report.incomplete[0].missing)), [`big.zip (40.0 MiB, over AI Archive's 30.0 MiB upload limit)`]);
+  assert.ok(limit < 30 * 1024 * 1024, 'the limit is just under 30 MiB');
+});
+
 test('GitHub\'s 422 "input was too large" leaves that attachment out, keeps the others, and still publishes', async () => {
   const harness = makeBackgroundSyncHarness({
     indexText: emptyIndex(),
@@ -2213,7 +2251,7 @@ test('GitHub\'s 422 "input was too large" leaves that attachment out, keeps the 
   assert.equal(entry.incomplete[0].size, refused.size);
   assert.equal(result.partial, true);
   assert.deepEqual([...result.report.incomplete.map((item) => item.id)], ['c1']);
-  assert.deepEqual([...result.report.incomplete[0].missing], ['T_RICKS_Menu___Slider.html (1.1 MiB, too large to upload to GitHub)']);
+  assert.deepEqual([...result.report.incomplete[0].missing], ['T_RICKS_Menu___Slider.html (1.1 MiB, refused by GitHub as too large to process)']);
 });
 
 test('a different 422 is a real error: it names the attachment and its size, and nothing is published', async () => {
@@ -2299,7 +2337,7 @@ test('a refused attachment received through the streaming transfer is noted, and
   assert.equal(result.partial, true);
   assert.match(markdownOf(harness, 'Streamed'), /\*\*Not archived: T\\_RICKS\\_Menu\\_\\_\\_Slider\.html\*\* \(146\.5 KiB; GitHub rejected the upload as too large to process \(HTTP 422/);
   assert.match(markdownOf(harness, 'Streamed'), /\[ok\.txt\]/);
-  assert.match(harness.storedValues().last_sync.message, /^Sync finished with problems: 1 conversation changed in 1 GitHub commit\..*archived with files missing .*T_RICKS_Menu___Slider\.html \(146\.5 KiB, too large to upload to GitHub\)/);
+  assert.match(harness.storedValues().last_sync.message, /^Sync finished with problems: 1 conversation changed in 1 GitHub commit\..*archived with files missing .*T_RICKS_Menu___Slider\.html \(146\.5 KiB, refused by GitHub as too large to process\)/);
 });
 
 test('the commit message counts changed conversations, not files, deletions or assets', async () => {

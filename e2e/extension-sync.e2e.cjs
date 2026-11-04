@@ -463,8 +463,8 @@ function handleClaude(url) {
     check('large attachments are archived byte for byte',
       bigPaths.length === 3 && bigPaths.every((file) => BIG_FILES.some((bytes) => files[file].equals(bytes))), bigPaths.join(', '));
 
-    // An attachment over the size cap (GitHub rejects files over 100 MiB; 30 MiB
-    // in this test copy) is left out with a note, and the sync still publishes.
+    // An attachment over AI Archive's ~30 MiB upload limit (40 MiB of base64
+    // JSON per blob request) is left out with a note, and the sync still publishes.
     {
       const hugeIndex = BIG_FILES.length;
       BIG_FILES.push(crypto.randomBytes((TEST_FILE_CAP_MIB + 1) * 1024 * 1024));
@@ -478,9 +478,28 @@ function handleClaude(url) {
       const hugeMarkdown = Object.entries(files).find(([file, content]) => file.endsWith('.md') && content.toString().includes('Here is the recording'));
       check('an attachment over the API upload limit is left out with a note, and the sync publishes',
         github.commitCount() === commitsBeforeHuge + 1 && /1 conversation changed/.test(lastMessage)
-        && /archived with files missing .*big-\d+\.bin \(31\.0 MiB, too large to upload to GitHub\)/.test(lastMessage)
+        && /archived with files missing .*big-\d+\.bin \(31\.0 MiB, over AI Archive's 30\.0 MiB upload limit\)/.test(lastMessage)
         && hugeMarkdown && /\*\*Not archived: big-\d+\.bin\*\* \(31\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/.test(hugeMarkdown[1].toString())
         && !Object.keys(files).some((file) => file.endsWith(`big-${hugeIndex}.bin`)), lastMessage);
+
+      // The oversized file is the sync's only problem: the popup still offers
+      // the diagnostic report (it was missing in 0.5.20 on a real account).
+      const diagnosticsShown = await popup.locator('#copyDiagnostics:not(.hidden)').count();
+      await popup.evaluate(() => { window.__copied = null; navigator.clipboard.writeText = async (text) => { window.__copied = text; }; });
+      if (diagnosticsShown) await popup.click('#copyDiagnostics');
+      const copiedHuge = diagnosticsShown ? await popup.evaluate(() => window.__copied) : '';
+      check('a sync whose only problem is an oversized file offers the diagnostic report',
+        diagnosticsShown === 1 && /"reason": "over the upload limit"/.test(copiedHuge) && !copiedHuge.includes(`big-${hugeIndex}`), `${copiedHuge.length} characters`);
+
+      // Syncing again retries the incomplete conversation but never uploads the
+      // oversized bytes, and publishes nothing when nothing changed.
+      const commitsBeforeRepeat = github.commitCount();
+      const requestsBeforeRepeat = github.requests.length;
+      await syncAll();
+      check('a repeat sync does not upload the oversized file or commit again',
+        github.commitCount() === commitsBeforeRepeat
+        && github.blobPostSizesSince(requestsBeforeRepeat).every((chars) => chars < TEST_FILE_CAP_MIB * 1024 * 1024),
+        `commits ${commitsBeforeRepeat}→${github.commitCount()}`);
     }
 
     // The shape of the conversation that failed on a real account with
@@ -569,7 +588,7 @@ function handleClaude(url) {
         Object.entries(files).some(([file, content]) => file.endsWith(`big-${first + 1}.bin`) && content.equals(keptBytes))
           && Object.entries(files).some(([file, content]) => file.endsWith(`big-${first + 2}.bin`) && content.equals(otherBytes)));
       const refusedReport = JSON.stringify(await reportItems());
-      check('the popup names the refused file and its size', new RegExp(`big-${first}\\.bin \\(4\\.0 MiB, too large to upload to GitHub\\)`).test(refusedReport), refusedReport.slice(0, 400));
+      check('the popup names the refused file and its size', new RegExp(`big-${first}\\.bin \\(4\\.0 MiB, refused by GitHub as too large to process\\)`).test(refusedReport), refusedReport.slice(0, 400));
       check('the commit message counts conversations, not files', github.headMessage() === 'Sync 2 AI conversations (2 assets)', github.headMessage());
 
       // The next sync does not send the refused bytes to GitHub again.
@@ -577,7 +596,7 @@ function handleClaude(url) {
       last = await syncAll();
       check('bytes GitHub refused are not uploaded again by the next sync',
         github.blobPostSizesSince(before).every((size) => size <= 3 * 1024 * 1024), github.blobPostSizesSince(before).join(','));
-      check('the conversation stays marked incomplete with the reason', /archived with files missing .*\(4\.0 MiB, too large to upload to GitHub\)/.test(lastMessage), lastMessage.slice(0, 400));
+      check('the conversation stays marked incomplete with the reason', /archived with files missing .*\(4\.0 MiB, refused by GitHub as too large to process\)/.test(lastMessage), lastMessage.slice(0, 400));
       github.rejectBlobsOver(0);
     }
 

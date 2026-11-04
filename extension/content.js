@@ -1549,14 +1549,30 @@
             const conversation = await normalize(payload, org, signal, sandboxInfo);
             if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
             prepared = transfer.prepare(conversation);
-            if (conversation.incomplete.length) {
+            // Files over the upload limit are downloaded, but the background
+            // leaves them out of the archive, so they are reported here too:
+            // otherwise a sync whose only problem is an oversized file stores an
+            // empty report and the popup offers no diagnostic report.
+            const oversized = (Array.isArray(conversation.assets) ? conversation.assets : [])
+              .filter((asset) => Number(asset?.size) > MAX_ARCHIVED_FILE_BYTES);
+            if (conversation.incomplete.length || oversized.length) {
               diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'incomplete', {
-                problems: conversation.incomplete.map((item) => ({
-                  kind: item.kind,
-                  reason: item.reason,
-                  message_id: item.message_external_id || null,
-                  file_extension: fileExtension(item.name),
-                })),
+                problems: [
+                  ...conversation.incomplete.map((item) => ({
+                    kind: item.kind,
+                    reason: item.reason,
+                    message_id: item.message_external_id || null,
+                    file_extension: fileExtension(item.name),
+                  })),
+                  ...oversized.map((asset) => ({
+                    kind: 'attachment',
+                    reason: 'over the upload limit',
+                    message_id: asset.message_external_id || asset.message_external_ids?.[0] || null,
+                    file_extension: fileExtension(asset.name),
+                    size: Number(asset.size),
+                    limit: MAX_ARCHIVED_FILE_BYTES,
+                  })),
+                ],
                 ...sandboxInfo,
               }));
             }

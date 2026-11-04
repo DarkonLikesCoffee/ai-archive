@@ -2,6 +2,50 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Oversized attachments after the real 0.5.20 sync — 2026-11-04 (extension 0.5.21)
+
+**User report.** The real sync on 0.5.20 succeeded with no 502.
+- Claude listed 802 conversations: 798 were skipped as unchanged and 4 incomplete ones were retried.
+- 7 attachments in those 4 conversations exceeded the ~30 MiB limit.
+- The attachment report was visible, but **Copy diagnostic report** was missing.
+
+**1. Diagnostic button: confirmed bug, fixed.**
+- Diagnostics are written by `content.js` (`storeDiagnostics`, carrying the running manifest version) and loaded by the popup (`loadDiagnostics` / `isCurrentDiagnosticReport`). Storage, version matching and loading work correctly.
+- The problem: an item was only created when the content script's own `conversation.incomplete` was non-empty. Oversized files are only marked as left out by the background (`normalizeAssetList`), so a sync whose only problems were oversized files stored `items: []`, and the popup correctly hid the button.
+- Fix: `runSync` adds one problem per asset over `MAX_ARCHIVED_FILE_BYTES`, recording kind, reason, message id, extension, size and limit, never the file name.
+- Tests:
+  - content unit test (fails without the fix);
+  - E2E check that the button appears and the copied report names the problem without the file name;
+  - the existing privacy assertions still hold.
+
+**2. Index and Markdown representation: verified with exporter output, no bug found.**
+- An oversized file is not listed in `assets[]`.
+- `incomplete[]` keeps `{kind, name, message_external_id, reason, too_large, sha256, size}`.
+- The Markdown has `**Not archived: <name>** (<size>; larger than the 30.0 MiB AI Archive can upload through GitHub's API)` where the file was attached.
+- New regression test for exactly this, plus an integrity-verifier check (`incomplete-note-missing`, with `--markdown`) so the real archive can be checked read-only.
+- The real archive was **not** read; the owner can run the verifier.
+
+**3. Repeat syncs.**
+- Confirmed correct: an oversized file is never uploaded (size check before any request), and a repeat sync with identical data makes no commit. Covered by a new unit test and a new E2E check.
+- Confirmed inefficiency, not fixed: the conversation stays incomplete, so every sync re-fetches it and downloads the oversized bytes in full from Claude before leaving them out. Recorded in ROADMAP P1.3 with two options. One of them, skipping such conversations, changes invariant 9 and needs owner approval.
+
+**4. Limit and wording.**
+- The limit is `MAX_ARCHIVED_FILE_BYTES` = 31,457,232 bytes, i.e. 30 MiB − 48 B (the base64 of a 40 MiB JSON blob request). It is the same in `content.js` and `background.js`, and it was **not changed**.
+- Inconsistencies found and fixed outside the archive files:
+  - The README's current-behaviour text said "over 100 MB". Fixed.
+  - The sync report called these files "too large to upload to GitHub", although they were never sent. It now says "over AI Archive's 30.0 MiB upload limit", with exact bytes near the limit, where both values used to round to "30.0 MiB". Files GitHub actually refused (HTTP 422) now say "refused by GitHub as too large to process".
+- Left as is, deliberately: the Markdown/index reason text ("30.0 MiB; larger than the 30.0 MiB …" for a file just over the limit). Changing it would rewrite the 4 archived conversations on the next sync.
+
+**Tests.**
+- `node --test extension/*.test.js`: 201/201.
+- `cd web && npm test`: 89/89; `npm run build` passes.
+- `node e2e/extension-sync.e2e.cjs`: 47/47, exit 0.
+- Expected-output updates: only the report label text in 3 unit tests and 3 E2E checks, which now assert the new exact wording.
+
+**Notes for the owner.**
+- 802 listed versus the ~812 conversations mentioned before: if the archive still holds about 812 entries, the full-sync message should have said that some archived conversations were not returned by Claude. Their archived copies are kept.
+- Next task: ROADMAP P1.3 option (a), design only, or whichever option the owner picks.
+
 ## Index rebuild analysis and dry run — 2026-11-04 (ROADMAP P0.2)
 
 - **Question.** Can `archive/index.json` be rebuilt from the canonical Markdown and attachment files, and what would a rebuild lose?

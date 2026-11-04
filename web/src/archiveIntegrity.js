@@ -15,6 +15,16 @@
 const CONVERSATIONS_ROOT = 'archive/conversations/';
 const ASSET_LINK = /\]\((assets\/[^)\s]+)\)/g;
 
+// The exporter's escaping of file names in Markdown labels
+// (escapeMarkdownLabel in extension/background.js).
+function exporterLabel(value) {
+  return String(value || 'file')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/\\/g, '\\\\').replace(/\r?\n/g, ' ')
+    .replace(/\[/g, '\\[').replace(/\]/g, '\\]').replace(/\(/g, '\\(').replace(/\)/g, '\\)')
+    .replace(/([*_\x60!])/g, '\\$1');
+}
+
 function finding(severity, code, path, message) {
   return { severity, code, path: path || null, message };
 }
@@ -121,6 +131,26 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
         const target = `${dirname(path)}/${match[1]}`;
         if (!blobs.has(target)) {
           findings.push(finding('error', 'link-broken', path, `Links to ${match[1]}, which is not in the repository.`));
+        }
+      }
+    }
+  }
+
+  // Every file the index records as not archived must be visibly noted in
+  // its conversation, so nobody reading the Markdown mistakes it for archived.
+  if (markdown instanceof Map) {
+    for (const entry of index.conversations) {
+      if (!entry || !Array.isArray(entry.incomplete) || !markdown.has(entry.path)) continue;
+      const text = String(markdown.get(entry.path) ?? '');
+      for (const item of entry.incomplete) {
+        // Other kinds are noted at the top without a file name.
+        if (!item?.name || !['attachment', 'sandbox-file'].includes(item.kind ?? 'attachment')) continue;
+        const label = exporterLabel(item.name);
+        const noted = item.kind === 'sandbox-file'
+          ? text.includes(`${label} was not archived`)
+          : text.includes(`**Not archived: ${label}**`) || text.includes(`**Attachment not archived: ${label}**`);
+        if (!noted) {
+          findings.push(finding('error', 'incomplete-note-missing', entry.path, `The index records "${item.name}" as not archived, but the conversation has no note saying so.`));
         }
       }
     }

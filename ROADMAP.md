@@ -64,6 +64,8 @@ Acceptance: synthetic tests cover all known payload shapes; manual real-account 
 - [ ] Ensure reports identify endpoint/shape/status without including message content, secrets, file contents or sensitive identifiers.
 - [ ] Add clear categories for source-unavailable, fetch-failed, transfer-failed, validation-failed and upload-refused.
 - [ ] Ensure stale reports cannot be mistaken for the latest sync.
+- [x] A sync whose only problems are oversized attachments stores a diagnostic report, so the popup offers it (0.5.21).
+- [ ] Attachments GitHub refuses during upload (HTTP 422) are detected in the background and still produce no diagnostic item.
 
 ### P1.3 Repository growth and GitHub limits
 - [ ] Measure repository size, tree entry count, blob count and index size.
@@ -71,6 +73,8 @@ Acceptance: synthetic tests cover all known payload shapes; manual real-account 
 - [ ] Estimate growth under realistic conversation/attachment workloads.
 - [ ] Propose thresholds and warnings before considering storage changes.
 - [ ] Never rewrite Git history or delete historical data as an automatic optimization.
+- [ ] Oversized attachments are re-downloaded on every sync. A conversation with a file over the ~30 MiB upload limit stays incomplete, so every sync fetches it again and downloads the oversized bytes in full from Claude, only to leave them out (confirmed in 0.5.21; uploads and commits are already avoided). Options to evaluate: (a) skip the download when the HTTP `Content-Length` already exceeds the limit. This needs an identity for the file without its SHA-256, which the asset matching in `content.js` relies on, so it needs careful design and tests. (b) Let incremental sync skip a conversation whose only problems are oversized files, while its `updated_at` and the upload limit are unchanged. This changes invariant 9 and needs owner approval.
+- [ ] Decide whether and how to raise the attachment upload limit. Not changed yet at the owner's request; GitHub's real request ceiling is undocumented.
 
 ### P1.4 Security and privacy review
 - [ ] Review extension token storage, viewer token storage and disconnect behavior.

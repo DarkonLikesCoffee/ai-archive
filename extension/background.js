@@ -635,9 +635,19 @@ function incompleteItems(c) {
 }
 
 // The popup's short description of one missing file.
+// Sync-report wording only; the Markdown note and the index keep their text.
+// An oversized file was never sent: it is over AI Archive's own request-based
+// limit, not refused by GitHub. Near the limit both round to "30.0 MiB", so
+// exact byte counts are shown instead.
 function missingLabel(item) {
   const name = item.name || 'files created by tools';
-  return item.too_large ? `${name} (${formatBytes(item.size)}, too large to upload to GitHub)` : name;
+  if (!item.too_large) return name;
+  if (item.github_rejected) return `${name} (${formatBytes(item.size)}, refused by GitHub as too large to process)`;
+  const size = formatBytes(item.size);
+  const limit = formatBytes(MAX_ARCHIVED_FILE_BYTES);
+  return size === limit
+    ? `${name} (${Number(item.size).toLocaleString('en-US')} bytes, over AI Archive's ${MAX_ARCHIVED_FILE_BYTES.toLocaleString('en-US')}-byte upload limit)`
+    : `${name} (${size}, over AI Archive's ${limit} upload limit)`;
 }
 
 function notArchivedMarkdown(item) {

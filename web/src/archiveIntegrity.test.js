@@ -100,3 +100,39 @@ test('malformed indexes and entries are reported instead of throwing', async () 
     'error:entry-malformed:null',
   ]);
 });
+
+test('files the index records as not archived must be noted in the exporter\'s Markdown', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const vm = await import('node:vm');
+  const source = await readFile(new URL('../../extension/background.js', import.meta.url), 'utf8');
+  const chrome = { storage: { local: { get: async () => ({}) } }, runtime: { onMessage: { addListener() {} }, sendMessage() { return Promise.resolve(); } } };
+  const context = { chrome, AbortController, TextEncoder, TextDecoder, Uint8Array, crypto: globalThis.crypto, btoa: globalThis.btoa, atob: globalThis.atob };
+  vm.runInNewContext(`${source}\nglobalThis.__hooks = { normalizeAssetList, conversationMarkdown, conversationPath, indexEntry, MAX_ARCHIVED_FILE_BYTES };`, context);
+  const exporter = context.__hooks;
+
+  // An oversized file (as the content script hands it over: metadata only)
+  // with a name that needs escaping, and a file Claude gave no link for.
+  const c = {
+    external_id: 'conv-big', title: 'Big files', model: null,
+    source_created_at: '2026-11-01T00:00:00.000Z', source_updated_at: '2026-11-01T00:00:00.000Z', message_count: 1,
+    messages: [{ external_id: 'm1', role: 'user', content: 'see files', files: [{ file_name: 'lecture_[part 1]*.mp4' }, { file_name: 'gone.pdf' }], attachments: [] }],
+    assets: [{ name: 'lecture_[part 1]*.mp4', mime: 'video/mp4', base64: '', size: exporter.MAX_ARCHIVED_FILE_BYTES + 1, sha256: 'c'.repeat(64), source: 'message', message_external_id: 'm1' }],
+    incomplete: [{ kind: 'attachment', name: 'gone.pdf', reason: 'Claude did not provide a download link for this file', message_external_id: 'm1' }],
+  };
+  const normalized = exporter.normalizeAssetList(c, 'claude', 'personal');
+  c.incomplete = [...c.incomplete, ...normalized.omissions];
+  const markdown = exporter.conversationMarkdown(c, 'claude', 'personal', normalized.byKey, normalized.assets);
+  const path = exporter.conversationPath(c, 'claude', 'personal');
+  const entry = JSON.parse(JSON.stringify(exporter.indexEntry(c, path, 'claude', 'personal', normalized.assets)));
+  assert.equal(entry.incomplete.length, 2);
+  const index = { conversations: [entry] };
+  const tree = [{ path, type: 'blob', size: markdown.length }, { path: 'archive/index.json', type: 'blob', size: 2 }];
+
+  const clean = await auditArchive({ index, tree, markdown: new Map([[path, markdown]]) });
+  assert.deepEqual(codes(clean), [`warning:conversation-incomplete:${path}`], 'both missing files are noted where they were attached');
+
+  const withoutNote = markdown.replace(/\*\*Not archived: [^\n]*/, '');
+  const broken = await auditArchive({ index, tree, markdown: new Map([[path, withoutNote]]) });
+  assert.deepEqual(codes(broken), [`error:incomplete-note-missing:${path}`, `warning:conversation-incomplete:${path}`]);
+  assert.match(broken.findings.find((item) => item.code === 'incomplete-note-missing').message, /"lecture_\[part 1\]\*\.mp4"/);
+});
