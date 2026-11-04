@@ -114,6 +114,12 @@ Create a [fine-grained personal access token](https://github.com/settings/person
 
 For the web viewer, a second token with **Contents: Read-only** is enough and is the safer choice.
 
+Where the tokens are kept:
+
+- **Extension:** in `chrome.storage.local` for the extension, on this browser profile only. **Disconnect** in the popup removes it, together with the stored sync reports.
+- **Viewer:** in the browser's `localStorage` for the viewer's site, on this browser only, so you stay signed in. **Disconnect** removes it and clears the attachment cache. Any script that ran on the viewer's origin could read it. The viewer escapes archive content and only sends the token to `api.github.com` and `raw.githubusercontent.com`, but a read-only token limits what a leaked token could do.
+- Give both tokens an expiry date. Don't use the viewer on a shared computer without disconnecting afterwards.
+
 ### 3. Install the extension
 
 1. Open `chrome://extensions` and enable **Developer mode**.

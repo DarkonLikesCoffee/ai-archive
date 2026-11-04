@@ -1,6 +1,31 @@
 # AI Archive — autonomous development log
 
-## Session handoff — 2026-11-03 (read this first)
+This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
+
+## PR integration of #82–#89 — 2026-11-04
+
+- **Problem.** All eight PRs had squash auto-merge enabled, passing `test-and-build` and `mergeable_state: clean`, but none merged. None was behind `development` at the time.
+- **Findings.**
+  - The `development` ruleset (id 26481969) requires: a PR (0 approvals, squash only), the `test-and-build` check on an up-to-date branch (strict), no force pushes, and code quality results. Code scanning is `not-configured`, yet GitHub reports the PRs as `clean`, so the code-quality rule did not block.
+  - Auto-merge only acts on an event. The checks had finished before the PRs became mergeable under the ruleset, so nothing triggered it.
+  - GitHub refuses to arm auto-merge on a PR that is already `clean` ("Pull request is in clean status").
+- **What was done.**
+  - #82: re-ran its `test-and-build` run, which made the check pending, and re-armed auto-merge; GitHub merged it when the check passed.
+  - The strict up-to-date rule then made every other PR behind. Each was updated in turn by merging `development` into its branch (no history rewrite), tested locally, pushed, and merged by auto-merge.
+  - Twice GitHub did not process a branch push: the PR head stayed stale and no CI run started. Each time a real content commit was pushed instead of an empty one: the audit status table (#84) and this log entry (#88).
+  - No settings, rules or `master` were changed. Nothing was merged by hand.
+- **Verification.** Before integrating, all seven remaining branches were merged locally on top of #82: extension unit tests 198/198, web tests 84/84, build OK, extension E2E 45/45 (exit 0). Each updated branch passed `test-and-build` in CI before merging.
+- **Order.** Merged as #82, #83, #84, #85, #86, #87, #89, #88.
+- **Next tasks**, in order:
+  1. ROADMAP P0.2: work out which index fields can be rebuilt from Markdown and asset files. Design and dry run only; use the verifier from #89 to check any rebuilt index.
+  2. Implement index v3 only if the #86 design is approved by the owner.
+  3. Audit finding 8 (`fetchAsset` host restriction): needs sanitized evidence of real URL shapes first.
+- **User verification still pending.**
+  - Re-run the ~812-conversation sync on 0.5.20.
+  - Run `web/scripts/verify-archive.mjs` on the real archive with a read-only token.
+  - Confirm the files of the six upgraded-workspace conversations.
+
+## Session handoff — 2026-11-03 (superseded: every PR listed below merged on 2026-11-04)
 
 Work from this session was submitted as separate PRs targeting `development`. All have GitHub squash auto-merge enabled. `Web CI` passed on each PR checked; GitHub showed DarkonLikesCoffee/ai-archive#82 as blocked anyway, so a required review or another merge rule is probably holding the merges. Each PR was checked to merge cleanly with the others (`git merge-tree`), and a local merge of #82–#85 passed 198 extension unit tests and 45/45 E2E checks.
 
@@ -25,6 +50,26 @@ Notes for the next session:
   2. ROADMAP P0.2: work out which index fields can be rebuilt from Markdown and asset files (design and dry-run only); the verifier from #89 can check any rebuilt index.
   3. Implement index v3 only if #86 is approved.
   4. Audit finding 8: restrict `fetchAsset` to known Claude hosts, after collecting sanitized evidence of real URL shapes.
+
+## Archive-state fallback is reported — 2026-11-03 (audit finding 3)
+
+- **Problem.** When `getArchiveState` failed (for example a GitHub 502 while reading the archive file list), `content.js` silently downloaded every conversation again; the outcome gave no hint why nothing was skipped as unchanged.
+- **Change.** `getArchivedState()` now returns the failure reason (sanitized, bounded); it travels in the transfer metadata as `archiveStateError`, is stored in `report.archiveStateError`, and the completion message says "The archive state could not be read (…), so every conversation was downloaded again…" (or, for an automatic sync, that only the latest conversations were checked). The sync is not marked partial: nothing was lost.
+- **Tests.** Extension unit tests 191/191 (new: content handoff carries the reason / no reason when the state is readable; background message variants). E2E: unchanged except the pre-existing popup failure fixed by PR #83.
+- **Next task.** Index v3 design document (audit finding 1c): move search text out of the single index blob, backward-compatible reader, migration notes. Design only, for owner review.
+
+## Technical audit — 2026-11-03
+
+- Wrote `docs/TECHNICAL_AUDIT.md` (read-only; ranked, evidence-backed). Top finding: `archive/index.json` is uploaded as one blob with gzip search text for every conversation; past the 40 MiB request limit every sync fails with a message that does not name the index. It is also a second plausible size-dependent source of the 812-conversation 502.
+- Next task: record the index size in each sync outcome, warn near the limit, and name the index in the error (audit finding 1 a/b), with regression tests.
+
+## Popup diagnostics and E2E repair — 2026-11-03 (after the GitHub 502 work)
+
+- **Problem.** `node e2e/extension-sync.e2e.cjs` failed on `development` (42065b9) since the popup redesign (939e2c2/45bacba): the "Copy diagnostic report" button and its lifecycle code were removed, while `content.js` still stores sanitized `last_sync_diagnostics`, so the report was unreachable. The E2E also still expected the old summary line + `<li>` report list.
+- **Changes.** Restored the button (secondary style, hidden unless a report of the current extension version exists; hidden on disconnect and when a sync starts) with a popup unit test. E2E now reads the redesigned report panel (`.report-item`) for what the popup shows and the stored `last_sync.message` for the full summary the redesign hides when a report is present.
+- **Tests.** `node --test extension/*.test.js` all pass; `node e2e/extension-sync.e2e.cjs` 45/45 PASS, exit 0.
+- **Open product question (not changed).** With a per-conversation report present the popup no longer shows the summary ("N conversations changed in 1 GitHub commit", unchanged/listed counts). Intentional per the redesign; revisit only if the user wants it back.
+- **Next task.** AUTOPILOT read-only technical audit → `docs/TECHNICAL_AUDIT.md`.
 
 ## GitHub 502 on a large sync — 2026-11-03 (extension 0.5.20)
 
@@ -54,21 +99,6 @@ Notes for the next session:
 - **Still requires setup/verification:** enable Allow auto-merge in repository settings and configure `Web CI` as a required check for `development` if the user wants merges to wait for CI. No repository settings or branch protection were changed by this work.
 - Existing `Web CI` covers extension syntax checks, extension unit tests, web unit tests and web production build. Browser E2E tests are not part of this CI workflow.
 
-## Popup diagnostics and E2E repair — 2026-11-03 (after the GitHub 502 work)
-
-- **Problem.** `node e2e/extension-sync.e2e.cjs` failed on `development` (42065b9) since the popup redesign (939e2c2/45bacba): the "Copy diagnostic report" button and its lifecycle code were removed, while `content.js` still stores sanitized `last_sync_diagnostics`, so the report was unreachable. The E2E also still expected the old summary line + `<li>` report list.
-- **Changes.** Restored the button (secondary style, hidden unless a report of the current extension version exists; hidden on disconnect and when a sync starts) with a popup unit test. E2E now reads the redesigned report panel (`.report-item`) for what the popup shows and the stored `last_sync.message` for the full summary the redesign hides when a report is present.
-- **Tests.** `node --test extension/*.test.js` all pass; `node e2e/extension-sync.e2e.cjs` 45/45 PASS, exit 0.
-- **Open product question (not changed).** With a per-conversation report present the popup no longer shows the summary ("N conversations changed in 1 GitHub commit", unchanged/listed counts). Intentional per the redesign; revisit only if the user wants it back.
-- **Next task.** AUTOPILOT read-only technical audit → `docs/TECHNICAL_AUDIT.md`.
-
-This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
-
-## Technical audit — 2026-11-03
-
-- Wrote `docs/TECHNICAL_AUDIT.md` (read-only; ranked, evidence-backed). Top finding: `archive/index.json` is uploaded as one blob with gzip search text for every conversation; past the 40 MiB request limit every sync fails with a message that does not name the index. It is also a second plausible size-dependent source of the 812-conversation 502.
-- Next task: record the index size in each sync outcome, warn near the limit, and name the index in the error (audit finding 1 a/b), with regression tests.
-
 ## Baseline handoff — 2026-11-03
 
 ### Repository state observed
@@ -97,11 +127,3 @@ This file is the durable handoff between Claude Code sessions. Keep entries fact
 
 ### Next action
 Perform the read-only technical audit described in `AUTOPILOT.md`. Write findings to `docs/TECHNICAL_AUDIT.md`, then implement one small, high-priority issue with regression coverage. Do not begin a broad refactor or a new provider.
-
-## Archive-state fallback is reported — 2026-11-03 (audit finding 3)
-
-(Appended at the end to avoid merge conflicts with parallel PRs; reorder newest-first once they are merged.)
-- **Problem.** When `getArchiveState` failed (for example a GitHub 502 while reading the archive file list), `content.js` silently downloaded every conversation again; the outcome gave no hint why nothing was skipped as unchanged.
-- **Change.** `getArchivedState()` now returns the failure reason (sanitized, bounded); it travels in the transfer metadata as `archiveStateError`, is stored in `report.archiveStateError`, and the completion message says "The archive state could not be read (…), so every conversation was downloaded again…" (or, for an automatic sync, that only the latest conversations were checked). The sync is not marked partial: nothing was lost.
-- **Tests.** Extension unit tests 191/191 (new: content handoff carries the reason / no reason when the state is readable; background message variants). E2E: unchanged except the pre-existing popup failure fixed by PR #83.
-- **Next task.** Index v3 design document (audit finding 1c): move search text out of the single index blob, backward-compatible reader, migration notes. Design only, for owner review.
