@@ -6,8 +6,11 @@
 // --markdown also downloads every conversation file to check its attachment
 // links; --hashes downloads every attachment to verify its SHA-256 and size.
 // Only GET requests are made, only to api.github.com. Nothing is written,
-// repaired or deleted. Exit status: 0 no errors, 1 errors found, 2 could not run.
+// repaired or deleted. --rebuild-dry-run (implies --markdown) also rebuilds
+// the index from the conversation files and reports how it differs from the
+// current one; it never writes the result. Exit status: 0 no errors, 1 errors found, 2 could not run.
 import { auditArchive, formatAuditReport } from '../src/archiveIntegrity.js';
+import { planIndexRebuild, formatRebuildPlan } from '../src/indexRebuild.js';
 
 const API = 'https://api.github.com';
 const args = process.argv.slice(2);
@@ -17,7 +20,7 @@ const branchArg = branchAt >= 0 ? args[branchAt + 1] : null;
 const token = process.env.GITHUB_TOKEN;
 
 if (!repoArg || !token) {
-  console.error('Usage: GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> [--branch main] [--markdown] [--hashes]');
+  console.error('Usage: GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> [--branch main] [--markdown] [--hashes] [--rebuild-dry-run]');
   process.exit(2);
 }
 const [owner, repo] = repoArg.split('/');
@@ -65,7 +68,8 @@ try {
   }
 
   let markdown = null;
-  if (args.includes('--markdown')) {
+  const rebuild = args.includes('--rebuild-dry-run');
+  if (args.includes('--markdown') || rebuild) {
     markdown = new Map();
     for (const [path, sha] of shaOf) {
       if (path.startsWith('archive/conversations/') && path.endsWith('.md')) {
@@ -78,6 +82,10 @@ try {
   const result = await auditArchive({ index, tree, markdown, readBytes });
   console.log(`${owner}/${repo} @ ${ref.ref} ${ref.object.sha.slice(0, 12)}`);
   console.log(formatAuditReport(result));
+  if (rebuild) {
+    console.log('');
+    console.log(formatRebuildPlan(await planIndexRebuild({ index, tree, markdown, readBytes })));
+  }
   process.exit(result.counts.error ? 1 : 0);
 } catch (error) {
   console.error(`Could not audit the archive: ${error.message}`);

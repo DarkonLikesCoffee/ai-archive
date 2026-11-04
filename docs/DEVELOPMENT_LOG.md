@@ -2,6 +2,26 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Index rebuild analysis and dry run — 2026-11-04 (ROADMAP P0.2)
+
+- **Question.** Can `archive/index.json` be rebuilt from the canonical Markdown and attachment files, and what would a rebuild lose?
+- **Answer** (in `docs/design/index-rebuild.md`):
+  - Exact: identity, title, model, timestamps, message count, path, `content_sha256`, attachment paths, sizes and SHA-256 (the last needs the bytes).
+  - Approximate: attachment names and MIME types, preview and search text.
+  - Not recoverable: `exporter_version`, `format_version`, and `incomplete[]` details.
+  - Markdown without a metadata block has no recoverable identity.
+- **Implemented.**
+  - `web/src/indexRebuild.js`: a dry-run plan that never writes and has no apply step.
+  - `verify-archive.mjs --rebuild-dry-run`.
+- **Tests.** 4 new tests in `web/src/indexRebuild.test.js` use the real exporter (loaded from `extension/background.js`) to produce fixtures:
+  - every exact field round-trips;
+  - a matching index yields zero differences;
+  - a damaged index is diagnosed (drift, missing entry, dangling entry, unreadable legacy file);
+  - missing files and "not archived" notes are reported, never invented.
+  Results: `cd web && npm test` 88/88 pass; `npm run build` passes. The command was smoke-tested against a fake GitHub API.
+- **Not done (needs owner review).** The apply step. Its proposed rules: merge, never replace; keep unrecoverable fields only while `content_sha256` matches; never remove entries; write one verified commit.
+- **Next task.** Audit finding 8 needs real URL evidence, and index v3 needs approval of #86. Without those, the next independent item is ROADMAP P1.2: audit diagnostic reports for privacy and usefulness, and add the categories source-unavailable, fetch-failed, transfer-failed, validation-failed and upload-refused.
+
 ## PR integration of #82–#89 — 2026-11-04
 
 - **Problem.** All eight PRs had squash auto-merge enabled, passing `test-and-build` and `mergeable_state: clean`, but none merged. None was behind `development` at the time.
