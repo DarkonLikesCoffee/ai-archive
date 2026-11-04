@@ -64,6 +64,11 @@ Notes for the next session:
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Technical audit — 2026-11-03
+
+- Wrote `docs/TECHNICAL_AUDIT.md` (read-only; ranked, evidence-backed). Top finding: `archive/index.json` is uploaded as one blob with gzip search text for every conversation; past the 40 MiB request limit every sync fails with a message that does not name the index. It is also a second plausible size-dependent source of the 812-conversation 502.
+- Next task: record the index size in each sync outcome, warn near the limit, and name the index in the error (audit finding 1 a/b), with regression tests.
+
 ## Baseline handoff — 2026-11-03
 
 ### Repository state observed
