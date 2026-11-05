@@ -918,10 +918,14 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 const OVERSIZED_REASON_LABELS = {
   'no-archive-state': 'no archive state for this sync',
   'no-file-id': 'no Claude file ID',
+  'ambiguous-file-id': 'several Claude file IDs for the same file',
   'not-recorded': 'not yet recorded in the archive',
   'size-unconfirmed': "Claude's response did not state its exact size",
   'size-changed': 'its size differs from the recorded one',
 };
+
+// Download paths in content.js, for the counters only.
+const OVERSIZED_ROUTES = ['message-url', 'files-api', 'sandbox-path', 'sandbox-list'];
 
 // Counters from the Claude tab, reduced to known fields of whole numbers.
 function sanitizeOversizedStats(value) {
@@ -929,8 +933,11 @@ function sanitizeOversizedStats(value) {
   const count = (n) => (Number.isSafeInteger(n) && n >= 0 ? n : 0);
   const stats = {
     detected: count(value.detected), skipped: count(value.skipped), skipped_bytes: count(value.skipped_bytes),
-    downloaded: count(value.downloaded), downloaded_bytes: count(value.downloaded_bytes), downloaded_reasons: {},
+    downloaded: count(value.downloaded), downloaded_bytes: count(value.downloaded_bytes), downloaded_reasons: {}, downloaded_routes: {},
   };
+  for (const [route, n] of Object.entries(value.downloaded_routes && typeof value.downloaded_routes === 'object' ? value.downloaded_routes : {})) {
+    if (OVERSIZED_ROUTES.includes(route) && count(n)) stats.downloaded_routes[route] = count(n);
+  }
   for (const [reason, n] of Object.entries(value.downloaded_reasons && typeof value.downloaded_reasons === 'object' ? value.downloaded_reasons : {})) {
     if (Object.hasOwn(OVERSIZED_REASON_LABELS, reason) && count(n)) stats.downloaded_reasons[reason] = count(n);
   }

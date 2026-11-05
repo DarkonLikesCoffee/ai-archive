@@ -2666,7 +2666,7 @@ test('the sync summary and report state how oversized downloads were handled, fr
   });
   assert.deepEqual(JSON.parse(JSON.stringify(result.report.oversized)), {
     detected: 7, skipped: 5, skipped_bytes: 5 * 40 * 1024 * 1024, downloaded: 2, downloaded_bytes: 2 * 35 * 1024 * 1024,
-    downloaded_reasons: { 'not-recorded': 1, 'size-unconfirmed': 1 },
+    downloaded_reasons: { 'not-recorded': 1, 'size-unconfirmed': 1 }, downloaded_routes: {},
   }, 'only known numeric fields and reason codes are kept');
   const message = progress.at(-1).message;
   assert.match(message, /5 attachments over the upload limit were not downloaded again \(200\.0 MiB not downloaded\): Claude reported the exact size already recorded in the archive\./);
