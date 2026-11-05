@@ -2651,3 +2651,32 @@ test('the archive state flags problems that block every sync, so the Claude tab 
   assert.equal(unavailable.ok, false);
   assert.equal(unavailable.blocksSync, undefined);
 });
+
+test('the sync summary and report state how oversized downloads were handled, from sanitized counters', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const progress = [];
+  const result = await harness.sync(sampleConversation(), (event) => progress.push(event), [], {
+    fullList: true, listed: 1,
+    oversizedDownloadsSkipped: 5,
+    oversizedStats: {
+      detected: 7, skipped: 5, skipped_bytes: 5 * 40 * 1024 * 1024, downloaded: 2, downloaded_bytes: 2 * 35 * 1024 * 1024,
+      downloaded_reasons: { 'not-recorded': 1, 'size-unconfirmed': 1, '<script>': 9 },
+      name: 'Private lecture.mp4',
+    },
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.report.oversized)), {
+    detected: 7, skipped: 5, skipped_bytes: 5 * 40 * 1024 * 1024, downloaded: 2, downloaded_bytes: 2 * 35 * 1024 * 1024,
+    downloaded_reasons: { 'not-recorded': 1, 'size-unconfirmed': 1 },
+  }, 'only known numeric fields and reason codes are kept');
+  const message = progress.at(-1).message;
+  assert.match(message, /5 attachments over the upload limit were not downloaded again \(200\.0 MiB not downloaded\): Claude reported the exact size already recorded in the archive\./);
+  assert.match(message, /2 attachments over the upload limit were downloaded in full \(70\.0 MiB\) and left out, because the download could not be skipped safely \(not yet recorded in the archive: 1; Claude's response did not state its exact size: 1\)\./);
+  assert.equal(message.includes('Private'), false);
+  assert.equal(JSON.stringify(result.report).includes('Private'), false, 'nothing but counters reaches the stored report');
+
+  for (const bad of [null, 'x', { detected: -1 }, { detected: 1.5 }, { detected: 0, skipped: 3 }]) {
+    const other = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+    const outcome = await other.sync(sampleConversation(), () => {}, [], { oversizedStats: bad });
+    assert.equal('oversized' in outcome.report, false, `ignored: ${JSON.stringify(bad)}`);
+  }
+});

@@ -2,6 +2,23 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Did the oversized-download skip happen? Counters — 2026-11-05 (extension 0.5.24)
+
+- **Question.** After a real "All conversations" sync (4 incomplete conversations, 7 oversized attachments), the report did not show whether the P1.3 skip worked.
+- **Findings from the code** (no assumption that the skip failed):
+  1. The summary sentence "N attachments … were not downloaded again" counts correctly: it is incremented only after a download is cancelled following the headers. But it is written only when N > 0, and the popup drops the whole summary whenever the per-conversation report has entries, which is the case for any sync with incomplete conversations. **The evidence was therefore invisible in the popup either way.** It was stored only in `last_sync.report.oversizedDownloadsSkipped` and `last_sync.message`, in the extension's local storage.
+  2. "Detected as oversized" and "download skipped" were not distinguished. The per-file diagnostic problem ("over the upload limit") is identical in both cases, and downloads that could not be skipped were not counted at all.
+- **Change.**
+  - Per-sync counters in `content.js`: detected, skipped, skipped_bytes, downloaded, downloaded_bytes, and `downloaded_reasons` with the codes no-archive-state, no-file-id, not-recorded, size-unconfirmed and size-changed. They come from a new `oversizedSkipBlocker` that returns why a skip is not possible.
+  - The counters reach the transfer metadata, the background's sanitized `report.oversized`, the summary text, the diagnostic report (`oversized_downloads`) and a popup report line.
+  - No names, IDs, URLs or contents. The background keeps only known numeric fields and reason codes.
+- **Evidence for the owner's past sync.** It can still be read locally: in `chrome://extensions`, open the extension's service worker console and run `chrome.storage.local.get('last_sync').then((r) => console.log(r.last_sync?.report?.oversizedDownloadsSkipped))`. A number means that many downloads were skipped; `undefined` means none was (provided that sync ran on 0.5.22 or later and is still the last one). The next 0.5.24 sync shows the full counters in the popup.
+- **Tests.**
+  - `node --test extension/*.test.js`: 215/215. New: skipped counters with bytes and the diagnostic copy; a full download for each of the five reasons, with a real over-limit body and no private strings; no counters without oversized files; the background summary and sanitizing; the popup line.
+  - `node e2e/extension-sync.e2e.cjs`: 50/50. The popup line reads "0 not downloaded again, 1 downloaded in full" on the first sync and "1 not downloaded again (31.0 MiB saved)" on the repeat.
+  - Web tests and build pass.
+- **Next task.** ROADMAP P1.2, the remaining diagnostics work: diagnostic items for attachments GitHub refuses (422), and failure categories.
+
 ## Sync correctness and atomicity review — 2026-11-04 (extension 0.5.23, ROADMAP P0.3)
 
 - **Scope.** Every failure path from Claude discovery to the branch update, mapped to its user-visible outcome and covering test in `docs/design/sync-failure-modes.md`. The core invariant holds: nothing changes before the single non-force PATCH, and a failed PATCH is resolved by reading the branch back.

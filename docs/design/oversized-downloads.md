@@ -61,6 +61,25 @@ A conversation with an attachment over the upload limit (31,457,232 bytes) stays
   In each case the identity comes from the bytes actually received.
 - **`e2e/extension-sync.e2e.cjs`:** the repeat sync of a 31 MiB attachment skips the download and makes no commit (byte-identical archive).
 
+## Counters: was the download actually skipped? (0.5.24)
+
+In 0.5.22–0.5.23 the only evidence was a sentence in the sync summary, written only when at least one download was skipped. The popup hides that summary whenever it shows a per-conversation report, which it does for any sync with incomplete conversations. So a real sync could not show whether the skip happened, and "detected as oversized" and "download skipped" were not distinguished.
+
+Since 0.5.24 the Claude tab counts every download that turns out to be over the limit:
+- `detected`: number of oversized downloads;
+- `skipped` and `skipped_bytes`: downloads cancelled after the headers, with the recorded sizes they would have transferred. A few kilobytes may arrive before the cancel;
+- `downloaded` and `downloaded_bytes`: downloads that still happened in full;
+- `downloaded_reasons`: why each of those could not be skipped. One of `no-archive-state` (Latest N, or an unreadable state), `no-file-id`, `not-recorded` (first sync that sees the file), `size-unconfirmed` (no exact `Content-Length`, compressed, ranged or not 200), or `size-changed`.
+
+Where the counters appear:
+- the transfer metadata;
+- the sync report (`last_sync.report.oversized`), sanitized by the background to known numeric fields and reason codes;
+- the summary text;
+- the diagnostic report (`oversized_downloads`);
+- one line in the popup's report panel, for example "Attachments over the upload limit: 7 — 7 not downloaded again (… saved), 0 downloaded in full."
+
+They contain no names, IDs, URLs or contents.
+
 ## Needs live verification (owner)
 
-Whether Claude's real download endpoints send `Content-Length` without content coding is **unknown**; the E2E fake server does. If they don't, nothing changes: the files are downloaded as before. After syncing with 0.5.22, the summary line "… attachments over the upload limit were not downloaded again" shows whether the skip happened (7 expected on the owner's archive).
+Whether Claude's real download endpoints send `Content-Length` without content coding is **unknown**; the E2E fake server does. If they don't, nothing changes: the files are downloaded as before. After an "All conversations" sync with 0.5.24, the popup's report line shows whether the skip happened: 7 expected on the owner's archive. If any were downloaded in full, the diagnostic report (`oversized_downloads.downloaded_reasons`) says why.
