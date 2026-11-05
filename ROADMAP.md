@@ -44,8 +44,8 @@ Acceptance: recovery behavior is documented, tested against historical format fi
 Acceptance: each failure mode has a test and documented user-visible outcome; no false-success state remains.
 
 ### P0.4 Attachment verification
-- [ ] Verify message-level file references, generated workspace files, legacy sandbox files, inline media and tool-result media.
-- [ ] Verify each saved file's bytes, MIME, size and SHA-256 against its source when possible.
+- [x] Verify message-level file references, generated workspace files, legacy sandbox files, inline media and tool-result media. (Code audit with synthetic tests: `docs/design/attachment-verification.md`. Real-account checks are still pending; see below.)
+- [ ] Verify each saved file's bytes, MIME, size and SHA-256 against its source when possible. Done: bytes, size and SHA-256 are checked from download through transfer; GitHub's blob ID must match the bytes sent; archived blobs are reused only when proven identical, and differing files are repaired (0.5.26). Open: the MIME type is not checked against the bytes.
 - [ ] Distinguish unavailable-at-source from download-failed and GitHub-upload-refused.
 - [ ] Keep real-account validation pending until the user checks representative exported files.
 
@@ -73,7 +73,7 @@ Acceptance: synthetic tests cover all known payload shapes; manual real-account 
 - [ ] Estimate growth under realistic conversation/attachment workloads.
 - [ ] Propose thresholds and warnings before considering storage changes.
 - [ ] Never rewrite Git history or delete historical data as an automatic optimization.
-- [x] Oversized attachments are no longer re-downloaded when Claude confirms the exact recorded size (0.5.22, `docs/design/oversized-downloads.md`, approach B). **Live verification pending**: real Claude responses must send `Content-Length`; otherwise files are downloaded as before. Since 0.5.24 the popup report line and the diagnostic counters (`oversized_downloads`) show whether this happened, and why not. Original problem: oversized attachments were re-downloaded on every sync. A conversation with a file over the ~30 MiB upload limit stays incomplete, so every sync fetches it again and downloads the oversized bytes in full from Claude, only to leave them out (confirmed in 0.5.21; uploads and commits are already avoided). Options to evaluate: (a) skip the download when the HTTP `Content-Length` already exceeds the limit. This needs an identity for the file without its SHA-256, which the asset matching in `content.js` relies on, so it needs careful design and tests. (b) Let incremental sync skip a conversation whose only problems are oversized files, while its `updated_at` and the upload limit are unchanged. This changes invariant 9 and needs owner approval.
+- [x] Oversized attachments are no longer re-downloaded when Claude confirms the exact recorded size (0.5.22, `docs/design/oversized-downloads.md`, approach B; sandbox-file identity fixed in 0.5.25). **Live-verified on the owner's account with 0.5.25:** "All conversations" sync, 802 listed, 798 unchanged; 7 oversized attachments skipped, 692.6 MiB not downloaded again, 0 downloaded in full. A first sight of a new oversized file still downloads it once, to learn its SHA-256. Conversations whose only problem is an oversized file are still re-fetched every sync (invariant 9); skipping them stays a separate owner decision.
 - [ ] Decide whether and how to raise the attachment upload limit. Not changed yet at the owner's request; GitHub's real request ceiling is undocumented.
 
 ### P1.4 Security and privacy review

@@ -868,22 +868,52 @@ async function sha256(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// The Git object ID of a blob holding `bytes`: SHA-1 of "blob <size>\0" and
+// the bytes. GitHub must return exactly this ID for an upload, and an archived
+// blob may stand in for bytes only when its ID is this one.
+async function gitBlobSha(bytes) {
+  const header = new TextEncoder().encode(`blob ${bytes.byteLength}\0`);
+  const data = new Uint8Array(header.byteLength + bytes.byteLength);
+  data.set(header, 0);
+  data.set(bytes, header.byteLength);
+  const digest = await crypto.subtle.digest('SHA-1', data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function blobContentBytes(content, encoding) {
+  if (encoding === 'base64') {
+    const binary = atob(String(content));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+  return new TextEncoder().encode(String(content));
+}
+
 // Throws BlobTooLargeError, without sending anything, for a body over the
 // request limit, and when GitHub refuses the body as too large. Any other
 // failure (including other 422 validation errors) is thrown unchanged.
+// The returned blob ID is checked against the bytes sent, so a blob GitHub
+// stored differently (or a response for other content) is never referenced.
 async function createBlob(content, encoding = 'utf-8', signal = undefined) {
   const body = JSON.stringify({ content, encoding });
   if (utf8LengthExceeds(body, MAX_BLOB_REQUEST_BYTES)) {
     throw new BlobTooLargeError(`the upload request would be over ${formatBytes(MAX_BLOB_REQUEST_BYTES)}`);
   }
+  let blob;
   try {
-    return await gh('/git/blobs', { method: 'POST', body, ...(signal ? { signal } : {}) });
+    blob = await gh('/git/blobs', { method: 'POST', body, ...(signal ? { signal } : {}) });
   } catch (error) {
     if (error?.inputTooLarge) {
       throw new BlobTooLargeError(error.message, { remote: { status: error.status, message: error.githubMessage } });
     }
     throw error;
   }
+  const expected = await gitBlobSha(blobContentBytes(content, encoding));
+  if (typeof blob?.sha !== 'string' || blob.sha.toLowerCase() !== expected) {
+    throw new Error(`GitHub returned blob ${String(blob?.sha || 'nothing').slice(0, 40)} for an upload whose bytes have blob ID ${expected}. Nothing was published; sync again.`);
+  }
+  return { ...blob, sha: expected };
 }
 
 // GitHub's low-level Git Database endpoints (blobs/trees/commits) reject
@@ -958,6 +988,9 @@ function syncReportSummary(report) {
     const reasons = Object.entries(report.oversized.downloaded_reasons || {})
       .map(([reason, count]) => `${OVERSIZED_REASON_LABELS[reason] || reason}: ${count}`).join('; ');
     text += ` ${plural(report.oversized.downloaded, 'attachment over the upload limit was', 'attachments over the upload limit were')} downloaded in full (${formatBytes(report.oversized.downloaded_bytes)}) and left out, because the download could not be skipped safely${reasons ? ` (${reasons})` : ''}.`;
+  }
+  if (report.repairedFiles) {
+    text += ` ${plural(report.repairedFiles, 'archived attachment did', 'archived attachments did')} not hold the bytes just downloaded and verified (changed outside AI Archive?) and ${report.repairedFiles === 1 ? 'was' : 'were'} rewritten with them; the previous version${report.repairedFiles === 1 ? ' remains' : 's remain'} in the repository history.`;
   }
   if (report.archiveStateError) {
     text += report.fullList
@@ -1188,6 +1221,11 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     let { ref, branch, baseCommit, baseTree, existingPaths, index } = await loadArchiveSnapshot();
 
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
+    // Blob IDs on the branch, to notice an archived file whose bytes are not the
+    // verified bytes of this export (for example changed outside AI Archive).
+    let branchBlobShas = new Map((baseTree?.tree || []).filter((item) => item?.type === 'blob').map((item) => [item.path, String(item.sha || '').toLowerCase()]));
+    const blobDiffersOnBranch = (asset) => !asset.omitted && typeof asset.blob_sha === 'string'
+      && branchBlobShas.has(asset.path) && branchBlobShas.get(asset.path) !== asset.blob_sha;
     report.failed = failedItems.map((item) => ({
       id: String(item.id),
       title: String(item.title || item.id),
@@ -1323,7 +1361,8 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         || previous.content_sha256 !== entry.content_sha256
         || previousAssetSignature !== currentAssetSignature
         || !existingPaths.has(path)
-        || previousAssets.some((asset) => asset?.path && !existingPaths.has(asset.path));
+        || previousAssets.some((asset) => asset?.path && !existingPaths.has(asset.path))
+        || normalizedAssets.assets.some((asset) => blobDiffersOnBranch(asset));
 
       if (changed) {
         changedConversations += 1;
@@ -1346,7 +1385,9 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         for (const asset of normalizedAssets.assets) {
           if (asset.omitted) continue;
           const previousAsset = previousAssets.find((a) => a.path === asset.path && a.sha256 === asset.sha256);
-          if (!previousAsset || !existingPaths.has(asset.path)) {
+          const repairing = Boolean(previousAsset && existingPaths.has(asset.path) && blobDiffersOnBranch(asset));
+          if (repairing) report.repairedFiles = (report.repairedFiles || 0) + 1;
+          if (!previousAsset || !existingPaths.has(asset.path) || repairing) {
             assetWrites += 1;
             changes.push(asset.blob_sha
               ? { path: asset.path, sha: asset.blob_sha }
@@ -1855,8 +1896,11 @@ async function stageAssetUpload(context, asset, base64, signal) {
   const size = Number(asset.size);
   const key = `${asset.sha256}:${size}`;
   const known = context.knownBlobs.get(key);
-  if (known) {
-    asset.blob_sha = known;
+  // An archived blob stands in for these bytes only if it provably holds them:
+  // the index's SHA-256 and the tree's size could describe a file changed
+  // outside AI Archive.
+  if (known && size <= MAX_ARCHIVED_FILE_BYTES && base64 && known.toLowerCase() === await gitBlobSha(blobContentBytes(base64, 'base64'))) {
+    asset.blob_sha = known.toLowerCase();
     return 'reused';
   }
   if (size > MAX_ARCHIVED_FILE_BYTES) {

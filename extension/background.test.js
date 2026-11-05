@@ -153,7 +153,9 @@ test('associates same-named sandbox assets only when their full paths identify t
 });
 
 
-function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [], extraTreePaths = [], baseTreeTruncated = false }) {
+const gitBlobShaOf = (bytes) => createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), Buffer.from(bytes)])).digest('hex');
+
+function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [], extraTreePaths = [], baseTreeTruncated = false, archivedBytes = {} }) {
   const listeners = [];
   const createdTrees = new Map();
   const blobContents = new Map();
@@ -213,7 +215,9 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
     } catch {}
     const missing = new Set(missingPaths);
     return new Map([...new Set([...indexedPaths, ...extraTreePaths, ...(indexText == null ? [] : ['archive/index.json'])])]
-      .filter((path) => !missing.has(path)).map((path) => [path, `existing-${path}`]));
+      .filter((path) => !missing.has(path))
+      // A file whose real bytes the test states gets its real Git blob ID.
+      .map((path) => [path, archivedBytes[path] ? gitBlobShaOf(archivedBytes[path]) : `existing-${path}`]));
   }
 
   const fetch = async (url, options = {}) => {
@@ -274,15 +278,20 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       });
     }
     if (pathname.endsWith('/git/blobs') && method === 'POST') {
-      const custom = blobResponder?.(requests.at(-1).body);
+      // This request's own body: with parallel uploads, requests.at(-1) can
+      // be another request by the time a delayed response is built.
+      const posted = requests.at(-1).body;
+      const custom = blobResponder?.(posted);
       if (custom) return response(custom.body, custom.status, custom.headers || {});
       activeBlobRequests += 1;
       maxActiveBlobRequests = Math.max(maxActiveBlobRequests, activeBlobRequests);
       try {
         if (blobDelayMs) await new Promise((resolve) => setTimeout(resolve, blobDelayMs));
         blobCount += 1;
-        blobContents.set(`blob-${blobCount}`, requests.at(-1).body);
-        return response({ sha: `blob-${blobCount}` });
+        // Like GitHub: the ID is the Git blob SHA-1 of the stored bytes.
+        const sha = gitBlobShaOf(Buffer.from(posted.content, posted.encoding === 'base64' ? 'base64' : 'utf8'));
+        blobContents.set(sha, posted);
+        return response({ sha });
       } finally {
         activeBlobRequests -= 1;
       }
@@ -580,6 +589,8 @@ test('renaming a conversation updates its Markdown path without deleting a still
   const currentConversation = { ...oldConversation, title: 'Renamed conversation' };
   const harness = makeBackgroundSyncHarness({
     indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previous] }),
+    // The archive holds exactly these bytes at the asset's path.
+    archivedBytes: { [previous.assets[0].path]: Buffer.from('image bytes') },
   });
 
   await harness.sync([currentConversation], () => {});
@@ -2060,7 +2071,7 @@ test('attachments are uploaded as Git blobs while the transfer is received and o
   const archivedBytes = Buffer.from('already archived image bytes');
   const archivedAsset = { path: 'archive/conversations/claude/personal/assets/old/aaaa-old.png', sha256: sha256Hex(archivedBytes), size: archivedBytes.length, name: 'old.png' };
   const indexText = JSON.stringify({ version: 2, updated_at: '', conversations: [{ id: 'old', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/old.md', assets: [archivedAsset] }] });
-  const harness = makeBackgroundSyncHarness({ indexText });
+  const harness = makeBackgroundSyncHarness({ indexText, archivedBytes: { [archivedAsset.path]: archivedBytes } });
   assert.equal(harness.send({ type: 'syncTransferStart', transferId: 'staged' }).ok, true);
 
   const fresh = transferAsset('notes.txt', 'brand new notes '.repeat(50));
@@ -2093,8 +2104,8 @@ test('attachments are uploaded as Git blobs while the transfer is received and o
   assert.equal(result.commit, 'new-commit');
   const tree = harness.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/git/trees')).body.tree;
   const byName = (name) => tree.find((entry) => entry.path.endsWith(name));
-  assert.equal(byName('notes.txt').sha, 'blob-1', 'the commit references the blob uploaded during the transfer');
-  assert.equal(byName('copy.png').sha, `existing-${archivedAsset.path}`, 'the reused file points at the archived blob');
+  assert.equal(byName('notes.txt').sha, gitBlobShaOf(Buffer.from(fresh.base64, 'base64')), 'the commit references the blob uploaded during the transfer');
+  assert.equal(byName('copy.png').sha, gitBlobShaOf(archivedBytes), 'the reused file points at the archived blob');
   assert.equal(byName('huge.mov'), undefined, 'an oversized file is never written');
   const markdownBlob = blobPosts().find((request) => request.body.encoding === 'utf-8' && request.body.content.includes('# Sync test'));
   assert.match(markdownBlob.body.content, /\*\*Not archived: huge\.mov\*\* \(150\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/);
@@ -2173,7 +2184,7 @@ test('the upload limit is set on the base64 JSON request, not on the file size',
   // locally, before any request reaches GitHub.
   const fits = 'A'.repeat(MAX_BLOB_REQUEST_BYTES - JSON.stringify({ content: '', encoding: 'base64' }).length);
   const blob = await createBlob(fits, 'base64');
-  assert.match(blob.sha, /^blob-/);
+  assert.match(blob.sha, /^[0-9a-f]{40}$/, 'a real Git blob ID, checked against the bytes sent');
   const before = harness.requests.length;
   await assert.rejects(createBlob(`${fits}A`, 'base64'), (error) => error instanceof BlobTooLargeError && error.remote === null);
   assert.equal(harness.requests.length, before, 'an over-limit blob is never sent');
@@ -2215,7 +2226,8 @@ test('an oversized file is recorded in the index and Markdown, and a repeat sync
     'the report does not call a file one byte over the limit "30.0 MiB, larger than 30.0 MiB"');
 
   // The same export again, against the archive the first sync produced.
-  const repeat = makeBackgroundSyncHarness({ indexText: JSON.stringify(index) });
+  // The branch as the first sync left it: the archived file holds its bytes.
+  const repeat = makeBackgroundSyncHarness({ indexText: JSON.stringify(index), archivedBytes: { [entry.assets[0].path]: Buffer.from(fits.base64, 'base64') } });
   const again = await repeat.sync([conversation()], () => {});
   assert.equal(again.commit, null, 'nothing changed, so nothing is committed');
   assert.equal(blobPostsOf(repeat).length, 0, 'the oversized file (and everything else) is not uploaded again');
@@ -2290,7 +2302,7 @@ test('archived bytes are reused instead of uploaded again, and bytes GitHub refu
     assets: [{ path: archivedPath, sha256: archived.sha256, size: archived.size, name: 'logo.png' }],
     incomplete: [{ kind: 'attachment', name: 'huge.html', reason: '14.6 KiB; GitHub rejected the upload as too large to process (HTTP 422: "Sorry, your input was too large to process.")', too_large: true, github_rejected: true, sha256: refused.sha256, size: refused.size }],
   }] });
-  const harness = makeBackgroundSyncHarness({ indexText, blobResponder: () => null });
+  const harness = makeBackgroundSyncHarness({ indexText, blobResponder: () => null, archivedBytes: { [archivedPath]: Buffer.from(archived.base64, 'base64') } });
   const result = await harness.sync([conversationWith('c1', [archived, refused], { title: 'Updated' })], () => {});
   assert.equal(result.commit, 'new-commit');
   const uploaded = blobPostsOf(harness).map((request) => request.body.content);
@@ -2308,11 +2320,12 @@ test('archived bytes are reused instead of uploaded again, and bytes GitHub refu
     updated_at: '2026-10-01T00:00:00.000Z', format_version: 4,
     assets: [{ path: 'archive/conversations/claude/personal/assets/legacy/logo.png', sha256: archived.sha256, size: archived.size, name: 'logo.png' }],
   }] });
-  const moved = makeBackgroundSyncHarness({ indexText: movedIndex });
+  const legacyPath = 'archive/conversations/claude/personal/assets/legacy/logo.png';
+  const moved = makeBackgroundSyncHarness({ indexText: movedIndex, archivedBytes: { [legacyPath]: Buffer.from(archived.base64, 'base64') } });
   await moved.sync([conversationWith('c1', [archived], { title: 'Moved' })], () => {});
   assert.equal(blobPostsOf(moved).some((request) => request.body.content === archived.base64), false);
   const movedTree = moved.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/git/trees')).body.tree;
-  assert.equal(movedTree.find((entry) => entry.path === archivedPath).sha, 'existing-archive/conversations/claude/personal/assets/legacy/logo.png');
+  assert.equal(movedTree.find((entry) => entry.path === archivedPath).sha, gitBlobShaOf(Buffer.from(archived.base64, 'base64')));
 });
 
 test('a file that was unavailable before is archived by a later sync and the conversation is complete again', async () => {
@@ -2679,4 +2692,53 @@ test('the sync summary and report state how oversized downloads were handled, fr
     const outcome = await other.sync(sampleConversation(), () => {}, [], { oversizedStats: bad });
     assert.equal('oversized' in outcome.report, false, `ignored: ${JSON.stringify(bad)}`);
   }
+});
+
+// ---- P0.4: GitHub must hold exactly the verified bytes ----
+
+test('a blob ID GitHub returns for other bytes is never referenced, for attachments and Markdown alike', async () => {
+  const wrong = { status: 201, body: { sha: '0'.repeat(40) } };
+  const asset = fileAsset('photo.png', 'real photo bytes');
+  for (const [what, responder] of [
+    ['attachment', (body) => (body.content === asset.base64 ? wrong : null)],
+    ['Markdown', (body) => (body.encoding === 'utf-8' && body.content.includes('# Conversation c1') ? wrong : null)],
+  ]) {
+    const harness = makeBackgroundSyncHarness({ indexText: emptyIndex(), blobResponder: responder });
+    await assert.rejects(harness.sync([conversationWith('c1', [asset])], () => {}),
+      /GitHub returned blob 0{40} for an upload whose bytes have blob ID [0-9a-f]{40}\. Nothing was published; sync again\./, what);
+    assert.equal(countRequests(harness, 'POST', '/git/trees'), 0, `${what}: no tree references it`);
+    assert.equal(countRequests(harness, 'PATCH', '/git/refs/heads/master'), 0, `${what}: nothing published`);
+  }
+});
+
+test('an archived file changed outside AI Archive (same size) is not reused for these bytes, and is repaired', async () => {
+  const asset = fileAsset('photo.png', 'real photo bytes');
+  const path = makeBackgroundSyncHarness({ indexText: emptyIndex() }).hooks
+    .normalizeAssetList(conversationWith('c1', [asset]), 'claude', 'personal').assets[0].path;
+  // A fresh export for every sync: a sync marks the assets it staged.
+  const conversation = () => conversationWith('c1', [{ ...asset }]);
+  const first = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  await first.sync([conversation()], () => {});
+  const index = first.lastCommittedArchive().index;
+
+  // The index still records the photo's SHA-256 and size, but the file on the
+  // branch now holds other bytes of the same length.
+  const tampered = Buffer.from('fake photo bytes');
+  assert.equal(tampered.length, Buffer.from(asset.base64, 'base64').length);
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify(index), archivedBytes: { [path]: tampered } });
+  const progress = [];
+  const result = await harness.sync([conversation()], (event) => progress.push(event));
+  assert.equal(result.commit, 'new-commit', 'the conversation is rewritten to repair it');
+  assert.match(progress.at(-1).message, /1 archived attachment did not hold the bytes just downloaded and verified \(changed outside AI Archive\?\) and was rewritten with them; the previous version remains in the repository history\./);
+  const uploads = blobPostsOf(harness).map((request) => request.body.content);
+  assert.ok(uploads.includes(asset.base64), 'the real bytes are uploaded instead of trusting the archived blob');
+  assert.equal(result.report.repairedFiles, 1);
+  const write = harness.lastCommittedArchive().tree.get(path);
+  assert.equal(write, gitBlobShaOf(Buffer.from(asset.base64, 'base64')), 'the path now holds the verified bytes');
+
+  // Unchanged bytes on the branch are reused and nothing is rewritten.
+  const intact = makeBackgroundSyncHarness({ indexText: JSON.stringify(index), archivedBytes: { [path]: Buffer.from(asset.base64, 'base64') } });
+  const again = await intact.sync([conversation()], () => {});
+  assert.equal(again.commit, null);
+  assert.equal(blobPostsOf(intact).length, 0);
 });

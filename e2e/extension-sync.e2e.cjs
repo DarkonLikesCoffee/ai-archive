@@ -44,7 +44,8 @@ function createFakeGitHub() {
   let rejectBlobBodiesOver = 0;
   const blobPosts = [];
   const sha = (value) => crypto.createHash('sha1').update(value).digest('hex');
-  const putBlob = (buffer) => { const id = sha(Buffer.concat([Buffer.from('blob'), buffer])); blobs.set(id, buffer); return id; };
+  // Real Git blob IDs (SHA-1 of "blob <size>\0" + bytes): the extension checks them.
+  const putBlob = (buffer) => { const id = sha(Buffer.concat([Buffer.from(`blob ${buffer.length}\0`), buffer])); blobs.set(id, buffer); return id; };
   const putTree = (entries) => { const id = sha(`tree${JSON.stringify([...entries].sort())}`); trees.set(id, new Map(entries)); return id; };
   const putCommit = (tree, parents, message) => { const id = sha(`commit${tree}${parents.join()}${message}${commits.size}`); commits.set(id, { sha: id, tree: { sha: tree }, parents: parents.map((p) => ({ sha: p })), message }); return id; };
   const json = (status, body) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
