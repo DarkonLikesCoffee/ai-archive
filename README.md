@@ -1,5 +1,10 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.26 — GitHub must hold exactly the verified bytes
+- Every uploaded file (attachments, Markdown and the index) is checked against the blob ID GitHub returns. That ID is a hash of the stored bytes, and it must equal the one computed from the bytes sent; otherwise nothing is published.
+- An attachment already in the archive is reused only when its stored blob provably holds the same bytes. Before, matching size and SHA-256 metadata in the index was enough.
+- If an archived attachment no longer holds the bytes just downloaded (for example it was changed outside AI Archive), the conversation is rewritten with the verified bytes and the sync report says so. The previous version stays in the repository history.
+
 ## Extension v0.5.25 — identity of oversized sandbox files
 - Claude-generated files from the conversation's sandbox file list were always downloaded without their Claude file ID, so the oversized-download skip could never apply to them ("no-file-id"). They now take the ID of the one message file entry that names their exact sandbox path, which is the same ID the archive records for them. If several different IDs name that path, the file is downloaded. Files are never matched by name.
 - The diagnostic counters add `downloaded_routes`: which download path each oversized file took.

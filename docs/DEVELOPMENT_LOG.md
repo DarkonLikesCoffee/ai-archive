@@ -2,6 +2,29 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Attachment verification, slice 1 — 2026-11-05 (extension 0.5.26, ROADMAP P0.4)
+
+- **P1.3 live result (owner, 0.5.25, "All conversations").** 802 listed, 798 unchanged, 7 oversized attachments skipped, 692.6 MiB not downloaded again, 0 downloaded in full. This confirms the live behaviour of the oversized-download skip, including the sandbox-file identity fix. ROADMAP P1.3 updated.
+- **Audit.** `docs/design/attachment-verification.md` traces every path from response to archive: message files, Files API, generated sandbox files, legacy sandbox paths, inline media and tool-result media. Download, size, SHA-256 and transfer checks were confirmed as sound. Two gaps were confirmed at the GitHub end; a test was written first for each and fails on 0.5.25:
+  1. `createBlob` trusted the blob ID GitHub returned. It now computes the Git blob ID (SHA-1 of `blob <size>\0` + bytes) of what it sent and refuses any other ID, so nothing is published. This applies to attachments, Markdown and the index.
+  2. Archived bytes were reused when the *index's* SHA-256 and the tree's size matched. A file changed outside AI Archive at the same size would have been reused and kept, leaving the index's SHA-256 false. Reuse now requires the archived blob ID to equal that of the bytes in hand. A path whose blob differs from the verified bytes is rewritten when its conversation is synced; `report.repairedFiles` and the summary say so, and the old version stays in Git history.
+- **Compatibility.** An unchanged archived file's blob ID equals the computed one, so existing archives are not rewritten. Verified: the repeat-sync tests make no commit when the bytes are intact.
+- **Test harness changes.**
+  - The unit and E2E fakes now return real Git blob IDs. The E2E fake previously hashed `"blob" + bytes`.
+  - New `archivedBytes` harness option, so a test can state what an archived file really holds.
+  - Fixed a harness race: a delayed blob response read the body of a later request.
+  - Assertions that expected fake IDs (`blob-1`, `existing-…`) now expect the real ID of the same bytes.
+- **Tests.**
+  - `node --test extension/*.test.js`: 221/221.
+  - `cd web && npm test`: 89/89; `npm run build` passes.
+  - `node e2e/extension-sync.e2e.cjs`: 50/50.
+- **Still open in P0.4:**
+  - the MIME type is not checked against the bytes;
+  - tool-result media that doesn't decode leaves only its inline note;
+  - unavailable-at-source / download-failed / upload-refused categories (next slice);
+  - real-account checks of representative files (owner).
+- **Next task.** P0.4 slice 2: distinguish unavailable-at-source, download-failed and GitHub-upload-refused in the index and report, without rewriting archived Markdown.
+
 ## Why all 7 oversized downloads were `no-file-id` — 2026-11-05 (extension 0.5.25)
 
 - **Live 0.5.24 result.** 7 detected, 0 skipped, 7 downloaded (692.6 MiB), all with reason `no-file-id`. The owner's diagnostic report was not attached to the request, so the cause was traced from the code; the report's per-route evidence is still to come.
