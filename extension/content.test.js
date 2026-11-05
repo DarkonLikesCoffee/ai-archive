@@ -3567,3 +3567,49 @@ test('an archive problem that blocks every sync stops the sync before any conver
   assert.equal(harness.requests.some((url) => url.includes(`/chat_conversations/${BIG_ID}`)), false, 'no conversation was downloaded');
   assert.equal(harness.handoffs.length, 0, 'nothing was handed to the background');
 });
+
+test('oversized-download counters separate skipped downloads from full ones, with the reason and bytes, and nothing private', async () => {
+  const skipped = await syncWithRecordedOversizedFile({ headers: { 'Content-Length': String(RECORDED_SIZE) } });
+  const skippedStats = { detected: 1, skipped: 1, skipped_bytes: RECORDED_SIZE, downloaded: 0, downloaded_bytes: 0, downloaded_reasons: {} };
+  assert.deepEqual(JSON.parse(JSON.stringify(skipped.handoff.oversizedStats)), skippedStats);
+  assert.deepEqual(JSON.parse(JSON.stringify(skipped.harness.storageState.last_sync_diagnostics.oversized_downloads)), skippedStats,
+    'the diagnostic report carries the same counters');
+
+  // Each reason a real oversized file is still downloaded in full.
+  const big = 'x'.repeat(OVERSIZE_LIMIT + 1);
+  const cases = {
+    'not-recorded': { oversized: [] },
+    'size-unconfirmed': {},
+    'size-changed': { headers: { 'Content-Length': String(OVERSIZE_LIMIT + 1) } },
+    'no-archive-state': { limit: '10', headers: { 'Content-Length': String(RECORDED_SIZE) } },
+    'no-file-id': { file: { file_uuid: undefined }, headers: { 'Content-Length': String(RECORDED_SIZE) } },
+  };
+  for (const [reason, options] of Object.entries(cases)) {
+    const conversation = plainConversation(BIG_ID);
+    conversation.chat_messages[0].files = [{ file_uuid: 'file-big', file_name: 'Private lecture.mp4', preview_url: BIG_URL, mime_type: 'video/mp4', ...(options.file || {}) }];
+    const harness = createHarness(conversation, {
+      storage: {},
+      conversationListResponse: [{ uuid: BIG_ID, name: 'Big', updated_at: '2026-10-20T08:00:00Z' }],
+      archiveState: [],
+      archiveOversized: options.oversized ?? [{ id: BIG_ID, file_uuid: 'file-big', size: RECORDED_SIZE, sha256: RECORDED_SHA }],
+      assetResponses: { [BIG_URL]: { content: big, contentType: 'video/mp4', headers: options.headers || {} } },
+    });
+    harness.onMessage({ type: 'startSync', limit: options.limit || 'all' }, {}, () => {});
+    const handoff = await harness.firstHandoff;
+    harness.finishFirstHandoff({ ok: true });
+    const expected = { detected: 1, skipped: 0, skipped_bytes: 0, downloaded: 1, downloaded_bytes: OVERSIZE_LIMIT + 1, downloaded_reasons: { [reason]: 1 } };
+    assert.deepEqual(JSON.parse(JSON.stringify(handoff.oversizedStats)), expected, reason);
+    assert.equal(handoff.oversizedDownloadsSkipped ?? 0, 0, reason);
+    const stored = JSON.stringify(harness.storageState.last_sync_diagnostics.oversized_downloads);
+    assert.deepEqual(JSON.parse(stored), expected, `${reason}: stored`);
+    for (const secret of ['Private', 'lecture', 'file-big', BIG_ID, 'files.example']) {
+      assert.equal(stored.includes(secret), false, `${reason}: counters contain no ${secret}`);
+    }
+  }
+});
+
+test('a sync without oversized files adds no counters', async () => {
+  const { handoff, harness } = await syncWithRecordedOversizedFile({ oversized: [] });
+  assert.equal(handoff.oversizedStats ?? null, null, 'a small file is not counted');
+  assert.equal('oversized_downloads' in harness.storageState.last_sync_diagnostics, false);
+});

@@ -44,7 +44,7 @@ function loadPopup({ tabs = {} } = {}) {
     fetch: async () => { throw new Error('unexpected fetch'); },
     setTimeout: (fn) => setImmediate(fn),
   };
-  vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__describeSyncReport = describeSyncReport;\nglobalThis.__sendToClaude = sendToClaude;
+  vm.runInNewContext(`${popupSource}\nglobalThis.__describeRepoCheck = describeRepoCheck;\nglobalThis.__describeLastSync = describeLastSync;\nglobalThis.__describeSyncReport = describeSyncReport;\nglobalThis.__describeOversizedDownloads = describeOversizedDownloads;\nglobalThis.__sendToClaude = sendToClaude;
 globalThis.__renderAccountOptions = renderAccountOptions;
 globalThis.__findExistingAccountName = findExistingAccountName;
 globalThis.__createArchiveAccount = createArchiveAccount;
@@ -56,6 +56,7 @@ globalThis.__getLastDiagnostics = () => lastDiagnostics;`, context);
     describeRepoCheck: context.__describeRepoCheck,
     describeLastSync: context.__describeLastSync,
     describeSyncReport: context.__describeSyncReport,
+    describeOversizedDownloads: context.__describeOversizedDownloads,
     sendToClaude: context.__sendToClaude,
     renderAccountOptions: context.__renderAccountOptions,
     findExistingAccountName: context.__findExistingAccountName,
@@ -294,4 +295,14 @@ test('offers the diagnostic report of the current extension version and hides it
   await disconnectGithubSettings();
   assert.equal(button.classes.has('hidden'), true, 'disconnecting hides the report');
   assert.equal(getLastDiagnostics(), null);
+});
+
+test('the popup report states how many oversized downloads were avoided and how many still happened', () => {
+  const { describeOversizedDownloads } = loadPopup();
+  assert.equal(describeOversizedDownloads({ detected: 7, skipped: 7, skipped_bytes: 7 * 32 * 1024 * 1024, downloaded: 0, downloaded_bytes: 0 }),
+    'Attachments over the upload limit: 7 — 7 not downloaded again (224.0 MiB saved), 0 downloaded in full.');
+  assert.equal(describeOversizedDownloads({ detected: 7, skipped: 0, skipped_bytes: 0, downloaded: 7, downloaded_bytes: 7 * 32 * 1024 * 1024 }),
+    'Attachments over the upload limit: 7 — 0 not downloaded again, 7 downloaded in full (224.0 MiB).');
+  assert.equal(describeOversizedDownloads(undefined), '', 'reports from before 0.5.24 show no line');
+  assert.equal(describeOversizedDownloads({ detected: 0 }), '');
 });

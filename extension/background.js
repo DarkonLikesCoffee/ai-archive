@@ -914,14 +914,43 @@ const listTitles = (items, describe, limit = 5) => {
 };
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
+// Why an oversized download was not skipped (oversizedSkipBlocker in content.js).
+const OVERSIZED_REASON_LABELS = {
+  'no-archive-state': 'no archive state for this sync',
+  'no-file-id': 'no Claude file ID',
+  'not-recorded': 'not yet recorded in the archive',
+  'size-unconfirmed': "Claude's response did not state its exact size",
+  'size-changed': 'its size differs from the recorded one',
+};
+
+// Counters from the Claude tab, reduced to known fields of whole numbers.
+function sanitizeOversizedStats(value) {
+  if (!value || typeof value !== 'object') return null;
+  const count = (n) => (Number.isSafeInteger(n) && n >= 0 ? n : 0);
+  const stats = {
+    detected: count(value.detected), skipped: count(value.skipped), skipped_bytes: count(value.skipped_bytes),
+    downloaded: count(value.downloaded), downloaded_bytes: count(value.downloaded_bytes), downloaded_reasons: {},
+  };
+  for (const [reason, n] of Object.entries(value.downloaded_reasons && typeof value.downloaded_reasons === 'object' ? value.downloaded_reasons : {})) {
+    if (Object.hasOwn(OVERSIZED_REASON_LABELS, reason) && count(n)) stats.downloaded_reasons[reason] = count(n);
+  }
+  return stats.detected ? stats : null;
+}
+
 // One sentence per outcome other than "written", so a partial sync is never
 // mistaken for a complete one. `report` lists every conversation by ID.
 function syncReportSummary(report) {
   let text = '';
   if (report.listed != null) text += ` Claude listed ${plural(report.listed, 'conversation', 'conversations')}.`;
   if (report.unchanged) text += ` ${plural(report.unchanged, 'unchanged conversation was', 'unchanged conversations were')} not downloaded again.`;
+  const skippedBytes = report.oversized?.skipped_bytes;
   if (report.oversizedDownloadsSkipped) {
-    text += ` ${plural(report.oversizedDownloadsSkipped, 'attachment over the upload limit was', 'attachments over the upload limit were')} not downloaded again: Claude reported the exact size already recorded in the archive.`;
+    text += ` ${plural(report.oversizedDownloadsSkipped, 'attachment over the upload limit was', 'attachments over the upload limit were')} not downloaded again${skippedBytes ? ` (${formatBytes(skippedBytes)} not downloaded)` : ''}: Claude reported the exact size already recorded in the archive.`;
+  }
+  if (report.oversized?.downloaded) {
+    const reasons = Object.entries(report.oversized.downloaded_reasons || {})
+      .map(([reason, count]) => `${OVERSIZED_REASON_LABELS[reason] || reason}: ${count}`).join('; ');
+    text += ` ${plural(report.oversized.downloaded, 'attachment over the upload limit was', 'attachments over the upload limit were')} downloaded in full (${formatBytes(report.oversized.downloaded_bytes)}) and left out, because the download could not be skipped safely${reasons ? ` (${reasons})` : ''}.`;
   }
   if (report.archiveStateError) {
     text += report.fullList
@@ -1119,12 +1148,13 @@ async function archiveSyncState() {
   return { conversations, oversized };
 }
 
-async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null, oversizedDownloadsSkipped = 0 } = {}) {
+async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null, oversizedDownloadsSkipped = 0, oversizedStats = null } = {}) {
   const unchanged = Array.isArray(unchangedIds) ? unchangedIds.map(String) : [];
   const failedItems = Array.isArray(skipped) ? skipped : [];
   const report = {
     listed: fullList && Number.isFinite(listed) ? listed : null,
     ...(Number.isSafeInteger(oversizedDownloadsSkipped) && oversizedDownloadsSkipped > 0 ? { oversizedDownloadsSkipped } : {}),
+    ...(sanitizeOversizedStats(oversizedStats) ? { oversized: sanitizeOversizedStats(oversizedStats) } : {}),
     ...(typeof archiveStateError === 'string' && archiveStateError ? { archiveStateError: archiveStateError.slice(0, 300), fullList } : {}),
     committed: [],
     unchanged: unchanged.length,
@@ -1988,6 +2018,7 @@ function completeTransfer(msg) {
     listed: Number.isFinite(metadata.listed) ? metadata.listed : null,
     archiveStateError: typeof metadata.archiveStateError === 'string' ? metadata.archiveStateError.slice(0, 300) : null,
     oversizedDownloadsSkipped: Number.isSafeInteger(metadata.oversizedDownloadsSkipped) && metadata.oversizedDownloadsSkipped > 0 ? metadata.oversizedDownloadsSkipped : 0,
+    oversizedStats: sanitizeOversizedStats(metadata.oversizedStats),
     conversations: transfer.conversations,
   };
 }
@@ -2120,6 +2151,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       listed: Number.isFinite(payload.listed) ? payload.listed : null,
       archiveStateError: typeof payload.archiveStateError === 'string' ? payload.archiveStateError : null,
       oversizedDownloadsSkipped: Number.isSafeInteger(payload.oversizedDownloadsSkipped) ? payload.oversizedDownloadsSkipped : 0,
+      oversizedStats: sanitizeOversizedStats(payload.oversizedStats),
     })
       .finally(() => {
         if (runningTransferId === msg.transferId) runningTransferId = null;

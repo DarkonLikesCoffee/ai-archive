@@ -1,5 +1,9 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.24 — counters for oversized downloads
+- The popup's sync report now has a line such as "Attachments over the upload limit: 7 — 7 not downloaded again (… saved), 0 downloaded in full". Before, whether an oversized download was skipped appeared only in a summary the popup hides whenever it shows per-conversation problems.
+- The diagnostic report adds `oversized_downloads`: counts, byte totals, and the reason code for each download that could not be skipped. It contains no names, IDs or URLs.
+
 ## Extension v0.5.23 — sync failure review
 - If `archive/index.json` is missing while the archive already holds conversations, syncing is refused, naming the problem. Before, a sync started a new index that listed only the conversations it had just synced, hiding all the others. Restore the index from the repository history, or see `docs/design/index-rebuild.md`.
 - Archive problems that would make every sync fail (a missing or corrupt index, or a tree too large for GitHub to return in full) now stop a sync before anything is downloaded from Claude.

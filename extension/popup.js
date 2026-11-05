@@ -139,6 +139,25 @@ function describeSyncReport(report) {
   return entries;
 }
 
+function popupBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return 'unknown size';
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+// One line about attachments over the upload limit in the last sync: how many
+// downloads were avoided and how many still happened (counts only).
+function describeOversizedDownloads(stats) {
+  if (!stats || !Number.isSafeInteger(stats.detected) || stats.detected <= 0) return '';
+  const skipped = Number.isSafeInteger(stats.skipped) ? stats.skipped : 0;
+  const downloaded = Number.isSafeInteger(stats.downloaded) ? stats.downloaded : 0;
+  const parts = [`${skipped} not downloaded again${skipped ? ` (${popupBytes(stats.skipped_bytes)} saved)` : ''}`];
+  parts.push(`${downloaded} downloaded in full${downloaded ? ` (${popupBytes(stats.downloaded_bytes)})` : ''}`);
+  return `Attachments over the upload limit: ${stats.detected} — ${parts.join(', ')}.`;
+}
+
 function showSyncReport(report) {
   const panel = $('syncReport');
   if (!panel) return;
@@ -155,6 +174,13 @@ function showSyncReport(report) {
   const note = document.createElement('span');
   note.textContent = 'Expand an item to see which attachment was skipped.';
   summary.append(title, note);
+  const oversized = describeOversizedDownloads(report.oversized);
+  if (oversized) {
+    const line = document.createElement('span');
+    line.className = 'report-oversized';
+    line.textContent = oversized;
+    summary.append(line);
+  }
   const list = document.createElement('div');
   list.className = 'report-list';
   for (const entry of entries) {

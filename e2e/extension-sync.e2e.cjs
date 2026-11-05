@@ -482,6 +482,11 @@ function handleClaude(url) {
         && hugeMarkdown && /\*\*Not archived: big-\d+\.bin\*\* \(31\.0 MiB; larger than the 30\.0 MiB AI Archive can upload through GitHub's API\)/.test(hugeMarkdown[1].toString())
         && !Object.keys(files).some((file) => file.endsWith(`big-${hugeIndex}.bin`)), lastMessage);
 
+      // The first sync must download it to learn its identity, and says so.
+      const firstLine = await popup.locator('#syncReport .report-oversized').textContent().catch(() => '');
+      check('the popup says the oversized file was downloaded in full on first sight',
+        firstLine === 'Attachments over the upload limit: 1 — 0 not downloaded again, 1 downloaded in full (31.0 MiB).', firstLine);
+
       // The oversized file is the sync's only problem: the popup still offers
       // the diagnostic report (it was missing in 0.5.20 on a real account).
       const diagnosticsShown = await popup.locator('#copyDiagnostics:not(.hidden)').count();
@@ -504,7 +509,10 @@ function handleClaude(url) {
       // repeat sync cancels the download after the headers and still produces
       // byte-identical Markdown and index (hence no commit above).
       check('a repeat sync does not download the recorded oversized file again',
-        /1 attachment over the upload limit was not downloaded again/.test(lastMessage), lastMessage.slice(0, 400));
+        /1 attachment over the upload limit was not downloaded again \(31\.0 MiB not downloaded\)/.test(lastMessage), lastMessage.slice(0, 400));
+      const repeatLine = await popup.locator('#syncReport .report-oversized').textContent().catch(() => '');
+      check('the popup report shows the skipped download and the bytes saved',
+        repeatLine === 'Attachments over the upload limit: 1 — 1 not downloaded again (31.0 MiB saved), 0 downloaded in full.', repeatLine);
     }
 
     // The shape of the conversation that failed on a real account with
