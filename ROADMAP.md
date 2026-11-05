@@ -46,7 +46,7 @@ Acceptance: each failure mode has a test and documented user-visible outcome; no
 ### P0.4 Attachment verification
 - [x] Verify message-level file references, generated workspace files, legacy sandbox files, inline media and tool-result media. (Code audit with synthetic tests: `docs/design/attachment-verification.md`. Real-account checks are still pending; see below.)
 - [ ] Verify each saved file's bytes, MIME, size and SHA-256 against its source when possible. Done: bytes, size and SHA-256 are checked from download through transfer; GitHub's blob ID must match the bytes sent; archived blobs are reused only when proven identical, and differing files are repaired (0.5.26). Open: the MIME type is not checked against the bytes.
-- [ ] Distinguish unavailable-at-source from download-failed and GitHub-upload-refused.
+- [x] Distinguish unavailable-at-source from download-failed and GitHub-upload-refused. (0.5.27: sync report, popup and diagnostics; derived from recorded data, so no Markdown or index changes. Left-out files: `unavailable-at-source` / `over-limit` / `upload-refused`. Left-out conversations: `download-failed` / `validation-failed` / `export-failed` / `over-limit`.)
 - [ ] Keep real-account validation pending until the user checks representative exported files.
 
 Acceptance: synthetic tests cover all known payload shapes; manual real-account test checklist is documented; no claim of live correctness without actual verification.
@@ -62,7 +62,7 @@ Acceptance: synthetic tests cover all known payload shapes; manual real-account 
 ### P1.2 Diagnostics
 - [ ] Audit diagnostic reports for usefulness and privacy.
 - [ ] Ensure reports identify endpoint/shape/status without including message content, secrets, file contents or sensitive identifiers.
-- [ ] Add clear categories for source-unavailable, fetch-failed, transfer-failed, validation-failed and upload-refused.
+- [ ] Add clear categories for source-unavailable, fetch-failed, transfer-failed, validation-failed and upload-refused. (Partly done in 0.5.27: source-unavailable, download/fetch-failed, validation-failed and upload-refused appear in the sync report, popup and diagnostics. Open: transfer failures still end the whole sync with a message rather than a category.)
 - [ ] Ensure stale reports cannot be mistaken for the latest sync.
 - [x] A sync whose only problems are oversized attachments stores a diagnostic report, so the popup offers it (0.5.21).
 - [ ] Attachments GitHub refuses during upload (HTTP 422) are detected in the background and still produce no diagnostic item.

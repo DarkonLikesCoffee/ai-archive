@@ -12,7 +12,7 @@ The product's highest promise is **faithful preservation without silent data los
 
 - `development` is the integration branch. Claude Code cloud sessions should use `development` as their base branch, work on their session branch, and open a PR targeting `development`. After verification, use GitHub's native PR auto-merge for PRs targeting `development` when it is enabled; never bypass required checks or reviews. Do not attempt to push directly from a cloud session if its branch is session-managed. Never merge to or push to `master` unless the user explicitly asks.
 - Baseline when these instructions were written: commit `37a26a97005c7510b89c11fbbf8c3e85b9aabb46`.
-- Extension manifest version: `0.5.26`.
+- Extension manifest version: `0.5.27`.
 - Web app package version: `0.6.15`.
 - Latest known CI run for the baseline: GitHub Actions run `41703560130`, successful.
 - Claude is the only implemented provider. ChatGPT/Gemini support is a future goal, not permission to start those integrations before the reliability gates in ROADMAP.md are met.

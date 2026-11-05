@@ -3749,3 +3749,29 @@ test('round trip: the identity recorded from a first full sandbox download is th
   assert.deepEqual(JSON.parse(JSON.stringify(textOnly.handoff.oversizedStats.downloaded_reasons)), { 'no-file-id': 1 });
   assert.deepEqual(JSON.parse(JSON.stringify(textOnly.handoff.oversizedStats.downloaded_routes)), { 'sandbox-list': 1 });
 });
+
+test('a conversation left out of a sync carries why: download failed or Claude data failed validation', async () => {
+  const okId = '66666666-7777-4888-8999-aaaaaaaaaaaa';
+  const downloadId = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
+  const invalidId = '88888888-9999-4aaa-8bbb-cccccccccccc';
+  const url = 'https://files.example/photo.png';
+  const conversations = {
+    [okId]: plainConversation(okId),
+    [downloadId]: { ...plainConversation(downloadId), chat_messages: plainConversation(downloadId).chat_messages.map((m, i) => (i === 0 ? { ...m, files: [{ file_uuid: 'f1', file_name: 'photo.png', preview_url: url }] } : m)) },
+    // The active leaf is not among the messages: the lineage cannot be verified.
+    [invalidId]: { ...plainConversation(invalidId), current_leaf_message_uuid: 'missing-leaf' },
+  };
+  const harness = createHarness(conversations[okId], {
+    storage: {},
+    conversationListResponse: Object.keys(conversations).map((uuid, i) => ({ uuid, name: `C${i}`, updated_at: `2026-10-2${i}T08:00:00Z` })),
+    fullConversationResponse: (id) => conversations[id],
+    assetResponses: { [url]: { status: 503 } },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  harness.finishFirstHandoff({ ok: true });
+  const byId = Object.fromEntries(handoff.skipped.map((item) => [item.id, item.category]));
+  assert.deepEqual(byId, { [downloadId]: 'download-failed', [invalidId]: 'validation-failed' });
+  const failed = harness.storageState.last_sync_diagnostics.items.filter((item) => item.outcome === 'failed');
+  assert.deepEqual(Object.fromEntries(failed.map((item) => [item.conversation_id, item.category])), byId, 'the diagnostic report names the category too');
+});

@@ -44,12 +44,28 @@ Extension 0.5.26. This traces each attachment path from Claude's response to the
    - Archived as message attachments when the base64 decodes. Payloads that don't decode stay redacted in the fenced result (`[omitted … payload]`) and are not recorded as incomplete: there are no valid bytes to archive.
    - Status: confirmed. The visible note is the only record (see below).
 
+## Failure categories (0.5.27, slice 2)
+
+The sync report, popup and diagnostic report now say *why* something was left out. The categories are derived from data already recorded, so the Markdown and index are unchanged.
+- **Files:**
+  - `unavailable-at-source`: Claude gave no download, or answered 404/410;
+  - `over-limit`: never sent;
+  - `upload-refused`: GitHub refused it (HTTP 422/413).
+- **Conversations left out of a sync:**
+  - `download-failed`: a file or file list was not delivered (network, 5xx, 403, 429); retried next sync;
+  - `validation-failed`: Claude's data failed a safety check, such as lineage, IDs or an unreadable payload;
+  - `over-limit`: the transcript exceeds the request limit;
+  - `export-failed`: anything else.
+
 ## Remaining gaps (not fixed in this slice)
 
 - **MIME type not verified against the bytes.** A wrong declared type changes how the viewer shows a file, never the bytes or their hash. Content sniffing would be a heuristic; low priority.
 - **Undecodable tool-result media** leaves only the inline redaction note, not an `incomplete[]` entry. Low risk, since the source data itself is invalid. Could be added as an incomplete item with kind `tool-result-media`, but that would change Markdown and index output for affected conversations.
 - **Unchanged conversations are never re-verified.** A file changed outside AI Archive is repaired only when its conversation is synced again. `web/scripts/verify-archive.mjs --hashes` detects such files read-only across the whole archive.
-- **Live verification pending** for real-account bytes of the five paths: compare representative archived files with the originals in Claude (P0.4 checklist item).
+- **Live verification pending** for real-account bytes of the five paths (P0.4). Checklist for the owner:
+  1. For one conversation of each kind (an uploaded file, a Claude-generated file, a legacy sandbox file, an inline image, a tool-result screenshot), open the archived file from the viewer and compare it with the original in Claude: it should open, look the same, and have the same size.
+  2. Run `web/scripts/verify-archive.mjs <owner>/<repo> --markdown --hashes` with a read-only token. Expect no errors; "incomplete" warnings should only be the files reported as not archived.
+  3. Report any mismatch with its category from the popup; no file contents are needed.
 
 ## Tests (0.5.26)
 
