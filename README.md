@@ -1,5 +1,9 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.27 — why something was left out
+- The sync report and popup now say why each conversation or file was left out. A conversation shows "Download from Claude failed", "Claude's data failed a safety check" or "Too large for GitHub". A file shows "not available from Claude", "over the upload limit" or "refused by GitHub".
+- The diagnostic report records the same category for each conversation that could not be exported. Nothing in the archive changes: categories are derived from what is already recorded.
+
 ## Extension v0.5.26 — GitHub must hold exactly the verified bytes
 - Every uploaded file (attachments, Markdown and the index) is checked against the blob ID GitHub returns. That ID is a hash of the stored bytes, and it must equal the one computed from the bytes sent; otherwise nothing is published.
 - An attachment already in the archive is reused only when its stored blob provably holds the same bytes. Before, matching size and SHA-256 metadata in the index was enough.

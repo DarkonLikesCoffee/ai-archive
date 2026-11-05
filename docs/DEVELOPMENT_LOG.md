@@ -2,6 +2,24 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Attachment verification, slice 2: failure categories — 2026-11-05 (extension 0.5.27, ROADMAP P0.4)
+
+- **Gap.** A left-out file or conversation was described only by free text. The popup said "Not exported" for every failed conversation, and the same "attachments missing" whether Claude had no file, the file was over the limit, or GitHub refused it.
+- **Change.**
+  - The content script tags download failures (`fetchAsset`, the sandbox list, Files API downloads) as `download-failed`, and classifies Claude-data safety failures as `validation-failed`. Each skipped conversation and its diagnostic item carries the category.
+  - The background keeps `report.failed[].category` (sanitized to known values) and derives `report.incomplete[].categories` from the recorded fields: `too_large` and `github_rejected`.
+  - The popup subtitles name the category. Older stored reports keep their old wording.
+  - **Nothing in the archive changes.** The index and Markdown keep their exact representation (tested).
+- **Tests.**
+  - `node --test extension/*.test.js`: 224/224. New: content categories for a 503 download and a broken lineage, including the diagnostic copy; background categories and sanitizing; popup subtitles.
+  - `cd web && npm test`: 89/89; `npm run build` passes.
+  - `node e2e/extension-sync.e2e.cjs`: 50/50. One E2E expectation now includes the new subtitle suffix.
+- **P0.4 status.** Code paths are audited and gaps fixed in slices 1–2. Still open:
+  - the MIME type is not checked against the bytes;
+  - tool-result media that doesn't decode;
+  - **real-account checks** (owner checklist in `docs/design/attachment-verification.md`).
+- **Next task.** P1.2: transfer failures as a category; make sure a stale diagnostic report can't be mistaken for the latest sync (verify against `last_sync.at`).
+
 ## Attachment verification, slice 1 — 2026-11-05 (extension 0.5.26, ROADMAP P0.4)
 
 - **P1.3 live result (owner, 0.5.25, "All conversations").** 802 listed, 798 unchanged, 7 oversized attachments skipped, 692.6 MiB not downloaded again, 0 downloaded in full. This confirms the live behaviour of the oversized-download skip, including the sandbox-file identity fix. ROADMAP P1.3 updated.

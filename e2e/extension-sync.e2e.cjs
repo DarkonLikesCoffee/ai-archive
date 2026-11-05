@@ -381,7 +381,7 @@ function handleClaude(url) {
     check('the sync is reported as finished with problems, naming the incomplete conversation',
       github.commitCount() === commitsBeforeReal + 1 && last === 'Last sync finished with problems just now.'
       && incompleteReport.length === 1 && incompleteReport[0].title === 'Base de datos'
-      && incompleteReport[0].state === 'Conversation archived · attachments missing'
+      && incompleteReport[0].state === 'Conversation archived · attachments missing: not available from Claude'
       && incompleteReport[0].details.join() === 'BD-GICD-Tema2-MER+DC+UML.pdf', `${last} ${JSON.stringify(incompleteReport)}`);
     // Clipboard permission cannot be granted to an extension origin here, so
     // record what the real button handler writes.

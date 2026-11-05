@@ -679,7 +679,7 @@
       };
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw Object.assign(new Error(`Failed to download attachment "${label}": ${e?.message || 'network error'}.`), { status: e?.status });
+      throw Object.assign(new Error(`Failed to download attachment "${label}": ${e?.message || 'network error'}.`), { status: e?.status, category: 'download-failed' });
     }
   }
 
@@ -762,7 +762,7 @@
       r = await fetch(endpoint, { credentials: 'include', signal });
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}": ${e?.message || 'network error'}.`);
+      throw Object.assign(new Error(`Could not list Claude sandbox files for conversation "${conversationId}": ${e?.message || 'network error'}.`), { category: 'download-failed' });
     }
     sandboxInfo.sandbox_list_status = r.status;
     if (!r.ok) {
@@ -771,7 +771,7 @@
     }
     if (r.status === 404) return { assets: [], listStatus: 404 };
     if (!r.ok) {
-      throw new Error(`Could not list Claude sandbox files for conversation "${conversationId}" (HTTP ${r.status}).`);
+      throw Object.assign(new Error(`Could not list Claude sandbox files for conversation "${conversationId}" (HTTP ${r.status}).`), { category: 'download-failed' });
     }
 
     let data;
@@ -821,7 +821,7 @@
             incomplete.push({ kind: 'sandbox-file', name: file.path, reason: `Claude returned HTTP ${e.status} for this file's download` });
             return null;
           }
-          throw new Error(`Failed to download sandbox file "${file.path}": ${e?.message || 'download error'}`);
+          throw Object.assign(new Error(`Failed to download sandbox file "${file.path}": ${e?.message || 'download error'}`), { category: 'download-failed' });
         }
         return { ...asset, source_path: file.path, source: 'sandbox' };
       },
@@ -1236,7 +1236,7 @@
         } catch (e) {
           if (e?.name === 'AbortError') throw e;
           if (!isUnavailable(e)) {
-            throw new Error(`Failed to download Claude file "${safeAssetName(name)}": ${e?.message || 'download error'}`);
+            throw Object.assign(new Error(`Failed to download Claude file "${safeAssetName(name)}": ${e?.message || 'download error'}`), { category: 'download-failed' });
           }
           attempts.push({ via: 'files-api', status: e.status });
           downloaded = null;
@@ -1603,6 +1603,18 @@
     };
   }
 
+  // Why a conversation could not be exported in this sync:
+  //   download-failed    Claude did not deliver a file or file list (network,
+  //                      5xx, 403, 429); a later sync retries
+  //   validation-failed  Claude's data failed a safety check (unreadable or
+  //                      inconsistent conversation, lineage or IDs)
+  //   export-failed      anything else (for example preparing the transfer)
+  function exportFailureCategory(error) {
+    if (error?.category === 'download-failed') return 'download-failed';
+    if (/^(Claude returned|Cannot safely export)/.test(String(error?.message || ''))) return 'validation-failed';
+    return 'export-failed';
+  }
+
   function storeDiagnostics(items, { oversized = null } = {}) {
     try {
       const version = chrome.runtime?.getManifest?.()?.version || null;
@@ -1715,12 +1727,13 @@
             }
           } catch (e) {
             if (e?.name === 'AbortError' || signal.aborted) throw e;
-            diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'failed', { error: sanitizeError(e?.message || e), ...sandboxInfo }));
+            diagnostics.push(diagnosticFor(selected[i].uuid, payload, 'failed', { error: sanitizeError(e?.message || e), category: exportFailureCategory(e), ...sandboxInfo }));
             firstExportError ??= e;
             skipped.push({
               id: selected[i].uuid,
               title: selected[i].name || selected[i].uuid,
               error: String(e?.message || e),
+              category: exportFailureCategory(e),
             });
           }
           payload = null;

@@ -2742,3 +2742,23 @@ test('an archived file changed outside AI Archive (same size) is not reused for 
   assert.equal(again.commit, null);
   assert.equal(blobPostsOf(intact).length, 0);
 });
+
+test('the report names a category for every left-out conversation and every missing file, without changing the archive', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex(), blobResponder: (body) => (body.content === refused.base64 ? TOO_LARGE_422 : null) });
+  const limit = harness.hooks.MAX_ARCHIVED_FILE_BYTES;
+  const refused = fileAsset('refused.html', '<p>'.repeat(2000));
+  const big = { ...fileAsset('big.mov', 'x'), size: limit + 1, base64: '' };
+  const c = conversationWith('c1', [refused, big]);
+  c.incomplete = [{ kind: 'attachment', name: 'gone.pdf', reason: 'Claude did not provide a download link for this file', message_external_id: 'c1-m1' }];
+  const result = await harness.sync([c], () => {}, [
+    { id: 'd1', title: 'D', error: 'Failed to download attachment "x": HTTP 503.', category: 'download-failed' },
+    { id: 'v1', title: 'V', error: 'Claude returned an invalid payload', category: 'validation-failed' },
+    { id: 'o1', title: 'O', error: 'something else', category: '<script>' },
+    { id: 'n1', title: 'N', error: 'from an older content script' },
+  ]);
+  assert.deepEqual(result.report.failed.map((item) => item.category), ['download-failed', 'validation-failed', 'export-failed', 'export-failed']);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.report.incomplete[0].categories)).sort(), ['over-limit', 'unavailable-at-source', 'upload-refused']);
+  // The archive keeps its existing representation: no category in the index.
+  const [entry] = indexOf(harness).conversations;
+  assert.equal(JSON.stringify(entry.incomplete).includes('categor'), false);
+});

@@ -306,3 +306,25 @@ test('the popup report states how many oversized downloads were avoided and how 
   assert.equal(describeOversizedDownloads(undefined), '', 'reports from before 0.5.24 show no line');
   assert.equal(describeOversizedDownloads({ detected: 0 }), '');
 });
+
+test('the popup report names why a conversation or file was left out, and keeps old reports readable', () => {
+  const { describeSyncReport } = loadPopup();
+  const entries = JSON.parse(JSON.stringify(describeSyncReport({
+    failed: [
+      { id: 'd1', title: 'D', error: 'HTTP 503', archived: true, category: 'download-failed' },
+      { id: 'v1', title: 'V', error: 'bad lineage', archived: false, category: 'validation-failed' },
+      { id: 'x1', title: 'X', error: 'older report', archived: false },
+    ],
+    incomplete: [
+      { id: 'c1', title: 'C', missing: ['a.pdf'], categories: ['unavailable-at-source', 'upload-refused'] },
+      { id: 'c2', title: 'Old', missing: ['b.pdf'] },
+    ],
+  })));
+  assert.deepEqual(entries.map((entry) => entry.subtitle), [
+    'Download from Claude failed · previous archive kept',
+    "Claude's data failed a safety check · not in archive",
+    'Not exported · not in archive',
+    'Conversation archived · attachments missing: not available from Claude, refused by GitHub',
+    'Conversation archived · attachments missing',
+  ]);
+});

@@ -118,17 +118,33 @@ function describeLastSync(record, now = Date.now()) {
   return summary ? `${label} ${when}: ${summary}` : `${label} ${when}.`;
 }
 
+// Categories from the background's sync report (older reports have none).
+const FAILURE_LABELS = {
+  'download-failed': 'Download from Claude failed',
+  'validation-failed': "Claude's data failed a safety check",
+  'over-limit': 'Too large for GitHub',
+};
+const MISSING_LABELS = {
+  'unavailable-at-source': 'not available from Claude',
+  'over-limit': 'over the upload limit',
+  'upload-refused': 'refused by GitHub',
+};
+function missingCategoriesText(categories) {
+  const labels = (Array.isArray(categories) ? categories : []).map((category) => MISSING_LABELS[category]).filter(Boolean);
+  return labels.length ? `: ${labels.join(', ')}` : '';
+}
+
 function describeSyncReport(report) {
   if (!report || typeof report !== 'object') return [];
   const entries = [];
   for (const item of Array.isArray(report.failed) ? report.failed : []) {
     entries.push({ type: 'failed', title: item.title || item.id, id: item.id,
-      subtitle: item.archived ? 'Not exported · previous archive kept' : 'Not exported · not in archive',
+      subtitle: `${FAILURE_LABELS[item.category] || 'Not exported'} · ${item.archived ? 'previous archive kept' : 'not in archive'}`,
       details: [item.error || 'Unknown error'] });
   }
   for (const item of Array.isArray(report.incomplete) ? report.incomplete : []) {
     entries.push({ type: 'incomplete', title: item.title || item.id, id: item.id,
-      subtitle: 'Conversation archived · attachments missing',
+      subtitle: `Conversation archived · attachments missing${missingCategoriesText(item.categories)}`,
       details: Array.isArray(item.missing) ? item.missing : [] });
   }
   for (const item of Array.isArray(report.keptPrevious) ? report.keptPrevious : []) {

@@ -635,6 +635,17 @@ function incompleteItems(c) {
 }
 
 // The popup's short description of one missing file.
+// Report-only categories (nothing in the archive changes):
+//   failed conversations: download-failed, validation-failed, export-failed
+//     (from the Claude tab), over-limit (a transcript over the request limit);
+//   files left out: unavailable-at-source (Claude has no download, or answers
+//     404/410), over-limit (never sent), upload-refused (GitHub refused it).
+const EXPORT_FAILURE_CATEGORIES = ['download-failed', 'validation-failed', 'export-failed', 'over-limit'];
+function missingCategory(item) {
+  if (!item.too_large) return 'unavailable-at-source';
+  return item.github_rejected ? 'upload-refused' : 'over-limit';
+}
+
 // Sync-report wording only; the Markdown note and the index keep their text.
 // An oversized file was never sent: it is over AI Archive's own request-based
 // limit, not refused by GitHub. Near the limit both round to "30.0 MiB", so
@@ -1230,6 +1241,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       id: String(item.id),
       title: String(item.title || item.id),
       error: String(item.error || 'unknown error').slice(0, 300),
+      category: EXPORT_FAILURE_CATEGORIES.includes(item.category) ? item.category : 'export-failed',
       archived: map.has(`${provider}:${account}:${item.id}`),
     }));
     if (fullList) {
@@ -1310,6 +1322,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
           id: String(c.external_id),
           title: c.title || String(c.external_id),
           error: `its Markdown transcript (${formatBytes(markdown.length)} or more) is over the ${formatBytes(MAX_BLOB_REQUEST_BYTES)} upload limit for GitHub's API`,
+          category: 'over-limit',
           archived: Boolean(previous),
         });
         onProgress?.({ stage: 'checking', current: i + 1, total, changed: changedConversations });
@@ -1340,7 +1353,12 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         }
       }
       if (missingItems.length) {
-        report.incomplete.push({ id: String(c.external_id), title: c.title || String(c.external_id), missing: missingItems.map(missingLabel) });
+        report.incomplete.push({
+          id: String(c.external_id),
+          title: c.title || String(c.external_id),
+          missing: missingItems.map(missingLabel),
+          categories: [...new Set(missingItems.map(missingCategory))],
+        });
       }
       if (JSON.stringify(previous?.incomplete || []) !== JSON.stringify(entry.incomplete || [])) indexNeedsUpdate = true;
       const currentAssetSignature = JSON.stringify(entry.assets);
