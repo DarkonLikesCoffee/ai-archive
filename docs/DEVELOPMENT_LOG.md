@@ -2,6 +2,28 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Why all 7 oversized downloads were `no-file-id` — 2026-11-05 (extension 0.5.25)
+
+- **Live 0.5.24 result.** 7 detected, 0 skipped, 7 downloaded (692.6 MiB), all with reason `no-file-id`. The owner's diagnostic report was not attached to the request, so the cause was traced from the code; the report's per-route evidence is still to come.
+- **Root cause (confirmed in code and by a test that failed first).** `fetchSandboxFiles` downloaded every file from Claude's sandbox list (`wiggle/list-files`) without passing any identity. Such a file only gets its `file_uuid` afterwards, in `collectMessageAssets`, when a `message.files[]` entry without a URL names exactly its path; that is what the index records. So on the next sync the download carried no UUID and always reported `no-file-id`, whatever Claude's response contained. All other download paths already passed `file_uuid`/`uuid`.
+- **Fix.**
+  - `sandboxFileIdentity()` takes, before the download, the UUID from the same source the archive records afterwards: the active lineage's `message.files[]` entries naming this exact sandbox path, in either form. Exactly one distinct UUID is required; several is `ambiguous-file-id`; none is `no-file-id`. File names are never used.
+  - The sandbox listing's declared size, if present, must also agree.
+  - All other skip conditions are unchanged, as are the upload limit and the archive.
+- **Diagnostics.** `oversized_downloads.downloaded_routes` (`message-url`, `files-api`, `sandbox-path`, `sandbox-list`) shows which path each full download took. If the next live sync still downloads in full, the route and reason name the remaining shape.
+- **Remaining cases without a safe identity** (documented with options in `docs/design/oversized-downloads.md`; not implemented):
+  - sandbox files referenced only by text;
+  - URL entries without an ID;
+  - IDs only in `files_v2`.
+- **Tests.**
+  - `node --test extension/*.test.js`: 219/219. New tests, all with synthetic IDs:
+    - real response shapes: an absolute or relative sandbox path, a `uuid` key instead of `file_uuid`;
+    - must-download shapes: text-only reference, same name in another folder, two UUIDs for one path, ID only in `files_v2`, a listing that declares another size, a record with another UUID, a URL entry without an ID;
+    - a round trip proving the recorded UUID is the one matched next time.
+  - `node e2e/extension-sync.e2e.cjs`: 50/50.
+  - Web tests and build pass.
+- **Owner verification.** After an "All conversations" sync on 0.5.25, check the popup line, and if any file is still downloaded in full, `oversized_downloads.downloaded_reasons` and `downloaded_routes` in the diagnostic report.
+
 ## Did the oversized-download skip happen? Counters — 2026-11-05 (extension 0.5.24)
 
 - **Question.** After a real "All conversations" sync (4 incomplete conversations, 7 oversized attachments), the report did not show whether the P1.3 skip worked.

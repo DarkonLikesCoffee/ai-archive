@@ -55,6 +55,7 @@ function createHarness(conversation, {
   sandboxContentTypes = {},
   sandboxDownloadStatuses = {},
   sandboxDownloadDelays = {},
+  sandboxHeaders = {},
   sandboxListStatus = 200,
   conversationListResponse = null,
   conversationCountResponse = null,
@@ -248,11 +249,15 @@ function createHarness(conversation, {
           ok: status >= 200 && status < 300,
           status,
           json: async () => ({}),
-          arrayBuffer: async () => bytes.slice().buffer,
+          arrayBuffer: async () => { bodyReads.push(`sandbox:${filePath}`); return bytes.slice().buffer; },
+          body: { cancel: async () => { bodyCancels.push(`sandbox:${filePath}`); } },
           headers: {
-            get: (name) => name.toLowerCase() === 'content-type'
-              ? (sandboxContentTypes[filePath] || null)
-              : null,
+            get: (name) => {
+              const key = name.toLowerCase();
+              if (key === 'content-type') return sandboxContentTypes[filePath] || null;
+              const extra = Object.fromEntries(Object.entries(sandboxHeaders[filePath] || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
+              return extra[key] ?? null;
+            },
           },
         };
       } finally {
@@ -3570,7 +3575,7 @@ test('an archive problem that blocks every sync stops the sync before any conver
 
 test('oversized-download counters separate skipped downloads from full ones, with the reason and bytes, and nothing private', async () => {
   const skipped = await syncWithRecordedOversizedFile({ headers: { 'Content-Length': String(RECORDED_SIZE) } });
-  const skippedStats = { detected: 1, skipped: 1, skipped_bytes: RECORDED_SIZE, downloaded: 0, downloaded_bytes: 0, downloaded_reasons: {} };
+  const skippedStats = { detected: 1, skipped: 1, skipped_bytes: RECORDED_SIZE, downloaded: 0, downloaded_bytes: 0, downloaded_reasons: {}, downloaded_routes: {} };
   assert.deepEqual(JSON.parse(JSON.stringify(skipped.handoff.oversizedStats)), skippedStats);
   assert.deepEqual(JSON.parse(JSON.stringify(skipped.harness.storageState.last_sync_diagnostics.oversized_downloads)), skippedStats,
     'the diagnostic report carries the same counters');
@@ -3597,7 +3602,7 @@ test('oversized-download counters separate skipped downloads from full ones, wit
     harness.onMessage({ type: 'startSync', limit: options.limit || 'all' }, {}, () => {});
     const handoff = await harness.firstHandoff;
     harness.finishFirstHandoff({ ok: true });
-    const expected = { detected: 1, skipped: 0, skipped_bytes: 0, downloaded: 1, downloaded_bytes: OVERSIZE_LIMIT + 1, downloaded_reasons: { [reason]: 1 } };
+    const expected = { detected: 1, skipped: 0, skipped_bytes: 0, downloaded: 1, downloaded_bytes: OVERSIZE_LIMIT + 1, downloaded_reasons: { [reason]: 1 }, downloaded_routes: { 'message-url': 1 } };
     assert.deepEqual(JSON.parse(JSON.stringify(handoff.oversizedStats)), expected, reason);
     assert.equal(handoff.oversizedDownloadsSkipped ?? 0, 0, reason);
     const stored = JSON.stringify(harness.storageState.last_sync_diagnostics.oversized_downloads);
@@ -3612,4 +3617,135 @@ test('a sync without oversized files adds no counters', async () => {
   const { handoff, harness } = await syncWithRecordedOversizedFile({ oversized: [] });
   assert.equal(handoff.oversizedStats ?? null, null, 'a small file is not counted');
   assert.equal('oversized_downloads' in harness.storageState.last_sync_diagnostics, false);
+});
+
+
+// ---- Identity of sandbox files for the oversized-download skip ----
+// Shapes seen on real accounts (synthetic IDs and names): a Claude-generated
+// file appears in the sandbox list by path, and the message that produced it
+// carries a file entry with the same path and a file UUID, but no URL.
+const SANDBOX_ID = '22222222-3333-4444-8555-666666666666';
+const SANDBOX_UUID = '33333333-4444-4555-8666-777777777777';
+const SANDBOX_PATH = '/mnt/user-data/outputs/export-bundle.zip';
+
+async function syncSandboxOversized({ fileEntries, listing, headers = { 'Content-Length': String(RECORDED_SIZE) }, oversized, messageText = 'Here is the bundle.' } = {}) {
+  const conversation = {
+    uuid: SANDBOX_ID, name: 'Sandbox output', current_leaf_message_uuid: 'a1',
+    chat_messages: [
+      { uuid: 'u1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'make a bundle' }], files: [], attachments: [] },
+      { uuid: 'a1', parent_message_uuid: 'u1', sender: 'assistant', content: [{ type: 'text', text: messageText }], attachments: [], ...fileEntries },
+    ],
+  };
+  const listed = listing ?? [{ path: SANDBOX_PATH, content_type: 'application/zip' }];
+  const harness = createHarness(conversation, {
+    storage: {},
+    conversationListResponse: [{ uuid: SANDBOX_ID, name: 'x', updated_at: '2026-10-20T08:00:00Z' }],
+    archiveState: [],
+    archiveOversized: oversized ?? [{ id: SANDBOX_ID, file_uuid: SANDBOX_UUID, size: RECORDED_SIZE, sha256: RECORDED_SHA }],
+    sandboxFiles: listed,
+    sandboxContents: Object.fromEntries(listed.map((file) => [file.path, 'stand-in bytes'])),
+    sandboxHeaders: Object.fromEntries(listed.map((file) => [file.path, headers])),
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  harness.finishFirstHandoff({ ok: true });
+  return { harness, handoff, assets: handoff.conversations[0].assets };
+}
+const blobEntry = (extra = {}) => ({ file_kind: 'blob', file_uuid: SANDBOX_UUID, file_name: 'export-bundle.zip', path: SANDBOX_PATH, ...extra });
+
+test('a sandbox file is skipped when the one message file entry naming its exact path has the recorded UUID and size', async () => {
+  for (const [shape, entry, listedPath] of [
+    ['absolute paths', blobEntry(), SANDBOX_PATH],
+    ['relative listing path', blobEntry(), 'outputs/export-bundle.zip'],
+    ['uuid key instead of file_uuid', blobEntry({ file_uuid: undefined, uuid: SANDBOX_UUID }), SANDBOX_PATH],
+  ]) {
+    const { harness, handoff, assets } = await syncSandboxOversized({ fileEntries: { files: [entry] }, listing: [{ path: listedPath, content_type: 'application/zip' }] });
+    assert.deepEqual(harness.bodyReads, [], `${shape}: not downloaded`);
+    assert.equal(harness.bodyCancels.length, 1, shape);
+    const [asset] = assets;
+    assert.equal(asset.sha256, RECORDED_SHA, `${shape}: the recorded identity`);
+    assert.equal(asset.size, RECORDED_SIZE);
+    assert.equal(asset.file_uuid, SANDBOX_UUID, `${shape}: still linked to its message file`);
+    assert.equal(asset.base64, '');
+    assert.deepEqual(JSON.parse(JSON.stringify(handoff.oversizedStats)), {
+      detected: 1, skipped: 1, skipped_bytes: RECORDED_SIZE, downloaded: 0, downloaded_bytes: 0, downloaded_reasons: {}, downloaded_routes: {},
+    }, shape);
+  }
+});
+
+test('a sandbox file without one unambiguous file entry for its exact path is always downloaded', async () => {
+  const cases = {
+    'only mentioned in the message text': { fileEntries: { files: [] }, messageText: `Saved to ${SANDBOX_PATH}` },
+    'an entry with the same file name in another folder': { fileEntries: { files: [blobEntry({ path: '/mnt/user-data/outputs/old/export-bundle.zip' })] }, messageText: `Saved to ${SANDBOX_PATH}` },
+    'two entries with different UUIDs for the path': { fileEntries: { files: [blobEntry(), blobEntry({ file_uuid: '44444444-5555-4666-8777-888888888888' })] } },
+    'an ID only in files_v2': { fileEntries: { files: [], files_v2: [blobEntry()] }, messageText: `Saved to ${SANDBOX_PATH}` },
+    'the listing declares another size': { fileEntries: { files: [blobEntry()] }, listing: [{ path: SANDBOX_PATH, content_type: 'application/zip', size: RECORDED_SIZE + 3 }] },
+    'a record with another UUID': { fileEntries: { files: [blobEntry()] }, oversized: [{ id: SANDBOX_ID, file_uuid: '55555555-6666-4777-8888-999999999999', size: RECORDED_SIZE, sha256: RECORDED_SHA }] },
+  };
+  for (const [name, options] of Object.entries(cases)) {
+    const { harness, assets } = await syncSandboxOversized(options);
+    assert.deepEqual(harness.bodyReads, [`sandbox:${(options.listing || [{ path: SANDBOX_PATH }])[0].path}`], `${name}: downloaded`);
+    assert.equal(assets[0].sha256, standInSha, `${name}: identity from the received bytes`);
+  }
+});
+
+test('a direct message file with a URL but no file ID is always downloaded', async () => {
+  const conversation = plainConversation(BIG_ID);
+  conversation.chat_messages[0].files = [{ file_name: 'lecture.mp4', preview_url: BIG_URL, mime_type: 'video/mp4' }];
+  const harness = createHarness(conversation, {
+    storage: {},
+    conversationListResponse: [{ uuid: BIG_ID, name: 'Big', updated_at: '2026-10-20T08:00:00Z' }],
+    archiveState: [],
+    archiveOversized: [{ id: BIG_ID, file_uuid: 'file-big', size: RECORDED_SIZE, sha256: RECORDED_SHA }],
+    assetResponses: { [BIG_URL]: { content: 'stand-in bytes', contentType: 'video/mp4', headers: { 'Content-Length': String(RECORDED_SIZE) } } },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  harness.finishFirstHandoff({ ok: true });
+  assert.deepEqual(harness.bodyReads, [BIG_URL], 'no ID: never matched by file name');
+  assert.equal(handoff.conversations[0].assets[0].sha256, standInSha);
+});
+
+test('round trip: the identity recorded from a first full sandbox download is the one the next sync matches', async () => {
+  const big = 'x'.repeat(OVERSIZE_LIMIT + 1);
+  const run = async (oversized, fileEntries) => {
+    const conversation = {
+      uuid: SANDBOX_ID, name: 'Sandbox output', current_leaf_message_uuid: 'a1',
+      chat_messages: [
+        { uuid: 'u1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'make a bundle' }], files: [], attachments: [] },
+        { uuid: 'a1', parent_message_uuid: 'u1', sender: 'assistant', content: [{ type: 'text', text: `Saved to ${SANDBOX_PATH}` }], attachments: [], ...fileEntries },
+      ],
+    };
+    const harness = createHarness(conversation, {
+      storage: {},
+      conversationListResponse: [{ uuid: SANDBOX_ID, name: 'x', updated_at: '2026-10-20T08:00:00Z' }],
+      archiveState: [], archiveOversized: oversized,
+      sandboxFiles: [{ path: SANDBOX_PATH, content_type: 'application/zip' }],
+      sandboxContents: { [SANDBOX_PATH]: big },
+      sandboxHeaders: { [SANDBOX_PATH]: { 'Content-Length': String(big.length) } },
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const handoff = await harness.firstHandoff;
+    harness.finishFirstHandoff({ ok: true });
+    return { harness, handoff, asset: handoff.conversations[0].assets[0] };
+  };
+
+  // First sync: nothing recorded yet, so the file is downloaded in full.
+  const first = await run([], { files: [blobEntry()] });
+  assert.deepEqual(JSON.parse(JSON.stringify(first.handoff.oversizedStats.downloaded_routes)), { 'sandbox-list': 1 });
+  assert.deepEqual(JSON.parse(JSON.stringify(first.handoff.oversizedStats.downloaded_reasons)), { 'not-recorded': 1 });
+  assert.equal(first.asset.file_uuid, SANDBOX_UUID, 'the archive records the UUID of the file entry naming this path');
+
+  // What the background records for it (incomplete[] of the index), fed back.
+  const record = { id: SANDBOX_ID, file_uuid: first.asset.file_uuid, size: first.asset.size, sha256: first.asset.sha256 };
+  const second = await run([record], { files: [blobEntry()] });
+  assert.deepEqual(second.harness.bodyReads, [], 'the second sync does not download it');
+  assert.equal(second.asset.sha256, first.asset.sha256);
+  assert.equal(second.asset.file_uuid, first.asset.file_uuid);
+  assert.equal(second.handoff.oversizedStats.skipped, 1);
+
+  // Mentioned only in the text, it has no file entry and therefore no identity.
+  const textOnly = await run([record], { files: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(textOnly.handoff.oversizedStats.downloaded_reasons)), { 'no-file-id': 1 });
+  assert.deepEqual(JSON.parse(JSON.stringify(textOnly.handoff.oversizedStats.downloaded_routes)), { 'sandbox-list': 1 });
 });

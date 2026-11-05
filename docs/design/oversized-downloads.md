@@ -80,6 +80,42 @@ Where the counters appear:
 
 They contain no names, IDs, URLs or contents.
 
+## Why the 0.5.24 live test reported `no-file-id: 7` (0.5.25)
+
+The live test showed 7 oversized downloads, 0 skipped and all 7 `no-file-id`. That reason means the download call itself carried no Claude file UUID. It says nothing about whether Claude's response had one. Tracing how attachment IDs flow through `content.js`:
+
+| Where the file is downloaded (route) | Identity passed to `fetchAsset` in 0.5.24 | Where the archive's `file_uuid` comes from |
+|---|---|---|
+| `message.files[]` entry with a preview or document URL (`message-url`) | `file_uuid` or `uuid` of that entry | same entry |
+| `message.files[]` blob with `download_source: files_api` (`files-api`) | `file_uuid` or `uuid` | same entry |
+| `message.files[]` entry with a sandbox `path` and no URL, not in the sandbox list (`sandbox-path`) | `file_uuid` or `uuid` | same entry |
+| **file from the sandbox list** (`wiggle/list-files`), downloaded by path (`sandbox-list`) | **none** | assigned *after* download, when a `message.files[]` entry without a URL names exactly that path (`pathAsset.file_uuid ??= fileId`) |
+| `attachments[]` (`extracted_content`) | n/a: text, never downloaded | none |
+| `files_v2` | not used for downloads, only recorded in diagnostics | none |
+
+**Finding.** Every file from the sandbox list was downloaded with no identity, so it always reported `no-file-id`. That holds even when the message file entry naming it had a UUID, and even when the archive had recorded that UUID. Claude-generated outputs (archives, videos, exports) come through this route, which fits all seven. The report itself was not attached, so the route of each file is not yet confirmed. The 0.5.25 counters record it.
+
+**Fix (0.5.25).** A file from the sandbox list takes its identity *before* download from the same source the archive records it from afterwards: the active lineage's `message.files[]` entries whose `path` names exactly this sandbox path, in either form (`/mnt/user-data/…` or relative).
+- Exactly one distinct UUID is used.
+- Several distinct UUIDs give `ambiguous-file-id`, and the file is downloaded.
+- No matching entry gives `no-file-id`, and the file is downloaded.
+- A file name is never used.
+- Every other condition is unchanged: same conversation, a record with that UUID, an exact size, no conflicting declared size (now also the size in the sandbox listing).
+
+A round-trip test shows the UUID recorded after a first full download is exactly the one the next sync matches.
+
+**Counters.** `downloaded_routes` (`message-url`, `files-api`, `sandbox-path`, `sandbox-list`) now shows which path each oversized download took.
+
+**Remaining cases without a stable identity.**
+- **A sandbox file referenced only in message text,** with no file entry. Its only identifier is the conversation plus its sandbox path, and a sandbox path can be overwritten with new content.
+- **A `message.files[]` entry with a URL but no `file_uuid` or `uuid`.**
+- **An ID that exists only in `files_v2`.** Its meaning is undocumented, and the archive never records it.
+
+Options, none implemented:
+- (a) Accept (conversation, exact sandbox path, exact size) as identity. This risks a stale SHA-256 when Claude rewrites a file with the same size; it needs owner approval.
+- (b) Also record the sandbox listing's own metadata, for example a modification time if Claude provides one, and require it to be unchanged. This needs evidence of the listing's fields and an index addition.
+- (c) Leave such files downloading, as now.
+
 ## Needs live verification (owner)
 
-Whether Claude's real download endpoints send `Content-Length` without content coding is **unknown**; the E2E fake server does. If they don't, nothing changes: the files are downloaded as before. After an "All conversations" sync with 0.5.24, the popup's report line shows whether the skip happened: 7 expected on the owner's archive. If any were downloaded in full, the diagnostic report (`oversized_downloads.downloaded_reasons`) says why.
+Whether Claude's real download endpoints send `Content-Length` without content coding is **unknown**; the E2E fake server does. If they don't, nothing changes: the files are downloaded as before. After an "All conversations" sync with 0.5.25, the popup's report line shows whether the skip happened. If any oversized file is still downloaded in full, the diagnostic report's `oversized_downloads` gives the reason and the route of each one: `downloaded_reasons` and `downloaded_routes`.

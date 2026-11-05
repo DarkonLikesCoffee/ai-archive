@@ -11,7 +11,7 @@
   // Per-sync counts of downloads over the upload limit: only counts, byte
   // totals and reason codes, never names, IDs or contents.
   function newOversizedStats() {
-    return { detected: 0, skipped: 0, skipped_bytes: 0, downloaded: 0, downloaded_bytes: 0, downloaded_reasons: {} };
+    return { detected: 0, skipped: 0, skipped_bytes: 0, downloaded: 0, downloaded_bytes: 0, downloaded_reasons: {}, downloaded_routes: {} };
   }
 
   async function getOrg(signal) {
@@ -614,11 +614,13 @@
   // Returns null when the download may be skipped, otherwise why not:
   //   no-archive-state  no archive state for this sync (Latest N, or unreadable)
   //   no-file-id        the file has no Claude file UUID to match a record by
+  //   ambiguous-file-id several different file UUIDs name this sandbox path
   //   not-recorded      the archive has no oversized record for this file yet
   //   size-unconfirmed  the response does not state the size unambiguously
   //   size-changed      the stated size differs from the recorded one
-  function oversizedSkipBlocker(response, known, declaredSize, { hasFileId }) {
+  function oversizedSkipBlocker(response, known, declaredSize, { hasFileId, fileIdAmbiguous }) {
     if (!knownOversizedFiles) return 'no-archive-state';
+    if (fileIdAmbiguous) return 'ambiguous-file-id';
     if (!hasFileId) return 'no-file-id';
     if (!known || !(known.size > MAX_ARCHIVED_FILE_BYTES)) return 'not-recorded';
     const header = (name) => response.headers?.get?.(name) ?? null;
@@ -631,7 +633,9 @@
     return null;
   }
 
-  async function fetchAsset(url, name, mime, signal, { conversationId = null, fileUuid = null, declaredSize = null } = {}) {
+  // `route` names the download path for the counters only: message-url,
+  // files-api, sandbox-path or sandbox-list.
+  async function fetchAsset(url, name, mime, signal, { conversationId = null, fileUuid = null, fileIdAmbiguous = false, declaredSize = null, route = 'message-url' } = {}) {
     const known = knownOversizedFile(conversationId, fileUuid);
     const label = safeAssetName(name);
     if (!url) {
@@ -640,7 +644,7 @@
     try {
       const r = await fetch(url, { credentials: 'include', signal });
       if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status });
-      const blocker = oversizedSkipBlocker(r, known, declaredSize, { hasFileId: Boolean(conversationId && fileUuid) });
+      const blocker = oversizedSkipBlocker(r, known, declaredSize, { hasFileId: Boolean(conversationId && fileUuid), fileIdAmbiguous });
       if (!blocker) {
         try { await r.body?.cancel?.(); } catch {}
         oversizedStats.detected += 1;
@@ -664,6 +668,7 @@
         oversizedStats.downloaded += 1;
         oversizedStats.downloaded_bytes += buffer.byteLength;
         oversizedStats.downloaded_reasons[blocker] = (oversizedStats.downloaded_reasons[blocker] || 0) + 1;
+        oversizedStats.downloaded_routes[route] = (oversizedStats.downloaded_routes[route] || 0) + 1;
       }
       return {
         name: label,
@@ -802,7 +807,14 @@
         const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(file.path)}`;
         let asset;
         try {
-          asset = await fetchAsset(url, file.path.split('/').pop() || file.path, file.content_type, signal);
+          const identity = sandboxFileIdentity(file.path, messages);
+          asset = await fetchAsset(url, file.path.split('/').pop() || file.path, file.content_type, signal, {
+            conversationId,
+            fileUuid: identity.fileUuid,
+            fileIdAmbiguous: identity.ambiguous,
+            declaredSize: declaredFileSize(file),
+            route: 'sandbox-list',
+          });
         } catch (e) {
           if (e?.name === 'AbortError') throw e;
           if (isUnavailable(e)) {
@@ -816,6 +828,26 @@
       signal,
     );
     return { assets: downloaded.filter(Boolean), listStatus: r.status };
+  }
+
+  // The Claude file UUID of a listed sandbox file, taken before it is
+  // downloaded from the same place the archive records it from afterwards
+  // (collectMessageAssets links a sandbox file to the message file entry whose
+  // `path` is exactly its path): the active lineage's `files` entries naming
+  // this exact path, in either path form. Never a file name. Only one distinct
+  // UUID counts; several are ambiguous and none is no identity.
+  function sandboxFileIdentity(path, messages) {
+    const target = sandboxRelativePath(path);
+    if (!target) return { fileUuid: null, ambiguous: false };
+    const uuids = new Set();
+    for (const message of Array.isArray(messages) ? messages : []) {
+      for (const entry of Array.isArray(message?.files) ? message.files : []) {
+        if (!entry?.path || sandboxRelativePath(entry.path) !== target) continue;
+        const id = entry.file_uuid || entry.uuid;
+        if (typeof id === 'string' && id) uuids.add(id);
+      }
+    }
+    return uuids.size === 1 ? { fileUuid: [...uuids][0], ambiguous: false } : { fileUuid: null, ambiguous: uuids.size > 1 };
   }
 
   function isReplyExcerptAttachment(file) {
@@ -1184,7 +1216,7 @@
         const url = `/api/organizations/${encodeURIComponent(org)}/files/${encodeURIComponent(fileApiId)}/contents`;
         try {
           downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal, {
-            conversationId, fileUuid: fileApiId,
+            conversationId, fileUuid: fileApiId, route: 'files-api',
             declaredSize: declaredFileSize(file),
           });
           const linked = {
@@ -1219,7 +1251,7 @@
           const url = `/api/organizations/${org}/conversations/${conversationId}/wiggle/download-file?path=${encodeURIComponent(candidate)}`;
           try {
             downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || null, signal, {
-              conversationId, fileUuid: fileId,
+              conversationId, fileUuid: fileId, route: 'sandbox-path',
               declaredSize: declaredFileSize(file),
             });
             attempts.push({ via: 'sandbox-path', form: candidate.startsWith('/') ? 'absolute' : 'relative', status: 200 });
@@ -1580,7 +1612,7 @@
           extension_version: version,
           items: items.slice(0, 30),
           // Aggregate counts only (see newOversizedStats).
-          ...(oversized?.detected ? { oversized_downloads: { ...oversized, downloaded_reasons: { ...oversized.downloaded_reasons } } } : {}),
+          ...(oversized?.detected ? { oversized_downloads: { ...oversized, downloaded_reasons: { ...oversized.downloaded_reasons }, downloaded_routes: { ...oversized.downloaded_routes } } } : {}),
         },
       })?.catch?.(() => {}) || Promise.resolve();
     } catch {
@@ -1715,7 +1747,7 @@
           skipped, unchangedIds, fullList: limit === 'all', listed: listData.length,
           ...(archiveStateError ? { archiveStateError } : {}),
           ...(oversizedStats.skipped ? { oversizedDownloadsSkipped: oversizedStats.skipped } : {}),
-          ...(oversizedStats.detected ? { oversizedStats: { ...oversizedStats, downloaded_reasons: { ...oversizedStats.downloaded_reasons } } } : {}),
+          ...(oversizedStats.detected ? { oversizedStats: { ...oversizedStats, downloaded_reasons: { ...oversizedStats.downloaded_reasons }, downloaded_routes: { ...oversizedStats.downloaded_routes } } } : {}),
         });
       } catch (e) {
         await transfer.abort();

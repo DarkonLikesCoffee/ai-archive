@@ -1,5 +1,9 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.25 — identity of oversized sandbox files
+- Claude-generated files from the conversation's sandbox file list were always downloaded without their Claude file ID, so the oversized-download skip could never apply to them ("no-file-id"). They now take the ID of the one message file entry that names their exact sandbox path, which is the same ID the archive records for them. If several different IDs name that path, the file is downloaded. Files are never matched by name.
+- The diagnostic counters add `downloaded_routes`: which download path each oversized file took.
+
 ## Extension v0.5.24 — counters for oversized downloads
 - The popup's sync report now has a line such as "Attachments over the upload limit: 7 — 7 not downloaded again (… saved), 0 downloaded in full". Before, whether an oversized download was skipped appeared only in a summary the popup hides whenever it shows per-conversation problems.
 - The diagnostic report adds `oversized_downloads`: counts, byte totals, and the reason code for each download that could not be skipped. It contains no names, IDs or URLs.
