@@ -136,3 +136,95 @@ test('files the index records as not archived must be noted in the exporter\'s M
   assert.deepEqual(codes(broken), [`error:incomplete-note-missing:${path}`, `warning:conversation-incomplete:${path}`]);
   assert.match(broken.findings.find((item) => item.code === 'incomplete-note-missing').message, /"lecture_\[part 1\]\*\.mp4"/);
 });
+
+// ---- Diagnostics for the first real-archive run (synthetic shapes) ----
+const DARK = 'archive/conversations/claude/darkon';
+const OWN_ID = '138089cb-0000-4000-8000-000000000001';
+const OTHER_ID = 'bb7e12e2-0000-4000-8000-000000000002';
+const OWN_MD = `${DARK}/Code-block-fixes--${OWN_ID}-1f4d8315.md`;
+const metaBlock = (id) => `<!-- AI_ARCHIVE_METADATA\n${JSON.stringify({ id, provider: 'claude', account: 'darkon', title: 'T' })}\n-->\n\n# T\n\n`;
+
+function diagnosticArchive() {
+  const js = bytes('console.log(1)');
+  const jsSha = sha(js);
+  const otherAsset = `${DARK}/assets/${OTHER_ID}-aaaa1111/${jsSha.slice(0, 8)}-extension.js`;
+  const files = new Map([
+    // Quoted text from another archive file, three times, links into another
+    // conversation's legacy folder; one own attachment is really missing.
+    [OWN_MD, bytes(`${metaBlock(OWN_ID)}## You\n\nThe viewer shows [extension.js](assets/bb7e12e2/${jsSha.slice(0, 8)}-extension.js) as text.\n> [extension.js](assets/bb7e12e2/${jsSha.slice(0, 8)}-extension.js)\n\`\`\`md\n![x](assets/bb7e12e2/${jsSha.slice(0, 8)}-extension.js)\n![y](assets/138089cb/ffff0000-in-code.png)\n\`\`\`\n![gone](assets/${OWN_ID}-1f4d8315/0000aaaa-gone.png)\n![gone](assets/${OWN_ID}-1f4d8315/0000aaaa-gone.png)\n`)],
+    [`${DARK}/Other--${OTHER_ID}.md`, bytes(`${metaBlock(OTHER_ID)}## You\n\n[extension.js](assets/${OTHER_ID}-aaaa1111/${jsSha.slice(0, 8)}-extension.js)\n`)],
+    [otherAsset, js],
+    ['archive/index.json', bytes('{}')],
+    // Unreferenced files of each kind.
+    [`${DARK}/Old-title--${OTHER_ID}.md`, bytes(`${metaBlock(OTHER_ID)}## You\n\nold copy\n`)],
+    [`${DARK}/Lost--cccc0000-0000-4000-8000-000000000003.md`, bytes(`${metaBlock('cccc0000-0000-4000-8000-000000000003')}## You\n\nnot indexed\n`)],
+    [`${DARK}/assets/bb7e12e2/${jsSha.slice(0, 8)}-extension.js`.replace('bb7e12e2', '9da9cc54'), bytes('legacy leftover')],
+    [`${DARK}/assets/${OTHER_ID}-aaaa1111/copy-extension.js`, js],
+    ['archive/conversations/claude/aaaaaaaaaa/Test--x.md', bytes('# test')],
+    [`${DARK}/assets/oldstuff/notes.txt`, bytes('orphan')],
+  ]);
+  const index = { version: 2, conversations: [
+    { id: OWN_ID, provider: 'claude', account: 'darkon', path: OWN_MD, assets: [],
+      incomplete: [{ kind: 'attachment', name: 'project.zip', too_large: true, size: 4e7, sha256: 'e'.repeat(64) }, { kind: 'attachment', name: 'gone.pdf', reason: 'no link' }] },
+    { id: OTHER_ID, provider: 'claude', account: 'darkon', path: `${DARK}/Other--${OTHER_ID}.md`, assets: [{ path: otherAsset, sha256: jsSha, size: js.byteLength, name: 'extension.js' }] },
+  ] };
+  return { files, index, otherAsset, jsSha };
+}
+
+test('a broken link is reported once per file and target, and links into another conversation\'s folder or code are not called exporter errors', async () => {
+  const { files, index, otherAsset, jsSha } = diagnosticArchive();
+  const result = await auditArchive(inputs({ index, files }));
+  const links = result.findings.filter((f) => f.path === OWN_MD && f.code.startsWith('link-'));
+  assert.deepEqual(links.map((f) => [f.severity, f.code, f.target, f.occurrences]), [
+    ['warning', 'link-unresolved-quoted', `assets/bb7e12e2/${jsSha.slice(0, 8)}-extension.js`, 3],
+    ['warning', 'link-unresolved-quoted', 'assets/138089cb/ffff0000-in-code.png', 1],
+    ['error', 'link-broken', `assets/${OWN_ID}-1f4d8315/0000aaaa-gone.png`, 2],
+  ]);
+  const [quoted, inCode, broken] = links;
+  assert.match(quoted.message, /another conversation's attachment folder \(assets\/bb7e12e2\/\)/);
+  assert.deepEqual(quoted.candidates, [otherAsset, `${DARK}/assets/9da9cc54/${jsSha.slice(0, 8)}-extension.js`], 'files with the same name are found, in tree order');
+  assert.match(quoted.message, new RegExp(`SHA-256 starting with ${jsSha.slice(0, 8)}.*very likely the same file`));
+  assert.match(inCode.message, /inside a code block or inline code/);
+  assert.equal(inCode.own_folder, true, 'its own legacy folder, but quoted in code');
+  assert.match(broken.message, /\(2 times\).*No file with that name exists anywhere/);
+});
+
+test('unreferenced files are classified by likely cause and summarized per folder', async () => {
+  const { files, index } = diagnosticArchive();
+  const result = await auditArchive(inputs({ index, files }));
+  const kinds = Object.fromEntries(result.findings.filter((f) => f.code === 'file-unreferenced').map((f) => [f.path, f.kind]));
+  const legacy = Object.keys(kinds).find((k) => k.startsWith(`${DARK}/assets/9da9cc54/`));
+  assert.deepEqual(kinds, {
+    [`${DARK}/Old-title--${OTHER_ID}.md`]: 'duplicate-conversation',
+    [`${DARK}/Lost--cccc0000-0000-4000-8000-000000000003.md`]: 'conversation-not-indexed',
+    [legacy]: 'legacy-layout',
+    [`${DARK}/assets/${OTHER_ID}-aaaa1111/copy-extension.js`]: 'duplicate-copy',
+    'archive/conversations/claude/aaaaaaaaaa/Test--x.md': 'markdown-not-indexed',
+    [`${DARK}/assets/oldstuff/notes.txt`]: 'orphaned',
+  });
+  const placeholder = result.findings.find((f) => f.path === 'archive/conversations/claude/aaaaaaaaaa/Test--x.md');
+  assert.equal(placeholder.placeholder, 'aaaaaaaaaa');
+  assert.match(placeholder.message, /"aaaaaaaaaa", which is not an ID the exporter writes: most likely sample or test data/);
+  const duplicate = result.findings.find((f) => f.kind === 'duplicate-conversation');
+  assert.match(duplicate.message, /older copy of a conversation the index lists at .*Other--/);
+  const report = formatAuditReport(result);
+  assert.match(report, /Unreferenced files by kind and folder:\n/);
+  assert.match(report, /\n {2}1 older copies of indexed conversations:\n {4}1 in archive\/conversations\/claude\/darkon\//);
+  assert.match(report, /1 files in legacy attachment folders:\n {4}1 in archive\/conversations\/claude\/darkon\/assets\/9da9cc54\//);
+  // Nothing is downgraded or hidden: every unreferenced file is still a warning.
+  assert.equal(result.findings.filter((f) => f.code === 'file-unreferenced').every((f) => f.severity === 'warning'), true);
+});
+
+test('an incomplete conversation lists its missing files with their category', async () => {
+  const { files, index } = diagnosticArchive();
+  const result = await auditArchive(inputs({ index, files }));
+  const incomplete = result.findings.find((f) => f.code === 'conversation-incomplete');
+  assert.match(incomplete.message, /2 file\(s\) missing; every sync retries it: project\.zip \(over the upload limit\); gone\.pdf \(not available from Claude\)\./);
+  assert.deepEqual(incomplete.missing, [{ name: 'project.zip', category: 'over the upload limit' }, { name: 'gone.pdf', category: 'not available from Claude' }]);
+});
+
+test('scanAssetLinks: one entry per target with counts, fences and inline code', async () => {
+  const { scanAssetLinks } = await import('./archiveIntegrity.js');
+  const links = scanAssetLinks('a [x](assets/d/1.png) `[y](assets/d/2.png)`\n~~~\n[z](assets/d/1.png)\n~~~\n[x](assets/d/1.png)\n````\n```\n[w](assets/d/3.png)\n````\n');
+  assert.deepEqual(links.map((l) => [l.ref, l.count, l.inCode]), [['assets/d/1.png', 3, false], ['assets/d/2.png', 1, true], ['assets/d/3.png', 1, true]]);
+});

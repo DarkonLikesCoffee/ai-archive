@@ -32,7 +32,7 @@ function makeArchive({ conversations = 3, corrupt = false } = {}) {
   return { files, index: { version: 2, conversations: entries } };
 }
 
-function fakeGitHub(files, { failures = {}, delayMs = 0, onBlob = null } = {}) {
+function fakeGitHub(files, { failures = {}, delayMs = 0, onBlob = null, history = {} } = {}) {
   const blobs = new Map([...files.values()].map((bytes) => [gitSha(bytes), bytes]));
   const tree = [...files].map(([path, bytes]) => ({ path, type: 'blob', sha: gitSha(bytes), size: bytes.length }));
   const stats = { blobRequests: new Map(), active: 0, peak: 0, methods: new Set(), urls: [] };
@@ -51,6 +51,11 @@ function fakeGitHub(files, { failures = {}, delayMs = 0, onBlob = null } = {}) {
     if (path.startsWith('/git/ref/heads/')) return reply(404, { message: 'Not Found' });
     if (path.startsWith('/git/commits/')) return reply(200, { tree: { sha: 't'.repeat(40) } });
     if (path.startsWith('/git/trees/')) return reply(200, { truncated: false, tree });
+    if (path === '/commits') {
+      const filePath = new URL(url).searchParams.get('path');
+      stats.historyPaths = [...(stats.historyPaths || []), filePath];
+      return reply(200, history[filePath] || []);
+    }
     const m = path.match(/^\/git\/blobs\/([0-9a-f]+)$/);
     if (m) {
       const sha = m[1];
@@ -85,7 +90,8 @@ async function run(files, argv, extra = {}) {
 
 test('options: old flags keep working and new ones are validated', () => {
   assert.deepEqual(parseArgs(['o/r', '--branch', 'main', '--markdown', '--hashes']).options,
-    { repo: 'o/r', branch: 'main', markdown: true, hashes: true, rebuild: false, concurrency: 6, quiet: false, progress: true, json: false });
+    { repo: 'o/r', branch: 'main', markdown: true, hashes: true, rebuild: false, history: false, concurrency: 6, quiet: false, progress: true, json: false });
+  assert.equal(parseArgs(['o/r', '--history']).options.history, true);
   assert.equal(parseArgs(['o/r', '--rebuild-dry-run']).options.markdown, true, 'a rebuild implies --markdown');
   assert.equal(parseArgs(['o/r', '--concurrency', '12']).options.concurrency, 12);
   assert.match(parseArgs(['o/r', '--concurrency', '0']).error, /from 1 to 32/);
@@ -182,7 +188,7 @@ test('--json writes only JSON to stdout; progress stays on stderr, or nowhere wi
   assert.equal(report.repository, 'o/r');
   assert.equal(report.branch, 'main');
   assert.equal(report.interrupted, false);
-  assert.deepEqual(Object.keys(report.stats).sort(), ['attachments', 'bytes_downloaded', 'conversations', 'elapsed_ms', 'failures', 'files_hashed', 'markdown_files', 'requests', 'retries']);
+  assert.deepEqual(Object.keys(report.stats).sort(), ['attachments', 'bytes_downloaded', 'conversations', 'elapsed_ms', 'failures', 'files_hashed', 'history_lookups', 'markdown_files', 'requests', 'retries']);
   assert.ok(report.stats.bytes_downloaded > 0);
   assert.match(result.stderr, /Verifying attachments/);
   const quiet = await run(files, ['--hashes', '--json', '--quiet']);
@@ -216,4 +222,28 @@ test('a rebuild dry run uses the downloaded data and still writes nothing', asyn
   const result = await run(files, ['--rebuild-dry-run', '--hashes']);
   assert.match(result.stdout, /Index rebuild dry run \(nothing was written\)/);
   assert.deepEqual([...result.gh.stats.methods], ['GET']);
+});
+
+
+test('--history tells a removed file from one never uploaded, and who wrote an unreferenced file, read-only', async () => {
+  const { files } = makeArchive({ conversations: 1 });
+  const md = `${ROOT}/C0--conv-0.md`;
+  // One link to an attachment that was removed, one to a file never uploaded.
+  files.set(md, Buffer.concat([files.get(md), Buffer.from('![a](assets/conv-0/removed.png)\n![b](assets/conv-0/never.png)\n')]));
+  files.set('archive/conversations/claude/aaaaaaaaaa/Test.md', Buffer.from('# test'));
+  const history = {
+    [`${ROOT}/assets/conv-0/removed.png`]: [{ sha: 'd'.repeat(40), commit: { message: 'Sync 2 AI conversations\n\nbody', author: { date: '2026-10-20T10:00:00Z' } } }],
+    'archive/conversations/claude/aaaaaaaaaa/Test.md': [{ sha: 'e'.repeat(40), commit: { message: 'Add test conversation', author: { date: '2026-10-01T10:00:00Z' } } }],
+  };
+  const result = await run(files, ['--markdown', '--history', '--json'], { github: { history } });
+  const report = JSON.parse(result.stdout);
+  const byTarget = Object.fromEntries(report.findings.filter((f) => f.target).map((f) => [f.target, f]));
+  assert.match(byTarget['assets/conv-0/removed.png'].message, /History: last changed by commit dddddddddddd \(2026-10-20\) "Sync 2 AI conversations", most likely its removal; the file can be read from that commit's parent\./);
+  assert.equal(byTarget['assets/conv-0/removed.png'].history.last_commit, 'd'.repeat(40));
+  assert.match(byTarget['assets/conv-0/never.png'].message, /History: it was never on this branch, so it was never uploaded here\./);
+  const placeholder = report.findings.find((f) => f.path === 'archive/conversations/claude/aaaaaaaaaa/Test.md');
+  assert.match(placeholder.message, /History: last written by commit eeeeeeeeeeee \(2026-10-01\) "Add test conversation"\./);
+  assert.equal(report.stats.history_lookups, 3);
+  assert.deepEqual([...result.gh.stats.methods], ['GET'], 'history lookups are read-only too');
+  assert.ok(result.gh.stats.urls.filter((u) => u.includes('/commits?')).every((u) => /sha=main&path=/.test(u)));
 });

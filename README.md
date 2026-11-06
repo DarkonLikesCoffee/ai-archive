@@ -207,13 +207,14 @@ A read-only audit compares `archive/index.json` with the repository:
 It makes only GET requests to `api.github.com`, never repairs or deletes anything, and works with a read-only token:
 
 ```bash
-GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> --branch main --markdown --hashes --concurrency 6
+GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> --branch main --markdown --hashes --history --concurrency 6
 ```
 
 Options:
 - `--markdown` downloads the conversation files, to check their attachment links and "not archived" notes.
 - `--hashes` downloads every attachment, to verify its size and SHA-256.
 - `--rebuild-dry-run` also rebuilds the index from the conversation files. It reports where that rebuild differs from the current index and what an apply would lose, and writes nothing (see `docs/design/index-rebuild.md`).
+- `--history` looks up, for each missing link target and each unreferenced file (up to 200), the last commit on the branch that touched it. That tells a file removed by a later commit, and still in history, from one never uploaded, and shows who wrote an unreferenced file. Read-only.
 - `--branch <name>` audits that branch (default: `main`, then `master`).
 - `--concurrency <n>` runs up to *n* downloads at a time (1–32, default 6).
 - `--json` writes a machine-readable report to stdout; progress stays on stderr.
@@ -224,6 +225,14 @@ How it downloads:
 - Every Git blob is downloaded once, even if several paths share it, and its bytes are checked against its blob ID.
 - Attachments are hashed and their bytes discarded, so memory stays small.
 - Network errors, 5xx responses and rate limits are retried with backoff. A primary rate limit is waited out when the reset is under 15 minutes away. Other errors (404, 401, …) are not retried; such a file is reported as `file-unreadable` and the rest is still checked.
+
+What the findings mean:
+- `link-broken` (error): a link into the conversation's own attachment folder, outside code, points to a missing file.
+- `link-unresolved-quoted` (warning): a missing target that is inside code, or in another conversation's folder. The exporter never writes such links, so it is most likely quoted text.
+- `file-unreferenced` (warning): a file under `archive/conversations/` that the index doesn't reference. Its `kind` says why: `duplicate-conversation`, `conversation-not-indexed`, `markdown-not-indexed`, `linked-not-indexed`, `duplicate-copy`, `legacy-layout`, `placeholder` or `orphaned`. The report sums them per kind and folder.
+- `conversation-incomplete` (warning): lists each file that was not archived, with its category.
+
+See `docs/investigations/2026-11-first-integrity-run.md` for how these were diagnosed on a real archive.
 
 Progress goes to stderr: one refreshed line in a terminal, a line every few seconds otherwise. Errors and mismatches appear as they happen. The final report lists the counts, bytes downloaded, retries, failures and elapsed time.
 

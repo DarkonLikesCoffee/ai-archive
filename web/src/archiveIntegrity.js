@@ -29,9 +29,55 @@ function exporterLabel(value) {
     .replace(/([*_\x60!])/g, '\\$1');
 }
 
-function finding(severity, code, path, message) {
-  return { severity, code, path: path || null, message };
+function finding(severity, code, path, message, extra = {}) {
+  return { severity, code, path: path || null, message, ...extra };
 }
+
+// The asset links of a Markdown file, once per target, with how often each
+// occurs and whether every occurrence is inside a fenced code block or inline
+// code (text, not an attachment reference written by the exporter).
+export function scanAssetLinks(text) {
+  const links = new Map();
+  let fence = null;
+  for (const line of String(text ?? '').split('\n')) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker) {
+      if (!fence) fence = marker[1][0].repeat(marker[1].length);
+      else if (marker[1][0] === fence[0] && marker[1].length >= fence.length && /^\s*(`{3,}|~{3,})\s*$/.test(line)) fence = null;
+      continue;
+    }
+    // Inline code spans on this line, so a link inside `...` counts as code.
+    const codeSpans = [...line.matchAll(/`[^`]*`/g)].map((m) => [m.index, m.index + m[0].length]);
+    for (const match of line.matchAll(ASSET_LINK)) {
+      const inCode = Boolean(fence) || codeSpans.some(([start, end]) => match.index >= start && match.index < end);
+      const link = links.get(match[1]) || { ref: match[1], count: 0, inCode: true };
+      link.count += 1;
+      link.inCode = link.inCode && inCode;
+      links.set(match[1], link);
+    }
+  }
+  return [...links.values()];
+}
+
+const basename = (path) => String(path).split('/').pop();
+const idPrefix = (id) => String(id ?? '').slice(0, 8).toLowerCase();
+const slugPrefix = (id) => String(id ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 8);
+// Both exporter layouts name a conversation's attachment folder after its ID:
+// legacy `assets/<first 8 characters>/`, current `assets/<id slug>-<hash>/`.
+function isOwnAssetFolder(folder, id) {
+  if (!id) return null;
+  const name = String(folder).toLowerCase();
+  return name.startsWith(idPrefix(id)) || name.startsWith(slugPrefix(id));
+}
+const metadataId = (text) => {
+  const m = String(text ?? '').match(/^<!--\s*AI_ARCHIVE_METADATA\s*\n([\s\S]*?)\n-->/);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
+};
+// A folder or account name made of one repeated character (aaaaaaaaaa): not
+// an exporter ID, most likely sample or test data.
+const placeholderSegment = (path) => String(path).split('/').slice(2, -1).find((segment) => /^(.)\1{5,}$/.test(segment)) || null;
+const missingCategory = (item) => (item?.too_large ? (item.github_rejected ? 'refused by GitHub' : 'over the upload limit') : 'not available from Claude');
 
 function dirname(path) {
   const at = String(path).lastIndexOf('/');
@@ -118,26 +164,89 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
       }
     }
     if (Array.isArray(entry.incomplete) && entry.incomplete.length) {
-      findings.push(finding('warning', 'conversation-incomplete', entry.path, `${label} was archived with ${entry.incomplete.length} file(s) missing; every sync retries it.`));
+      const listed = entry.incomplete.slice(0, 5).map((item) => `${item?.name || item?.kind || 'file'} (${missingCategory(item)})`).join('; ');
+      findings.push(finding('warning', 'conversation-incomplete', entry.path,
+        `${label} was archived with ${entry.incomplete.length} file(s) missing; every sync retries it: ${listed}${entry.incomplete.length > 5 ? '; …' : ''}.`,
+        { missing: entry.incomplete.map((item) => ({ name: item?.name || null, category: missingCategory(item) })) }));
     }
   });
 
+  // Files by name and indexed assets by blob, to explain missing and
+  // unreferenced files (diagnostics only: nothing is matched or repaired).
+  const pathsByName = new Map();
   for (const path of blobs.keys()) {
-    if (path.startsWith(CONVERSATIONS_ROOT) && !referenced.has(path)) {
-      findings.push(finding('warning', 'file-unreferenced', path, 'In the repository but not referenced by the index (orphaned, or written by another tool).'));
-    }
+    if (path.startsWith(CONVERSATIONS_ROOT)) pathsByName.set(basename(path), [...(pathsByName.get(basename(path)) || []), path]);
   }
+  const indexedAssetByBlob = new Map();
+  for (const [path] of expectedAssets) {
+    const sha = blobs.get(path)?.sha;
+    if (sha && !indexedAssetByBlob.has(sha)) indexedAssetByBlob.set(sha, path);
+  }
+  const entryByPath = new Map(index.conversations.filter((e) => e && typeof e.path === 'string').map((e) => [e.path, e]));
 
+  const linkedFromMarkdown = new Map();
   if (markdown instanceof Map) {
     for (const [path, text] of markdown) {
       checked.markdownFiles += 1;
-      for (const match of String(text ?? '').matchAll(ASSET_LINK)) {
-        const target = `${dirname(path)}/${match[1]}`;
-        if (!blobs.has(target)) {
-          findings.push(finding('error', 'link-broken', path, `Links to ${match[1]}, which is not in the repository.`));
+      const ownerId = entryByPath.get(path)?.id ?? metadataId(text)?.id ?? null;
+      for (const link of scanAssetLinks(text)) {
+        const target = `${dirname(path)}/${link.ref}`;
+        linkedFromMarkdown.set(target, path);
+        if (blobs.has(target)) continue;
+        const folder = link.ref.split('/')[1] || '';
+        const own = isOwnAssetFolder(folder, ownerId);
+        const times = link.count > 1 ? ` (${link.count} times)` : '';
+        const candidates = (pathsByName.get(basename(link.ref)) || []).filter((candidate) => candidate !== target);
+        const prefix = basename(link.ref).match(/^([0-9a-f]{8})-/)?.[1] || null;
+        const sameHash = prefix ? candidates.filter((candidate) => String(expectedAssets.get(candidate)?.sha256 || '').startsWith(prefix)) : [];
+        const elsewhere = candidates.length
+          ? ` A file with the same name exists at ${candidates.slice(0, 3).join(', ')}${candidates.length > 3 ? ', …' : ''}${sameHash.length ? `; the index records a SHA-256 starting with ${prefix} for it, as the name does, so it is very likely the same file` : ''}.`
+          : ' No file with that name exists anywhere under archive/conversations/.';
+        const extra = { target: link.ref, occurrences: link.count, in_code: link.inCode, own_folder: own, candidates: candidates.slice(0, 10) };
+        if (own !== false && !link.inCode) {
+          findings.push(finding('error', 'link-broken', path, `Links to ${link.ref}${times}, which is not in the repository.${elsewhere}`, extra));
+        } else {
+          const why = [
+            link.inCode ? 'every occurrence is inside a code block or inline code' : null,
+            own === false ? `it points to another conversation's attachment folder (assets/${folder}/), which the exporter never writes` : null,
+          ].filter(Boolean).join(', and ');
+          findings.push(finding('warning', 'link-unresolved-quoted', path, `Mentions ${link.ref}${times}, which is not in the repository; ${why}, so it is most likely Markdown quoted in the conversation text rather than one of its attachments.${elsewhere}`, extra));
         }
       }
     }
+  }
+
+  const identityKey = (meta) => `${meta?.provider ?? '?'}:${meta?.account ?? '?'}:${meta?.id ?? '?'}`;
+  for (const path of blobs.keys()) {
+    if (!path.startsWith(CONVERSATIONS_ROOT) || referenced.has(path)) continue;
+    let kind;
+    let detail;
+    const placeholder = placeholderSegment(path);
+    if (path.endsWith('.md') && !path.includes('/assets/')) {
+      const meta = markdown instanceof Map && markdown.has(path) ? metadataId(markdown.get(path)) : null;
+      const indexed = meta ? identities.get(identityKey(meta)) : null;
+      if (indexed) { kind = 'duplicate-conversation'; detail = `An older copy of a conversation the index lists at ${indexed.path} (for example left by a rename).`; }
+      else if (meta?.id) { kind = 'conversation-not-indexed'; detail = `Conversation ${identityKey(meta)} is not in the index; a rebuild dry run (--rebuild-dry-run) shows what indexing it would add.`; }
+      else if (markdown instanceof Map) { kind = 'markdown-not-indexed'; detail = 'Its identity cannot be read (no metadata block).'; }
+      else { kind = 'markdown-not-indexed'; detail = 'Run with --markdown to classify it.'; }
+    } else if (linkedFromMarkdown.has(path)) {
+      kind = 'linked-not-indexed';
+      detail = `Linked from ${linkedFromMarkdown.get(path)}, but not listed among that conversation's attachments in the index.`;
+    } else if (indexedAssetByBlob.has(blobs.get(path)?.sha)) {
+      kind = 'duplicate-copy';
+      detail = `The same bytes are archived and indexed at ${indexedAssetByBlob.get(blobs.get(path).sha)}.`;
+    } else {
+      const folder = path.split('/assets/')[1]?.split('/')[0] || '';
+      // The legacy layout named folders after the first 8 characters of a
+      // Claude conversation UUID: 8 hexadecimal characters.
+      kind = placeholder ? 'placeholder' : /^[0-9a-f]{8}$/i.test(folder) ? 'legacy-layout' : 'orphaned';
+      const owner = kind === 'legacy-layout' ? index.conversations.find((e) => idPrefix(e?.id) === folder.toLowerCase()) : null;
+      detail = kind === 'legacy-layout'
+        ? `In a legacy attachment folder (assets/${folder}/, the 8-character layout used before 2026-10-26)${owner ? ` of conversation ${owner.id}, which the index now lists at ${owner.path}` : ''}; usually left behind when its conversation was re-exported.`
+        : kind === 'placeholder' ? '' : 'Neither the index nor any Markdown file references it.';
+    }
+    if (placeholder) detail = `${detail ? `${detail} ` : ''}Its path contains "${placeholder}", which is not an ID the exporter writes: most likely sample or test data.`.trim();
+    findings.push(finding('warning', 'file-unreferenced', path, `In the repository but not referenced by the index. ${detail}`.trim(), { kind, ...(placeholder ? { placeholder } : {}) }));
   }
 
   // Every file the index records as not archived must be visibly noted in
@@ -209,5 +318,41 @@ export function formatAuditReport(result) {
   const head = `Archive integrity: ${result.counts.error} error(s), ${result.counts.warning} warning(s); `
     + `${result.checked.conversations} conversations, ${result.checked.assets} attachments, `
     + `${result.checked.markdownFiles} Markdown files and ${result.checked.hashedFiles} file hashes checked.`;
-  return [head, ...lines].join('\n');
+  const summary = summarizeUnreferenced(result.findings);
+  return [head, ...(summary.length ? ['', 'Unreferenced files by kind and folder:', ...summary.map((line) => `  ${line}`), ''] : []), ...lines].join('\n');
+}
+
+const KIND_LABELS = {
+  'duplicate-conversation': 'older copies of indexed conversations',
+  'conversation-not-indexed': 'conversations missing from the index',
+  'markdown-not-indexed': 'Markdown files not in the index',
+  'linked-not-indexed': 'attachments linked from Markdown but not indexed',
+  'duplicate-copy': 'duplicate copies of indexed attachments',
+  'legacy-layout': 'files in legacy attachment folders',
+  placeholder: 'files under placeholder-looking names (likely sample or test data)',
+  orphaned: 'files nothing references',
+};
+
+// Counts of file-unreferenced findings per kind, then per top folder below
+// archive/conversations/<provider>/, so dozens of warnings read as a few causes.
+export function summarizeUnreferenced(findings) {
+  const byKind = new Map();
+  for (const item of findings) {
+    if (item.code !== 'file-unreferenced') continue;
+    const kind = item.kind || 'orphaned';
+    const folder = String(item.path).split('/').slice(0, item.path.includes('/assets/') ? 6 : 4).join('/');
+    const folders = byKind.get(kind) || new Map();
+    folders.set(folder, (folders.get(folder) || 0) + 1);
+    byKind.set(kind, folders);
+  }
+  const lines = [];
+  for (const [kind, folders] of [...byKind].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    const total = [...folders.values()].reduce((a, b) => a + b, 0);
+    lines.push(`${total} ${KIND_LABELS[kind] || kind}:`);
+    for (const [folder, count] of [...folders].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 10)) {
+      lines.push(`  ${count} in ${folder}/`);
+    }
+    if (folders.size > 10) lines.push(`  … and ${folders.size - 10} more folders`);
+  }
+  return lines;
 }

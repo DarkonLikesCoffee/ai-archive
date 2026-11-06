@@ -23,7 +23,14 @@ A user should be able to export years of conversations from supported AI provide
 - [x] Detect orphaned assets, duplicate identities/paths, broken Markdown asset references, missing index entries and malformed metadata. (Files under `archive/conversations/` that the index does not list are reported as unreferenced.)
 - [x] Produce a human-readable report with severity and exact paths; never repair or delete automatically.
 - [x] Add unit tests using synthetic fixtures and a documented invocation. (`web/src/archiveIntegrity.test.js`; `web/scripts/verify-archive.mjs`)
-- [ ] Run it against a real archive (user, read-only token) and review the findings. (Since web 0.6.16 the verifier downloads in parallel with retries, shows progress, and supports `--json`/`--quiet`/`--no-progress`/`--concurrency` and Ctrl+C.)
+- [x] Run it against a real archive (user, read-only token) and review the findings. First run on 2026-11-06: 6 errors and 60 warnings, diagnosed in `docs/investigations/2026-11-first-integrity-run.md`. No indexed attachment bytes are missing.
+- [x] Make findings explain themselves (web 0.6.17):
+  - one finding per broken link target;
+  - links in quoted text or code, or into another conversation's folder, are separated from exporter links;
+  - unreferenced files are classified by kind and grouped per folder;
+  - incomplete conversations list their missing files;
+  - `--history` shows whether a missing file ever existed and which commit wrote an unreferenced one.
+- [ ] Classify the 56 unreferenced files of the real archive with `--markdown --history` (owner run), then decide per category which reviewed repairs are justified. Nothing is deleted or re-indexed automatically.
 
 Acceptance: a deliberately corrupted fixture produces precise findings; a clean fixture produces zero errors; the tool never mutates the archive.
 

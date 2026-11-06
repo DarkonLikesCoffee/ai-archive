@@ -81,3 +81,15 @@ Begin with a **read-only technical audit**, not a large refactor:
 - do not expose private data or secrets;
 - then select the first small, testable P0/P1 improvement from the audit and implement it if safe.
 After this first audit, continue the normal work loop using ROADMAP.md.
+
+## Standing findings from real-archive checks (keep current)
+
+- **First integrity run (2026-11-06, web 0.6.16), on the owner's archive:** 824 conversations, 1,420 attachments hashed, 0 download failures, 6 errors and 60 warnings. Diagnosis: `docs/investigations/2026-11-first-integrity-run.md`.
+  - The 6 errors are 2 links in one conversation, counted once per occurrence. They point into **other** conversations' legacy attachment folders, which the exporter never writes; most likely quoted text.
+  - The 4 incomplete conversations are the 7 oversized attachments.
+  - The 56 unreferenced files are not yet classified.
+- **Rules for these findings:**
+  - Do not delete, move or rewrite any of these files, and do not rebuild or publish the index on your own.
+  - Repairs wait for the owner's `--markdown --history` run and an explicit decision per category.
+- **Next action:** ask for, then analyse, the `kind` summary of the 0.6.17 report. Only then propose category-specific, reviewed repairs, for example re-syncing `linked-not-indexed` conversations or reviewing `conversation-not-indexed` files with `--rebuild-dry-run`.
+
