@@ -46,7 +46,7 @@ async function sha256Hex(data) {
 }
 
 // One conversation file -> the index entry a rebuild could produce, or why not.
-export async function rebuildIndexEntry({ path, markdown, tree = [], readBytes = null }) {
+export async function rebuildIndexEntry({ path, markdown, tree = [], readBytes = null, readDigest = null }) {
   const parsed = parseConversationMarkdown(markdown);
   const missing = ['id', 'provider', 'account'].filter((field) => typeof parsed[field] !== 'string' || !parsed[field]);
   if (missing.length) {
@@ -67,7 +67,15 @@ export async function rebuildIndexEntry({ path, markdown, tree = [], readBytes =
     }
     const extension = assetPath.split('.').pop().toLowerCase();
     const asset = { path: assetPath, sha256: null, size: blob.size ?? null, mime: MIME_BY_EXTENSION[extension] || 'application/octet-stream', name: unescapeLabel(match[1]) };
-    if (typeof readBytes === 'function') {
+    if (typeof readDigest === 'function') {
+      const digest = await readDigest(assetPath);
+      if (digest && !digest.error) {
+        asset.sha256 = digest.sha256;
+        asset.size = digest.size;
+      } else {
+        problems.push(`${match[2]} could not be read, so its hash was not rebuilt`);
+      }
+    } else if (typeof readBytes === 'function') {
       const bytes = await readBytes(assetPath);
       asset.sha256 = await sha256Hex(bytes);
       asset.size = bytes.byteLength;
@@ -99,12 +107,12 @@ const identity = (entry) => `${entry?.provider}:${entry?.account}:${entry?.id}`;
 
 // Compares a rebuild of every conversation file with the current index.
 // Returns a plan; it never writes, repairs or deletes.
-export async function planIndexRebuild({ index, tree, markdown, readBytes = null }) {
+export async function planIndexRebuild({ index, tree, markdown, readBytes = null, readDigest = null }) {
   const current = new Map((Array.isArray(index?.conversations) ? index.conversations : []).map((entry) => [identity(entry), entry]));
   const plan = { rebuilt: 0, unchanged: [], differs: [], onlyInFiles: [], onlyInIndex: [], unreadable: [], lostIfApplied: [] };
   const rebuiltKeys = new Set();
   for (const [path, text] of markdown) {
-    const result = await rebuildIndexEntry({ path, markdown: text, tree, readBytes });
+    const result = await rebuildIndexEntry({ path, markdown: text, tree, readBytes, readDigest });
     if (!result.entry) {
       plan.unreadable.push({ path, problems: result.problems });
       continue;
@@ -118,7 +126,7 @@ export async function planIndexRebuild({ index, tree, markdown, readBytes = null
       continue;
     }
     const fields = EXACT_FIELDS.filter((field) => JSON.stringify(existing[field] ?? null) !== JSON.stringify(result.entry[field] ?? null));
-    const assetKey = (asset) => `${asset.path}|${asset.size}${readBytes ? `|${asset.sha256}` : ''}`;
+    const assetKey = (asset) => `${asset.path}|${asset.size}${readBytes || readDigest ? `|${asset.sha256}` : ''}`;
     const before = (existing.assets || []).map(assetKey).sort().join();
     const after = result.entry.assets.map(assetKey).sort().join();
     if (before !== after) fields.push('assets');
