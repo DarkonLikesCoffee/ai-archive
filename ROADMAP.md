@@ -23,7 +23,7 @@ A user should be able to export years of conversations from supported AI provide
 - [x] Detect orphaned assets, duplicate identities/paths, broken Markdown asset references, missing index entries and malformed metadata. (Files under `archive/conversations/` that the index does not list are reported as unreferenced.)
 - [x] Produce a human-readable report with severity and exact paths; never repair or delete automatically.
 - [x] Add unit tests using synthetic fixtures and a documented invocation. (`web/src/archiveIntegrity.test.js`; `web/scripts/verify-archive.mjs`)
-- [ ] Run it against a real archive (user, read-only token) and review the findings.
+- [ ] Run it against a real archive (user, read-only token) and review the findings. (Since web 0.6.16 the verifier downloads in parallel with retries, shows progress, and supports `--json`/`--quiet`/`--no-progress`/`--concurrency` and Ctrl+C.)
 
 Acceptance: a deliberately corrupted fixture produces precise findings; a clean fixture produces zero errors; the tool never mutates the archive.
 

@@ -207,10 +207,27 @@ A read-only audit compares `archive/index.json` with the repository:
 It makes only GET requests to `api.github.com`, never repairs or deletes anything, and works with a read-only token:
 
 ```bash
-GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> --markdown --hashes
+GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> --branch main --markdown --hashes --concurrency 6
 ```
 
-`--rebuild-dry-run` also rebuilds the index from the conversation files. It reports where that rebuild differs from the current index and what an apply would lose, and it writes nothing (see `docs/design/index-rebuild.md`). `--markdown` downloads conversation files to check their links. `--hashes` downloads every attachment to verify its bytes, which is slow for large archives. The exit status is 0 when there are no errors, 1 when errors were found, and 2 when the audit could not run.
+Options:
+- `--markdown` downloads the conversation files, to check their attachment links and "not archived" notes.
+- `--hashes` downloads every attachment, to verify its size and SHA-256.
+- `--rebuild-dry-run` also rebuilds the index from the conversation files. It reports where that rebuild differs from the current index and what an apply would lose, and writes nothing (see `docs/design/index-rebuild.md`).
+- `--branch <name>` audits that branch (default: `main`, then `master`).
+- `--concurrency <n>` runs up to *n* downloads at a time (1–32, default 6).
+- `--json` writes a machine-readable report to stdout; progress stays on stderr.
+- `--no-progress` keeps the step messages but drops the progress line.
+- `--quiet` prints only the final report.
+
+How it downloads:
+- Every Git blob is downloaded once, even if several paths share it, and its bytes are checked against its blob ID.
+- Attachments are hashed and their bytes discarded, so memory stays small.
+- Network errors, 5xx responses and rate limits are retried with backoff. A primary rate limit is waited out when the reset is under 15 minutes away. Other errors (404, 401, …) are not retried; such a file is reported as `file-unreadable` and the rest is still checked.
+
+Progress goes to stderr: one refreshed line in a terminal, a line every few seconds otherwise. Errors and mismatches appear as they happen. The final report lists the counts, bytes downloaded, retries, failures and elapsed time.
+
+Ctrl+C stops scheduling downloads, reports how much was and wasn't checked, and exits 130; a second Ctrl+C quits at once. Exit status: 0 when there are no errors, 1 when errors were found, 2 when the audit could not run, 130 when interrupted.
 
 ## Repository layout
 

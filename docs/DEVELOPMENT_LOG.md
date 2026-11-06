@@ -2,6 +2,39 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Faster, observable archive verifier — 2026-11-06 (web 0.6.16)
+
+- **Problem (owner report).** `verify-archive.mjs --markdown --hashes` on a real archive (hundreds of conversations, thousands of attachments) ran for so long without any output that it had to be interrupted.
+- **Bottlenecks found.**
+  - Every Markdown file and attachment was downloaded strictly one after another.
+  - Each blob came as base64 JSON: a third larger, and decoded in memory.
+  - A blob shared by several paths was downloaded once per path.
+  - There were no retries, so one 5xx failed the whole run, and no output until the end.
+- **Change.** New `web/src/verifierRuntime.js` and `web/src/verifyArchiveCli.js`; the script is now a thin wrapper.
+  - Bounded concurrency (`--concurrency`, 1–32, default 6).
+  - Each unique blob SHA is downloaded once, through the raw media type.
+  - Every download is verified against its Git blob ID, so a truncated or altered download is retried and never hashed.
+  - Attachments are hashed and their bytes dropped.
+  - Retries with exponential backoff and jitter for network errors, 5xx and secondary limits (honouring `Retry-After`). A primary rate limit is waited out when the reset is at most 15 minutes away. No retry for other 4xx.
+  - A failed file becomes a `file-unreadable` finding on that path, and the rest is still checked.
+  - Progress on stderr: steps; done/total, percentage, rate, ETA and elapsed time; errors and mismatches as they happen. The line is refreshed with `\r` on a terminal (no ANSI codes) and printed periodically otherwise.
+  - `--json`, `--quiet`, `--no-progress`. The final stats cover conversations, attachments, Markdown files, files hashed, bytes, requests, retries, failures and elapsed time.
+  - Ctrl+C stops scheduling, aborts in-flight requests, reports what was and wasn't checked, and exits 130. An interrupted run never reports findings.
+- **Unchanged semantics.**
+  - `auditArchive` and `planIndexRebuild` keep their checks; they now also accept digests (`readDigest`) and unreadable files.
+  - Results are deterministic: data is ordered by tree path, not completion. A test shows the JSON findings equal the original in-memory audit at concurrency 1 and 6.
+  - Strictly GET to api.github.com; a test asserts only GET is used.
+- **Bugs found by the new tests and fixed before merging.**
+  - A missing `Retry-After` header read as 0, causing instant retries.
+  - The unreadable list was sorted with `localeCompare`, which depends on the machine's locale; it now uses code-point order.
+- **Tests.**
+  - `cd web && npm test`: 104/104. 15 new tests covering progress/ETA, TTY vs. pipe output, concurrency limit, de-duplication, retries, rate limits, blob verification, partial failures, JSON, `--quiet`/`--no-progress`, interruption, flag compatibility and identical findings.
+  - `npm run build` passes.
+  - `node --test extension/*.test.js`: 224/224.
+  - `node e2e/extension-sync.e2e.cjs`: 50/50.
+  - The real script was smoke-tested against a fake GitHub API (`--import` preload), including a real SIGINT (exit 130).
+- **Not verified.** Speed on the owner's real archive (no access from here). Expected order of magnitude: about `concurrency`× fewer wall-clock seconds for many small files; large attachments are bounded by bandwidth.
+
 ## Attachment verification, slice 2: failure categories — 2026-11-05 (extension 0.5.27, ROADMAP P0.4)
 
 - **Gap.** A left-out file or conversation was described only by free text. The popup said "Not exported" for every failed conversation, and the same "attachments missing" whether Claude had no file, the file was over the limit, or GitHub refused it.

@@ -1,93 +1,37 @@
 #!/usr/bin/env node
 // Read-only integrity audit of an AI Archive GitHub repository (ROADMAP P0.1).
 //
-//   GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> [--branch main] [--markdown] [--hashes]
+//   GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> \
+//     [--branch main] [--markdown] [--hashes] [--rebuild-dry-run] \
+//     [--concurrency 6] [--quiet] [--no-progress] [--json]
 //
-// --markdown also downloads every conversation file to check its attachment
-// links; --hashes downloads every attachment to verify its SHA-256 and size.
+// --markdown downloads every conversation file to check its attachment links
+// and "not archived" notes; --hashes downloads every attachment to verify its
+// SHA-256 and size; --rebuild-dry-run (implies --markdown) also rebuilds the
+// index from the conversation files and reports the differences, writing
+// nothing. Downloads run --concurrency at a time (default 6) with retries.
+// Progress goes to stderr; the report (or JSON with --json) to stdout.
 // Only GET requests are made, only to api.github.com. Nothing is written,
-// repaired or deleted. --rebuild-dry-run (implies --markdown) also rebuilds
-// the index from the conversation files and reports how it differs from the
-// current one; it never writes the result. Exit status: 0 no errors, 1 errors found, 2 could not run.
-import { auditArchive, formatAuditReport } from '../src/archiveIntegrity.js';
-import { planIndexRebuild, formatRebuildPlan } from '../src/indexRebuild.js';
+// repaired or deleted. Exit status: 0 no errors, 1 errors found, 2 could not
+// run, 130 interrupted (Ctrl+C).
+import { runVerifier } from '../src/verifyArchiveCli.js';
 
-const API = 'https://api.github.com';
-const args = process.argv.slice(2);
-const repoArg = args.find((arg) => /^[^-][^/]*\/[^/]+$/.test(arg));
-const branchAt = args.indexOf('--branch');
-const branchArg = branchAt >= 0 ? args[branchAt + 1] : null;
-const token = process.env.GITHUB_TOKEN;
+const controller = new AbortController();
+let interrupts = 0;
+process.on('SIGINT', () => {
+  interrupts += 1;
+  if (interrupts > 1) process.exit(130);
+  process.stderr.write('\nStopping: no new downloads are started; press Ctrl+C again to quit at once.\n');
+  controller.abort();
+});
 
-if (!repoArg || !token) {
-  console.error('Usage: GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> [--branch main] [--markdown] [--hashes] [--rebuild-dry-run]');
-  process.exit(2);
-}
-const [owner, repo] = repoArg.split('/');
-
-async function get(path) {
-  const response = await fetch(`${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    let message = text;
-    try { message = JSON.parse(text).message || text; } catch {}
-    throw new Error(`GitHub ${response.status} for ${path.split('?')[0]}: ${String(message).slice(0, 200)}`);
-  }
-  return JSON.parse(text);
-}
-
-async function blobBytes(sha) {
-  const blob = await get(`/git/blobs/${encodeURIComponent(sha)}`);
-  if (blob.encoding !== 'base64') throw new Error(`Unexpected blob encoding for ${sha}`);
-  return new Uint8Array(Buffer.from(blob.content, 'base64'));
-}
-
-try {
-  let ref = null;
-  for (const branch of branchArg ? [branchArg] : ['main', 'master']) {
-    try { ref = await get(`/git/ref/heads/${encodeURIComponent(branch)}`); break; } catch (error) {
-      if (!/GitHub 404/.test(error.message)) throw error;
-    }
-  }
-  if (!ref) throw new Error('No main or master branch found (use --branch).');
-  const commit = await get(`/git/commits/${ref.object.sha}`);
-  const treeResponse = await get(`/git/trees/${commit.tree.sha}?recursive=1`);
-  if (treeResponse.truncated) throw new Error('GitHub truncated the repository tree; the archive is too large to audit this way.');
-  const tree = treeResponse.tree;
-  const shaOf = new Map(tree.filter((item) => item.type === 'blob').map((item) => [item.path, item.sha]));
-  if (!shaOf.has('archive/index.json')) throw new Error('archive/index.json is not in the repository.');
-
-  let index;
-  try {
-    index = JSON.parse(new TextDecoder().decode(await blobBytes(shaOf.get('archive/index.json'))));
-  } catch (error) {
-    index = null;
-    console.error(`archive/index.json could not be parsed: ${error.message}`);
-  }
-
-  let markdown = null;
-  const rebuild = args.includes('--rebuild-dry-run');
-  if (args.includes('--markdown') || rebuild) {
-    markdown = new Map();
-    for (const [path, sha] of shaOf) {
-      if (path.startsWith('archive/conversations/') && path.endsWith('.md')) {
-        markdown.set(path, new TextDecoder().decode(await blobBytes(sha)));
-      }
-    }
-  }
-  const readBytes = args.includes('--hashes') ? (path) => blobBytes(shaOf.get(path)) : null;
-
-  const result = await auditArchive({ index, tree, markdown, readBytes });
-  console.log(`${owner}/${repo} @ ${ref.ref} ${ref.object.sha.slice(0, 12)}`);
-  console.log(formatAuditReport(result));
-  if (rebuild) {
-    console.log('');
-    console.log(formatRebuildPlan(await planIndexRebuild({ index, tree, markdown, readBytes })));
-  }
-  process.exit(result.counts.error ? 1 : 0);
-} catch (error) {
-  console.error(`Could not audit the archive: ${error.message}`);
-  process.exit(2);
-}
+const status = await runVerifier({
+  argv: process.argv.slice(2),
+  env: process.env,
+  fetch: globalThis.fetch,
+  stdout: process.stdout,
+  stderr: process.stderr,
+  stderrIsTTY: Boolean(process.stderr.isTTY),
+  signal: controller.signal,
+});
+process.exitCode = status;

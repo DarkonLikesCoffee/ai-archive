@@ -8,6 +8,10 @@
 //   tree     [{ path, type, sha, size }] from GET /git/trees/<sha>?recursive=1
 //   markdown optional Map(path -> text) of conversation files to check links in
 //   readBytes optional async (path) -> Uint8Array, to verify SHA-256 and size
+//   readDigest optional (path) -> { size, sha256 } or { error }, the same check
+//             from digests computed elsewhere (bytes need not be kept)
+//   unreadable optional [{ path, message }]: files that could not be read;
+//             each is an error, so a failed download never passes silently
 //
 // Output: { findings: [{ severity, code, path, message }], counts, checked }.
 // severity: 'error' (archive is inconsistent), 'warning' (worth a look).
@@ -39,7 +43,7 @@ async function sha256Hex(bytes) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export async function auditArchive({ index, tree, markdown = null, readBytes = null } = {}) {
+export async function auditArchive({ index, tree, markdown = null, readBytes = null, readDigest = null, unreadable = [] } = {}) {
   const findings = [];
   const checked = { conversations: 0, assets: 0, markdownFiles: 0, hashedFiles: 0 };
 
@@ -156,15 +160,32 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
     }
   }
 
-  if (typeof readBytes === 'function') {
+  for (const item of Array.isArray(unreadable) ? unreadable : []) {
+    findings.push(finding('error', 'file-unreadable', item.path, `Could not be read from GitHub, so it was not checked: ${item.message}`));
+  }
+
+  if (typeof readBytes === 'function' || typeof readDigest === 'function') {
     for (const [path, asset] of expectedAssets) {
       if (!blobs.has(path) || typeof asset.sha256 !== 'string') continue;
-      const bytes = await readBytes(path);
-      checked.hashedFiles += 1;
-      if (asset.size != null && bytes.byteLength !== Number(asset.size)) {
-        findings.push(finding('error', 'asset-size-mismatch', path, `The index records ${asset.size} bytes; the file has ${bytes.byteLength}.`));
+      let digest;
+      if (typeof readDigest === 'function') {
+        digest = await readDigest(path);
+        if (!digest || digest.error) {
+          // Reported once through `unreadable` when the caller lists it there.
+          if (!(Array.isArray(unreadable) && unreadable.some((item) => item.path === path))) {
+            findings.push(finding('error', 'file-unreadable', path, `Could not be read from GitHub, so it was not checked: ${digest?.error || 'no data'}`));
+          }
+          continue;
+        }
+      } else {
+        const bytes = await readBytes(path);
+        digest = { size: bytes.byteLength, sha256: await sha256Hex(bytes) };
       }
-      if (await sha256Hex(bytes) !== asset.sha256.toLowerCase()) {
+      checked.hashedFiles += 1;
+      if (asset.size != null && digest.size !== Number(asset.size)) {
+        findings.push(finding('error', 'asset-size-mismatch', path, `The index records ${asset.size} bytes; the file has ${digest.size}.`));
+      }
+      if (digest.sha256 !== asset.sha256.toLowerCase()) {
         findings.push(finding('error', 'asset-hash-mismatch', path, 'The file\'s SHA-256 does not match the index.'));
       }
     }
