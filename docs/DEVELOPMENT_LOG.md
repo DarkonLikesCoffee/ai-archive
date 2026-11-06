@@ -2,6 +2,28 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## First real integrity run diagnosed; self-explaining findings — 2026-11-06 (web 0.6.17)
+
+- **Owner's run (web 0.6.16, `--markdown --hashes`).** 824 conversations, 1,420 attachments hashed, 931 Markdown files, 381.8 MB in 2,298 requests, 0 retries, 0 failures; 6 errors and 60 warnings (56 `file-unreferenced`, 4 `conversation-incomplete`).
+- **Diagnosis** (`docs/investigations/2026-11-first-integrity-run.md`; the private archive was not read):
+  - **The 6 errors.** These are 2 missing targets in one conversation, reported once per occurrence (**verifier duplicate reporting, confirmed**). Both point into *other* conversations' legacy folders (`assets/bb7e12e2/`, `assets/9da9cc54/`; this conversation is `138089cb…`). Every exporter version since `d90190a` builds the folder from the conversation's own ID, so **these are not exporter links (confirmed)**. Most likely quoted archive Markdown in a conversation about rendering fixes, with the files moved to the new layout when those conversations were re-exported (likely, to confirm with `--history`).
+  - **The 4 incomplete conversations** are the 7 oversized attachments (confirmed from the live sync reports). This is expected behaviour.
+  - **The 56 unreferenced files** are not yet classifiable without the owner's run. The `aaaaaaaaaa`-style names are not IDs the exporter derives from Claude data, and no code or test here writes them to a real repository. Most likely test accounts, sample data, or files added outside AI Archive.
+- **Verifier changes (read-only, no check removed):**
+  - one link finding per (file, target) with `occurrences`;
+  - `link-broken` stays an error for the conversation's own folder outside code, and anything else is the warning `link-unresolved-quoted`;
+  - both carry same-name candidates elsewhere in the tree, and a "very likely the same file" note when the indexed SHA-256 matches the name's prefix;
+  - `file-unreferenced` gains a `kind`, an explanation, and a per-kind/per-folder summary;
+  - `conversation-incomplete` lists missing files with their category;
+  - new `--history` (at most 200 read-only commit lookups) tells removed from never-uploaded files and shows who wrote an unreferenced one.
+- **Bug found by the new tests.** The legacy-folder heuristic first treated any 8-character folder as legacy; it is now restricted to 8 hexadecimal characters (Claude UUID prefixes).
+- **Tests.**
+  - `cd web && npm test`: 109/109. New: duplicate links, foreign-folder and code-block links with candidates, each unreferenced kind including placeholders, the summary, incomplete details, `scanAssetLinks`, and `--history`.
+  - `npm run build` passes.
+  - `node --test extension/*.test.js`: 224/224.
+  - `node e2e/extension-sync.e2e.cjs`: 50/50.
+- **Next.** The owner runs `--markdown --history` and reports the `kind` summary. Then, per category, propose reviewed repairs; never automatic deletion or index publication.
+
 ## Faster, observable archive verifier — 2026-11-06 (web 0.6.16)
 
 - **Problem (owner report).** `verify-archive.mjs --markdown --hashes` on a real archive (hundreds of conversations, thousands of attachments) ran for so long without any output that it had to be interrupted.

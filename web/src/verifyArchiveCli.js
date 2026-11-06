@@ -9,18 +9,21 @@ import {
 } from './verifierRuntime.js';
 
 export const USAGE = 'Usage: GITHUB_TOKEN=<read-only token> node web/scripts/verify-archive.mjs <owner>/<repo> '
-  + '[--branch main] [--markdown] [--hashes] [--rebuild-dry-run] [--concurrency 6] [--quiet] [--no-progress] [--json]';
+  + '[--branch main] [--markdown] [--hashes] [--rebuild-dry-run] [--history] [--concurrency 6] [--quiet] [--no-progress] [--json]';
+// At most this many history lookups per audit (one GitHub request each).
+export const MAX_HISTORY_LOOKUPS = 200;
 const DEFAULT_CONCURRENCY = 6;
 const MAX_CONCURRENCY = 32;
 
 export function parseArgs(argv) {
-  const options = { repo: null, branch: null, markdown: false, hashes: false, rebuild: false, concurrency: DEFAULT_CONCURRENCY, quiet: false, progress: true, json: false };
+  const options = { repo: null, branch: null, markdown: false, hashes: false, rebuild: false, history: false, concurrency: DEFAULT_CONCURRENCY, quiet: false, progress: true, json: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--branch') options.branch = argv[++i] ?? null;
     else if (arg === '--markdown') options.markdown = true;
     else if (arg === '--hashes') options.hashes = true;
     else if (arg === '--rebuild-dry-run') options.rebuild = true;
+    else if (arg === '--history') options.history = true;
     else if (arg === '--concurrency') {
       const value = Number(argv[++i]);
       if (!Number.isInteger(value) || value < 1 || value > MAX_CONCURRENCY) return { error: `--concurrency must be a whole number from 1 to ${MAX_CONCURRENCY}.` };
@@ -204,6 +207,45 @@ export async function runVerifier({ argv, env, fetch, stdout, stderr, stderrIsTT
     const sortedUnreadable = [...unreadable].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     const result = await auditArchive({ index, tree, markdown, readDigest, unreadable: sortedUnreadable });
     const plan = options.rebuild ? await planIndexRebuild({ index, tree, markdown, readDigest }) : null;
+
+    // Read-only history of missing link targets and unreferenced files: was a
+    // missing file ever on the branch (recoverable) or never uploaded, and
+    // which commit wrote an unreferenced one?
+    let historyLookups = 0;
+    if (options.history) {
+      const targets = [];
+      for (const item of result.findings) {
+        if ((item.code === 'link-broken' || item.code === 'link-unresolved-quoted') && item.target) {
+          targets.push({ item, path: `${dirname(item.path)}/${item.target}`, present: false });
+        } else if (item.code === 'file-unreferenced') {
+          targets.push({ item, path: item.path, present: true });
+        }
+      }
+      const selected = targets.slice(0, MAX_HISTORY_LOOKUPS);
+      if (showSteps) stderr.write(`[+] Looking up history for ${formatCount(selected.length)} file(s)${targets.length > selected.length ? ` (first ${MAX_HISTORY_LOOKUPS} of ${formatCount(targets.length)})` : ''}...\n`);
+      if (!selected.length && showSteps) stderr.write('      nothing to look up\n');
+      if (selected.length) progress.start({ total: selected.length, unit: 'lookups' });
+      await mapLimit(selected, options.concurrency, async (target) => {
+        try {
+          const commits = await reader.json(`/commits?sha=${encodeURIComponent(branchName)}&path=${encodeURIComponent(target.path)}&per_page=1`);
+          const last = Array.isArray(commits) ? commits[0] : null;
+          target.item.history = last
+            ? { path: target.path, last_commit: String(last.sha), date: last.commit?.author?.date || last.commit?.committer?.date || null, message: String(last.commit?.message || '').split('\n')[0].slice(0, 120) }
+            : { path: target.path, last_commit: null };
+          const when = last ? `${String(last.sha).slice(0, 12)}${target.item.history.date ? ` (${target.item.history.date.slice(0, 10)})` : ''} "${target.item.history.message}"` : '';
+          target.item.message += !last
+            ? (target.present ? ' History: no commit on this branch touched it (unexpected for a file on it).' : ' History: it was never on this branch, so it was never uploaded here.')
+            : (target.present ? ` History: last written by commit ${when}.` : ` History: last changed by commit ${when}, most likely its removal; the file can be read from that commit's parent.`);
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          target.item.history = { path: target.path, error: error.message };
+          target.item.message += ` History: could not be looked up (${error.message}).`;
+        }
+        historyLookups += 1;
+        progress.tick();
+      }, { signal });
+      if (selected.length) progress.finish();
+    }
     const stats = {
       conversations: Array.isArray(index?.conversations) ? index.conversations.length : 0,
       attachments: result.checked.assets,
@@ -211,6 +253,7 @@ export async function runVerifier({ argv, env, fetch, stdout, stderr, stderrIsTT
       files_hashed: result.checked.hashedFiles,
       bytes_downloaded: reader.stats.bytes,
       requests: reader.stats.requests,
+      history_lookups: historyLookups,
       retries: reader.stats.retries,
       failures: sortedUnreadable.length,
       elapsed_ms: now() - startedAt,
@@ -218,7 +261,7 @@ export async function runVerifier({ argv, env, fetch, stdout, stderr, stderrIsTT
     if (options.json) {
       stdout.write(`${JSON.stringify({
         repository: `${owner}/${repo}`, branch: branchName, commit: ref.object.sha, interrupted: false,
-        options: { markdown: options.markdown, hashes: options.hashes, rebuild: options.rebuild, concurrency: options.concurrency },
+        options: { markdown: options.markdown, hashes: options.hashes, rebuild: options.rebuild, history: options.history, concurrency: options.concurrency },
         counts: result.counts, checked: result.checked, findings: result.findings,
         ...(plan ? { rebuild: plan } : {}), stats,
       }, null, 2)}\n`);
