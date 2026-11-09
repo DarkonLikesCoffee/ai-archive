@@ -30,7 +30,8 @@ A user should be able to export years of conversations from supported AI provide
   - unreferenced files are classified by kind and grouped per folder;
   - incomplete conversations list their missing files;
   - `--history` shows whether a missing file ever existed and which commit wrote an unreferenced one.
-- [ ] Classify the 56 unreferenced files of the real archive with `--markdown --history` (owner run), then decide per category which reviewed repairs are justified. Nothing is deleted or re-indexed automatically.
+- [x] Classify the 56 unreferenced files of the real archive. Investigation 2026-11-09: 41 files are copies of 11 conversations indexed under another account, left behind by an early index-overwrite bug, now fixed. 14 attachments are byte-identical to indexed copies. 1 image exists only there. The verifier now reports all of this itself (web 0.6.18).
+- [ ] Owner decision: what to do with the four test-profile folders. Rescue first the one image that exists only there and, if wanted, the non-active branches. Nothing is deleted automatically.
 
 Acceptance: a deliberately corrupted fixture produces precise findings; a clean fixture produces zero errors; the tool never mutates the archive.
 
@@ -52,6 +53,8 @@ Acceptance: each failure mode has a test and documented user-visible outcome; no
 
 ### P0.4 Attachment verification
 - [x] Verify message-level file references, generated workspace files, legacy sandbox files, inline media and tool-result media. (Code audit with synthetic tests: `docs/design/attachment-verification.md`. Real-account checks are still pending; see below.)
+- [x] Same-named distinct attachments are no longer merged by name: the original of a pasted upload in the sandbox is kept next to the message's same-named preview (0.5.28, reproduced with synthetic data).
+- [ ] Decide whether to raise `EXPORTER_VERSION`, which re-exports every conversation once, so that already archived conversations gain originals that were skipped before 0.5.28.
 - [ ] Verify each saved file's bytes, MIME, size and SHA-256 against its source when possible. Done: bytes, size and SHA-256 are checked from download through transfer; GitHub's blob ID must match the bytes sent; archived blobs are reused only when proven identical, and differing files are repaired (0.5.26). Open: the MIME type is not checked against the bytes.
 - [x] Distinguish unavailable-at-source from download-failed and GitHub-upload-refused. (0.5.27: sync report, popup and diagnostics; derived from recorded data, so no Markdown or index changes. Left-out files: `unavailable-at-source` / `over-limit` / `upload-refused`. Left-out conversations: `download-failed` / `validation-failed` / `export-failed` / `over-limit`.)
 - [ ] Keep real-account validation pending until the user checks representative exported files.

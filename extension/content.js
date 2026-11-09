@@ -743,11 +743,18 @@
 
       // If a directly downloaded message attachment has the same name, a
       // basename mention may refer to that attachment instead of this sandbox
-      // file. Include the sandbox copy only when the exact path was cited above.
-      const collidesWithDirectAsset = directAssets.some(({ asset }) =>
-        String(asset?.name || '').toLowerCase() === basename
-      );
-      return !collidesWithDirectAsset;
+      // file, so it is not archived on the name alone...
+      const collisions = directAssets.filter(({ asset }) => String(asset?.name || '').toLowerCase() === basename);
+      if (!collisions.length) return true;
+      // ...except the original of that very upload: Claude keeps a user's
+      // upload in the sandbox's uploads folder under its file name, while the
+      // message file can be a preview (a pasted image is served as WebP under
+      // the .png name). A name is not an identity, so the original is
+      // downloaded too; a copy with the same name and the same bytes is then
+      // dropped by content in collectMessageAssets, so identical files are
+      // still stored once.
+      return /^uploads\//.test(sandboxRelativePath(file?.path))
+        && collisions.some(({ message: owner }) => owner?.sender === 'human');
     });
   }
 

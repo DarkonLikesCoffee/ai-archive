@@ -281,10 +281,27 @@ function normalizeMarkdown(markdown) {
   return String(markdown ?? '').replace(/\r\n?/g, '\n');
 }
 
+// The metadata block of a conversation file: the current
+// `<!-- AI_ARCHIVE_METADATA {…} -->` comment, or the earliest exporter's
+// front matter, a JSON object between `---` lines. The front matter counts
+// only when it is a JSON object, so a file that merely starts with a
+// horizontal rule is not misread.
+const LEGACY_FRONT_MATTER = /^---[ \t]*\n(\{[\s\S]*?\})[ \t]*\n---[ \t]*(?:\n[ \t]*)*/;
 function parseMetadata(markdown) {
   const normalized = normalizeMarkdown(markdown);
   const m = normalized.match(/^<!--\s*AI_ARCHIVE_METADATA\s*\n([\s\S]*?)\n-->[ \t]*(?:\n[ \t]*)*/);
-  if (!m) return { metadata: {}, body: normalized };
+  if (!m) {
+    const legacy = normalized.match(LEGACY_FRONT_MATTER);
+    if (legacy) {
+      try {
+        const metadata = JSON.parse(legacy[1]);
+        if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+          return { metadata, body: normalized.slice(legacy[0].length) };
+        }
+      } catch {}
+    }
+    return { metadata: {}, body: normalized };
+  }
   try {
     return { metadata: JSON.parse(m[1]), body: normalized.slice(m[0].length) };
   } catch {

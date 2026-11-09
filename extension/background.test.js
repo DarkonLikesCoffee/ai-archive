@@ -2762,3 +2762,25 @@ test('the report names a category for every left-out conversation and every miss
   const [entry] = indexOf(harness).conversations;
   assert.equal(JSON.stringify(entry.incomplete).includes('categor'), false);
 });
+
+test('two different files with the same name in one conversation are both archived, indexed and linked', async () => {
+  const name = '1700000000000_image.png';
+  const preview = fileAsset(name, 'webp preview bytes', 'm1', { source: 'message', file_uuid: 'img-1', mime: 'image/webp' });
+  const original = { ...fileAsset(name, 'png original bytes', 'm1', { source: 'sandbox', source_path: `/mnt/user-data/uploads/${name}`, mime: 'image/png' }) };
+  delete original.message_external_id;
+  const conversation = {
+    ...conversationWith('c1', []),
+    messages: [{ external_id: 'm1', role: 'user', content: 'what is in this image?', files: [{ file_name: name, file_uuid: 'img-1' }], attachments: [] }],
+    assets: [preview, original],
+  };
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  await harness.sync([conversation], () => {});
+  const [entry] = indexOf(harness).conversations;
+  assert.equal(entry.assets.length, 2, 'both files are in the index');
+  assert.equal(new Set(entry.assets.map((asset) => asset.path)).size, 2, 'at distinct paths');
+  assert.deepEqual(new Set(entry.assets.map((asset) => asset.sha256)), new Set([preview.sha256, original.sha256]));
+  const markdown = markdownOf(harness, 'Conversation c1');
+  for (const asset of entry.assets) {
+    assert.ok(markdown.includes(`](assets/${asset.path.split('/assets/')[1]})`), `the Markdown links ${asset.path.split('/').pop()}`);
+  }
+});

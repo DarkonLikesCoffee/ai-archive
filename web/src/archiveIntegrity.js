@@ -18,6 +18,8 @@
 
 const CONVERSATIONS_ROOT = 'archive/conversations/';
 const ASSET_LINK = /\]\((assets\/[^)\s]+)\)/g;
+// The same link with its label, in the exporter's escaping.
+const LABELED_ASSET_LINK = /!?\[((?:\\.|[^\]\\])*)\]\((assets\/[^)\s]+)\)/g;
 
 // The exporter's escaping of file names in Markdown labels
 // (escapeMarkdownLabel in extension/background.js).
@@ -36,10 +38,23 @@ function finding(severity, code, path, message, extra = {}) {
 // The asset links of a Markdown file, once per target, with how often each
 // occurs and whether every occurrence is inside a fenced code block or inline
 // code (text, not an attachment reference written by the exporter).
+//
+// Message content is exported verbatim, so a message can leave a code block
+// unclosed. A block never spans messages: the fence state is reset at every
+// message boundary the exporter writes (a `---` line, then a `## <Role>`
+// heading), so links in later messages are not mistaken for code.
+const ROLE_HEADING = /^## (You|Claude|[a-z][a-z0-9_-]*)\s*$/;
 export function scanAssetLinks(text) {
   const links = new Map();
   let fence = null;
-  for (const line of String(text ?? '').split('\n')) {
+  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '---') {
+      let next = i + 1;
+      while (next < lines.length && !lines[next].trim()) next += 1;
+      if (next < lines.length && ROLE_HEADING.test(lines[next])) { fence = null; continue; }
+    }
     const marker = line.match(/^\s*(`{3,}|~{3,})/);
     if (marker) {
       if (!fence) fence = marker[1][0].repeat(marker[1].length);
@@ -48,12 +63,13 @@ export function scanAssetLinks(text) {
     }
     // Inline code spans on this line, so a link inside `...` counts as code.
     const codeSpans = [...line.matchAll(/`[^`]*`/g)].map((m) => [m.index, m.index + m[0].length]);
-    for (const match of line.matchAll(ASSET_LINK)) {
+    for (const match of line.matchAll(LABELED_ASSET_LINK)) {
       const inCode = Boolean(fence) || codeSpans.some(([start, end]) => match.index >= start && match.index < end);
-      const link = links.get(match[1]) || { ref: match[1], count: 0, inCode: true };
+      const link = links.get(match[2]) || { ref: match[2], count: 0, inCode: true, label: null };
       link.count += 1;
+      if (!inCode && link.label == null) link.label = match[1];
       link.inCode = link.inCode && inCode;
-      links.set(match[1], link);
+      links.set(match[2], link);
     }
   }
   return [...links.values()];
@@ -69,11 +85,20 @@ function isOwnAssetFolder(folder, id) {
   const name = String(folder).toLowerCase();
   return name.startsWith(idPrefix(id)) || name.startsWith(slugPrefix(id));
 }
+// The metadata of a conversation file, in the current comment block or the
+// earliest exporter's `---` JSON front matter (as parseMetadata in github.js).
 const metadataId = (text) => {
-  const m = String(text ?? '').match(/^<!--\s*AI_ARCHIVE_METADATA\s*\n([\s\S]*?)\n-->/);
+  const value = String(text ?? '').replace(/\r\n?/g, '\n');
+  const m = value.match(/^<!--\s*AI_ARCHIVE_METADATA\s*\n([\s\S]*?)\n-->/) || value.match(/^---[ \t]*\n(\{[\s\S]*?\})[ \t]*\n---/);
   if (!m) return null;
-  try { return JSON.parse(m[1]); } catch { return null; }
+  try { const meta = JSON.parse(m[1]); return meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : null; } catch { return null; }
 };
+
+// Conversation files are the Markdown files of an account folder; a `.md`
+// file under `assets/` is an attachment (for example a README Claude wrote).
+export function isConversationMarkdownPath(path) {
+  return String(path).startsWith(CONVERSATIONS_ROOT) && String(path).endsWith('.md') && !String(path).includes('/assets/');
+}
 // A folder or account name made of one repeated character (aaaaaaaaaa): not
 // an exporter ID, most likely sample or test data.
 const placeholderSegment = (path) => String(path).split('/').slice(2, -1).find((segment) => /^(.)\1{5,}$/.test(segment)) || null;
@@ -187,6 +212,7 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
   const linkedFromMarkdown = new Map();
   if (markdown instanceof Map) {
     for (const [path, text] of markdown) {
+      if (!isConversationMarkdownPath(path)) continue;
       checked.markdownFiles += 1;
       const ownerId = entryByPath.get(path)?.id ?? metadataId(text)?.id ?? null;
       for (const link of scanAssetLinks(text)) {
@@ -225,13 +251,19 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
     if (path.endsWith('.md') && !path.includes('/assets/')) {
       const meta = markdown instanceof Map && markdown.has(path) ? metadataId(markdown.get(path)) : null;
       const indexed = meta ? identities.get(identityKey(meta)) : null;
+      const elsewhere = meta && !indexed ? index.conversations.filter((e) => e && e.provider === meta.provider && String(e.id) === String(meta.id) && e.account !== meta.account) : [];
       if (indexed) { kind = 'duplicate-conversation'; detail = `An older copy of a conversation the index lists at ${indexed.path} (for example left by a rename).`; }
+      else if (elsewhere.length) {
+        kind = 'indexed-under-other-account';
+        detail = `The same ${meta.provider} conversation (${meta.id}) is indexed under ${elsewhere.map((e) => `account "${e.account}" at ${e.path}`).join(' and ')}; this copy belongs to account "${meta.account}", which the index does not list.`;
+      }
       else if (meta?.id) { kind = 'conversation-not-indexed'; detail = `Conversation ${identityKey(meta)} is not in the index; a rebuild dry run (--rebuild-dry-run) shows what indexing it would add.`; }
       else if (markdown instanceof Map) { kind = 'markdown-not-indexed'; detail = 'Its identity cannot be read (no metadata block).'; }
       else { kind = 'markdown-not-indexed'; detail = 'Run with --markdown to classify it.'; }
     } else if (linkedFromMarkdown.has(path)) {
       kind = 'linked-not-indexed';
-      detail = `Linked from ${linkedFromMarkdown.get(path)}, but not listed among that conversation's attachments in the index.`;
+      const copy = indexedAssetByBlob.get(blobs.get(path)?.sha);
+      detail = `Linked from ${linkedFromMarkdown.get(path)}, but not listed among that conversation's attachments in the index.${copy ? ` The same bytes are archived and indexed at ${copy}.` : ' Its bytes are not indexed anywhere else.'}`;
     } else if (indexedAssetByBlob.has(blobs.get(path)?.sha)) {
       kind = 'duplicate-copy';
       detail = `The same bytes are archived and indexed at ${indexedAssetByBlob.get(blobs.get(path).sha)}.`;
@@ -324,6 +356,7 @@ export function formatAuditReport(result) {
 
 const KIND_LABELS = {
   'duplicate-conversation': 'older copies of indexed conversations',
+  'indexed-under-other-account': 'copies of conversations indexed under another account',
   'conversation-not-indexed': 'conversations missing from the index',
   'markdown-not-indexed': 'Markdown files not in the index',
   'linked-not-indexed': 'attachments linked from Markdown but not indexed',
