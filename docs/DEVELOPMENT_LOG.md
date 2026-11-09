@@ -2,6 +2,38 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Verifier fixes and the same-name attachment collision — 2026-11-09 (extension 0.5.28, web 0.6.18)
+
+**Background.** A read-only investigation of the owner's archive (2026-11-09; reported to the owner, no private data committed here) explained all 62 warnings:
+- **41 Markdown files and 14 attachments:** left in four test-profile folders on 2026-09-26, when an early exporter overwrote an index larger than the Contents API's inline limit. That bug was fixed in #19.
+- **1 image:** exists only in one of those folders.
+- **4 incomplete conversations:** the 7 oversized attachments.
+- **2 quoted links:** inside code blocks.
+
+**Verifier defects (web), each with regression tests in `web/src/verifierFixes.test.js`:**
+1. **`.md` attachments.** Markdown under `assets/` was treated as conversations: 66 files on the real archive. `isConversationMarkdownPath()` is now used by the audit, the rebuild and the command, which downloads conversation Markdown only; attachments are still hashed with `--hashes`.
+2. **Earliest metadata format.** The JSON front matter between `---` lines was unreadable (20 files). `parseMetadata` (viewer and rebuild) and the audit now read it, only when it is a JSON object.
+3. **Code in rebuilds.** The rebuild compared links inside code, so 1 conversation differed. It now uses `scanAssetLinks` and skips links whose every occurrence is in code. A check against the real archive exposed a second effect: an unclosed code block in one message turned later messages' exporter links into "code" (2 conversations). The fence state is now reset at every exporter message boundary, and a link to an existing file in the conversation's own folder always counts.
+4. **Copies under another account.** The new `file-unreferenced` kind `indexed-under-other-account`, and `indexedUnder` in the rebuild plan, mark copies of a conversation indexed under another account. `linked-not-indexed` says whether the same bytes are indexed elsewhere.
+
+**Read-only check against a local clone of the owner's archive** (results not committed): 0 errors and 62 warnings as before; 865 conversation files instead of 931; rebuild 824/824 match, 0 differ, 0 unreadable; the 41 files named as copies indexed under another account. The clone was not modified.
+
+**Attachment collision (extension).**
+- **Real bug, reproduced with synthetic data.** `sandboxFileIsReferenced` skipped a sandbox file mentioned by name whenever a directly downloaded message attachment had the same name. For a pasted image, the message file is Claude's preview (on the owner's archive a lossy WebP under the `.png` name, confirmed by its bytes), and the sandbox's `uploads/<name>` holds the original. So the original was never archived: silent loss of the original bytes. The two files are distinct; they only share a name.
+- **Fix (`extension/content.js`).** On such a collision a file in the sandbox's `uploads/` folder that matches a user message's attachment is downloaded too. A copy with the same name and the same bytes is still dropped by content, so it is stored once.
+- **Not changed.** The existing protection for Claude-generated files (for example `outputs/photo.png`) mentioned only by a basename that collides with a direct attachment; its test is unchanged and passes.
+- **Background side.** It already archived, indexed and linked both files at distinct paths (new test).
+
+**Not done (owner decision).**
+- `EXPORTER_VERSION` was not raised. Raising it would re-export all conversations once so that archived ones gain the originals. Without it, only conversations synced again for other reasons gain them.
+- The preview-versus-original question for message images *without* a sandbox copy is unchanged: those are archived from Claude's preview URL.
+
+**Tests.**
+- `node --test extension/*.test.js`: 227/227. New: preview plus original kept; identical bytes stored once; background archives and links both.
+- `cd web && npm test`: 115/115, 6 new tests.
+- `npm run build` passes.
+- `node e2e/extension-sync.e2e.cjs`: 50/50.
+
 ## First real integrity run diagnosed; self-explaining findings — 2026-11-06 (web 0.6.17)
 
 - **Owner's run (web 0.6.16, `--markdown --hashes`).** 824 conversations, 1,420 attachments hashed, 931 Markdown files, 381.8 MB in 2,298 requests, 0 retries, 0 failures; 6 errors and 60 warnings (56 `file-unreferenced`, 4 `conversation-incomplete`).

@@ -16,13 +16,12 @@
 //     conversation, which is safe), incomplete[] details (only the visible
 //     "not archived" notes survive, without size, SHA-256 or reason codes)
 import { parseConversationMarkdown } from './github.js';
+import { scanAssetLinks, isConversationMarkdownPath } from './archiveIntegrity.js';
 
 export const EXACT_FIELDS = ['id', 'provider', 'account', 'title', 'model', 'created_at', 'updated_at', 'message_count', 'path', 'content_sha256'];
 export const APPROXIMATE_FIELDS = ['preview', 'search_text', 'assets.name', 'assets.mime'];
 export const UNRECOVERABLE_FIELDS = ['exporter_version', 'format_version', 'incomplete'];
 
-// "[label](assets/…)" or "![label](assets/…)", with the exporter's label escaping.
-const ASSET_LINK = /!?\[((?:\\.|[^\]\\])*)\]\((assets\/[^)\s]+)\)/g;
 const NOT_ARCHIVED = /\*\*(?:Attachment not archived|Not archived):|\*\*Incomplete archive:\*\*/;
 const MIME_BY_EXTENSION = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
@@ -56,7 +55,19 @@ export async function rebuildIndexEntry({ path, markdown, tree = [], readBytes =
   const problems = [];
   const assets = [];
   const seen = new Set();
-  for (const match of String(markdown).matchAll(ASSET_LINK)) {
+  // Attachment references only: the exporter never writes one inside a code
+  // block or inline code, so links there are quoted text (see scanAssetLinks).
+  // A link into the conversation's own attachment folder to a file that exists
+  // is the exporter's even when an unclosed code block in the message makes
+  // it look like code; both layouts name that folder after the conversation ID.
+  const ownFolder = (ref) => {
+    const folder = String(ref).split('/')[1]?.toLowerCase() || '';
+    const id = String(parsed.id || '').toLowerCase();
+    return Boolean(id) && (folder.startsWith(id.slice(0, 8)) || folder.startsWith(id.replace(/[^a-z0-9]+/g, '-').slice(0, 8)));
+  };
+  for (const link of scanAssetLinks(markdown)) {
+    if (link.inCode && !(ownFolder(link.ref) && blobs.has(`${dirname(path)}/${link.ref}`))) continue;
+    const match = [null, link.label ?? '', link.ref];
     const assetPath = `${dirname(path)}/${match[2]}`;
     if (seen.has(assetPath)) continue;
     seen.add(assetPath);
@@ -111,7 +122,14 @@ export async function planIndexRebuild({ index, tree, markdown, readBytes = null
   const current = new Map((Array.isArray(index?.conversations) ? index.conversations : []).map((entry) => [identity(entry), entry]));
   const plan = { rebuilt: 0, unchanged: [], differs: [], onlyInFiles: [], onlyInIndex: [], unreadable: [], lostIfApplied: [] };
   const rebuiltKeys = new Set();
+  const byConversation = new Map();
+  for (const entry of current.values()) {
+    const key = `${entry?.provider}:${entry?.id}`;
+    byConversation.set(key, [...(byConversation.get(key) || []), entry]);
+  }
   for (const [path, text] of markdown) {
+    // Attachments that happen to be Markdown are not conversations.
+    if (!isConversationMarkdownPath(path)) continue;
     const result = await rebuildIndexEntry({ path, markdown: text, tree, readBytes, readDigest });
     if (!result.entry) {
       plan.unreadable.push({ path, problems: result.problems });
@@ -122,7 +140,11 @@ export async function planIndexRebuild({ index, tree, markdown, readBytes = null
     rebuiltKeys.add(key);
     const existing = current.get(key);
     if (!existing) {
-      plan.onlyInFiles.push({ key, path, problems: result.problems });
+      // The same provider conversation may already be indexed under another
+      // account (profile): adding this file would index a second copy.
+      const indexedUnder = (byConversation.get(`${result.entry.provider}:${result.entry.id}`) || [])
+        .filter((entry) => entry.account !== result.entry.account).map((entry) => ({ account: entry.account, path: entry.path }));
+      plan.onlyInFiles.push({ key, path, problems: result.problems, ...(indexedUnder.length ? { indexedUnder } : {}) });
       continue;
     }
     const fields = EXACT_FIELDS.filter((field) => JSON.stringify(existing[field] ?? null) !== JSON.stringify(result.entry[field] ?? null));
@@ -148,7 +170,9 @@ export function formatRebuildPlan(plan) {
       + `${plan.onlyInIndex.length} index entries were not rebuilt, ${plan.unreadable.length} file(s) could not be rebuilt.`,
   ];
   for (const item of plan.differs) lines.push(`DIFFERS ${item.path}: ${[...item.fields, ...item.problems].join('; ')}`);
-  for (const item of plan.onlyInFiles) lines.push(`NOT IN INDEX ${item.path}`);
+  for (const item of plan.onlyInFiles) {
+    lines.push(`NOT IN INDEX ${item.path}${item.indexedUnder ? ` (already indexed under ${item.indexedUnder.map((e) => `account "${e.account}"`).join(', ')}; adding it would index a second copy)` : ''}`);
+  }
   for (const item of plan.onlyInIndex) lines.push(`NOT REBUILT ${item.path ?? item.key}: no readable conversation file has this identity`);
   for (const item of plan.unreadable) lines.push(`UNREADABLE ${item.path}: ${item.problems.join('; ')}`);
   if (plan.lostIfApplied.length) {

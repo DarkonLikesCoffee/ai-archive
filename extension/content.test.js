@@ -3775,3 +3775,59 @@ test('a conversation left out of a sync carries why: download failed or Claude d
   const failed = harness.storageState.last_sync_diagnostics.items.filter((item) => item.outcome === 'failed');
   assert.deepEqual(Object.fromEntries(failed.map((item) => [item.conversation_id, item.category])), byId, 'the diagnostic report names the category too');
 });
+
+// ---- Same-named attachments must never be merged by name alone ----
+// Shape seen on a real account (synthetic IDs, names and bytes): a pasted
+// image is listed on the message with a preview URL (Claude serves a WebP
+// preview under the .png name), and its original upload sits in the
+// conversation sandbox under the same file name.
+test('an original upload in the sandbox is kept next to the same-named preview of the message file', async () => {
+  const conversationId = '5b000000-0000-4000-8000-000000000001';
+  const previewUrl = 'https://files.example/preview/1700000000000_image.png';
+  const name = '1700000000000_image.png';
+  const conversation = {
+    uuid: conversationId, name: 'Image', current_leaf_message_uuid: 'a1',
+    chat_messages: [
+      { uuid: 'u1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'what is in this image?' }],
+        files: [{ file_uuid: 'img-1', file_name: name, file_kind: 'image', preview_url: previewUrl }], attachments: [] },
+      { uuid: 'a1', parent_message_uuid: 'u1', sender: 'assistant', content: [{ type: 'text', text: 'A chart.' }], files: [], attachments: [] },
+    ],
+  };
+  const harness = createHarness(conversation, {
+    conversationListResponse: [{ uuid: conversationId, name: 'Image', updated_at: '2026-10-20T08:00:00Z' }],
+    assetResponses: { [previewUrl]: { content: 'RIFF....WEBPVP8 preview bytes', contentType: 'image/webp' } },
+    sandboxFiles: [{ path: `/mnt/user-data/uploads/${name}`, content_type: 'image/png' }],
+    sandboxContents: { [`/mnt/user-data/uploads/${name}`]: '\x89PNG original upload bytes' },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  harness.finishFirstHandoff({ ok: true });
+  const assets = handoff.conversations[0].assets;
+  const shas = new Set(assets.map((asset) => asset.sha256));
+  assert.equal(shas.size, 2, `both distinct files are kept (got ${assets.map((a) => `${a.source}:${a.size}`).join(', ')})`);
+  assert.ok(assets.some((asset) => asset.source === 'sandbox' && asset.source_path === `/mnt/user-data/uploads/${name}`), 'the original upload is archived');
+  assert.ok(assets.some((asset) => asset.source === 'message' && asset.file_uuid === 'img-1'), 'the message file is still archived');
+});
+
+test('a sandbox copy with the same name and the same bytes as the message file is still stored once', async () => {
+  const conversationId = '5b000000-0000-4000-8000-000000000002';
+  const url = 'https://files.example/report.txt';
+  const conversation = {
+    uuid: conversationId, name: 'Same', current_leaf_message_uuid: 'a1',
+    chat_messages: [
+      { uuid: 'u1', parent_message_uuid: ROOT, sender: 'human', content: [{ type: 'text', text: 'see report.txt' }],
+        files: [{ file_uuid: 'f-1', file_name: 'report.txt', preview_url: url }], attachments: [] },
+      { uuid: 'a1', parent_message_uuid: 'u1', sender: 'assistant', content: [{ type: 'text', text: 'ok' }], files: [], attachments: [] },
+    ],
+  };
+  const harness = createHarness(conversation, {
+    conversationListResponse: [{ uuid: conversationId, name: 'Same', updated_at: '2026-10-20T08:00:00Z' }],
+    assetResponses: { [url]: { content: 'identical bytes', contentType: 'text/plain' } },
+    sandboxFiles: [{ path: '/mnt/user-data/uploads/report.txt', content_type: 'text/plain' }],
+    sandboxContents: { '/mnt/user-data/uploads/report.txt': 'identical bytes' },
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  harness.finishFirstHandoff({ ok: true });
+  assert.equal(handoff.conversations[0].assets.length, 1, 'identical bytes are deduplicated by content');
+});

@@ -1,7 +1,7 @@
 // The archive verifier command (web/scripts/verify-archive.mjs), runnable in
 // tests with a fake fetch and streams. Strictly read-only: it only issues GET
 // requests to api.github.com and never writes, repairs or deletes anything.
-import { auditArchive, formatAuditReport } from './archiveIntegrity.js';
+import { auditArchive, formatAuditReport, isConversationMarkdownPath } from './archiveIntegrity.js';
 import { planIndexRebuild, formatRebuildPlan } from './indexRebuild.js';
 import {
   createGitHubReader, createProgress, mapLimit, sha256Hex,
@@ -113,7 +113,9 @@ export async function runVerifier({ argv, env, fetch, stdout, stderr, stderrIsTT
 
     // [3/4] Conversation Markdown: every unique blob once, at most N at a time.
     let markdown = null;
-    const markdownPaths = [...shaOf.keys()].filter((path) => path.startsWith('archive/conversations/') && path.endsWith('.md'));
+    // Conversation files only: a .md file under assets/ is an attachment, and
+    // is hashed with the attachments (--hashes), not parsed as a conversation.
+    const markdownPaths = [...shaOf.keys()].filter(isConversationMarkdownPath);
     if (options.markdown) {
       const shas = [...new Set(markdownPaths.map((path) => shaOf.get(path)))];
       counts.markdown.total = markdownPaths.length;

@@ -1,5 +1,15 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.28 — same-named attachments are no longer merged by name
+- A pasted image is listed on its message with a *preview* (Claude serves a WebP preview under the upload's `.png` name), while the sandbox's `uploads/` folder holds the original. Because the two share a file name, the exporter skipped the original. It now downloads it as well and keeps both. A copy with the same name and the **same bytes** is still stored only once.
+- Unchanged conversations are not re-exported by this version, so already archived conversations gain the original only when they are synced again. See the development log for the trade-off of re-exporting everything.
+
+## Web 0.6.18 — verifier fixes
+- Markdown files under `assets/` are attachments, not conversations, so they are no longer checked as conversations or reported as unreadable by `--rebuild-dry-run`.
+- Conversation files from the earliest exporter (JSON front matter between `---` lines) are read, by the verifier and the viewer.
+- The rebuild ignores attachment links quoted in fenced or inline code. An unclosed code block in one message no longer turns links in later messages into "code".
+- An unindexed conversation file is reported as `indexed-under-other-account` when the same Claude conversation is indexed under another account or profile. The rebuild dry run says that adding it would index a second copy.
+
 ## Extension v0.5.27 — why something was left out
 - The sync report and popup now say why each conversation or file was left out. A conversation shows "Download from Claude failed", "Claude's data failed a safety check" or "Too large for GitHub". A file shows "not available from Claude", "over the upload limit" or "refused by GitHub".
 - The diagnostic report records the same category for each conversation that could not be exported. Nothing in the archive changes: categories are derived from what is already recorded.
