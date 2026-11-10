@@ -2,6 +2,25 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Pre-live-test verification of PR #102 — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+- **CI for `c7e86da`.** `test-and-build` and `extension-e2e` both succeeded (run 42809195233).
+- **Regression found and fixed.** The previous commit added `retained_assets` paths to `referencedPaths`, which is also the list `verifySyncTree` requires to exist. A kept file deleted outside AI Archive would therefore have blocked every sync with "Archive integrity check failed".
+  - Kept files are now only protected from deletion (`protectedPaths`), not required to exist.
+  - New test: such an archive still syncs. With the old behaviour put back, it fails.
+- **Live-test check script moved into the repository.**
+  - `web/src/recoveredOriginals.js`: checks, testable.
+  - `web/scripts/verify-recovered-originals.mjs`: command line, no machine-specific paths. Exit 0 pass, 1 a check failed, 2 could not run.
+  - Procedure: `docs/live-test-original-images.md`.
+  - 4 tests in `web/src/recoveredOriginals.test.js`. They build the test archive with the real exporter code, so the checker and the format cannot drift apart unnoticed, and they cover each kind of mislabelling and the command-line exit codes.
+- **Package.** The 0.5.28 fixture lives in `test-fixtures/`, outside `extension/` (the unpacked package); CI does no packaging.
+- **Final local results.**
+  - `node --test extension/*.test.js`: 281/281.
+  - `cd web && npm test`: 126/126. `npm run build`: OK.
+  - `node e2e/extension-sync.e2e.cjs`: exit 0, 55 PASS / 0 FAIL.
+  - `node web/e2e/viewer.e2e.cjs`: exit 0, 47 PASS.
+- **Recheck when PR #100 is merged and this PR is retargeted.** See the PR description: merge result, full suites, CI, the 0.5.28 fixture still matching what was released, and versions.
+
 ## Review fixes for PR #102: originals never demoted, unique pairing, persistent downgrade detection — 2026-11-10 (extension 0.5.29, web 0.6.19)
 
 Fixes for the defects found by the final review of PR #102. Each was reproduced first in scratch copies running the real code.

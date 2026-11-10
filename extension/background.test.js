@@ -3248,3 +3248,13 @@ test('fields of the marker file this version does not know are kept when it is r
   assert.deepEqual(written.future_field, { kept: true });
   assert.equal(written.requires_extension, '0.5.29');
 });
+
+test('a kept file deleted outside AI Archive does not block syncs, and is still never required', async () => {
+  const gone = 'archive/conversations/claude/personal/assets/kept-folder/aaaaaaaa-gone.png';
+  const keeper = { id: 'conv-kept-gone', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/kept-gone.md', title: 'Kept gone', updated_at: '2026-10-01T00:00:00Z', message_count: 1, format_version: 4, exporter_version: 1, assets: [], retained_assets: [{ path: gone, name: 'gone.png' }] };
+  // The kept file is listed in the index but no longer in the repository.
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [keeper] }) });
+  const result = await harness.sync(sampleConversation(), () => {});
+  assert.ok(result.commit, 'the sync is published');
+  assert.deepEqual(plainJson(harness.lastCommittedArchive().index.conversations.find((e) => e.id === 'conv-kept-gone').retained_assets), [{ path: gone, name: 'gone.png' }], 'the untouched entry is left as it was');
+});

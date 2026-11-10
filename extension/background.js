@@ -1797,15 +1797,18 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     const referencedPaths = new Set(nextIndex.conversations.flatMap((archived) => [
       archived.path,
       ...(Array.isArray(archived.assets) ? archived.assets.map((asset) => asset?.path) : []),
-      // Files kept from earlier exports are referenced too: never deleted
-      // because another conversation sharing the folder dropped them.
-      ...(Array.isArray(archived.retained_assets) ? archived.retained_assets.map((asset) => asset?.path) : []),
     ]).filter(Boolean));
+    // Files kept from earlier exports are protected too: never deleted because
+    // another conversation sharing the folder dropped them. Unlike the paths
+    // above they are not required to exist (one deleted outside AI Archive
+    // must not block every sync; the verifier reports it).
+    const protectedPaths = new Set([...referencedPaths, ...nextIndex.conversations.flatMap((archived) =>
+      (Array.isArray(archived.retained_assets) ? archived.retained_assets.map((asset) => asset?.path) : [])).filter(Boolean)]);
     const plannedWritesBeforeCleanup = new Set(changes.filter((change) => !change.delete).map((change) => change.path));
     const seenDeletes = new Set();
     changes = changes.filter((change) => {
       if (!change.delete) return true;
-      if (referencedPaths.has(change.path) || plannedWritesBeforeCleanup.has(change.path)) return false;
+      if (protectedPaths.has(change.path) || plannedWritesBeforeCleanup.has(change.path)) return false;
       if (seenDeletes.has(change.path)) return false;
       seenDeletes.add(change.path);
       return true;
