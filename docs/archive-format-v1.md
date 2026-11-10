@@ -163,6 +163,20 @@ From 0.5.29 an image attachment is exported as follows:
 4. Any other failure (403, 429, 5xx, network error, an original whose bytes
    are not an image) fails the conversation for that sync; a later sync
    retries it. A preview is never substituted silently.
+5. An original already archived is never demoted. When a conversation is
+   re-exported and Claude answers 404/410 for an image whose original the
+   archive holds (same conversation, same `file_uuid`, still in the
+   repository), that archived original stays linked: the Claude tab refers
+   to it from the archive state without downloading it again, and a sync
+   without archive state (such as "Latest N") that received only the
+   preview links the archived original again and keeps the new preview as
+   its `preview_of` preview. A reference that does not match the archived
+   file (path, SHA-256 and file UUID) is reported as not archived, so the
+   archived copy is kept.
+6. A sandbox `uploads/` file is paired with a preview only when its name is
+   unique among the sandbox uploads and among the conversation's image
+   attachments. Pasted images are often all named `image.png`; with several
+   candidates nothing is guessed.
 
 When both an original and its preview are archived, the Markdown links each
 exactly once: the original as the image, followed by `*Also archived:
@@ -174,6 +188,9 @@ Index fields (all optional and additive; readers ignore them when absent):
 - `assets[].variant`: `"original"` or `"preview"`, on image assets written
   by 0.5.29 or later. Absent on every other asset and on all older entries,
   whose images may be either.
+- `assets[].file_uuid`: Claude's file UUID, on image assets with a
+  `variant` (when Claude gave one). It identifies the archived original of
+  an image across re-exports.
 - `assets[].preview_of`: on a preview whose original is also archived, the
   `path` of that original (one of the same entry's `assets`). A preview with
   `preview_of` is never preview-only.
@@ -201,25 +218,66 @@ So an image file is exactly one of: a linked asset (`assets[]`, with
 linked preview-only asset (also listed in `preview_only[]`), or an unlinked
 historical file (`retained_assets[]`).
 
-Top-level `requires_extension` (index version stays 2): every index written by
-0.5.29 or later records the oldest extension version allowed to write to the
-archive (currently `"0.5.29"`). An extension older than that refuses to sync
-(from 0.5.29 on). Extensions before 0.5.29 never check it, and they rewrite
-the index without it: an index holding `variant`, `preview_only` or
-`retained_assets` records but no `requires_extension` therefore means an older
-extension wrote to the archive after it began recording originals, and may
-have replaced originals with previews in the conversations it re-exported
-(the originals remain in the repository history). The next sync of 0.5.29 or
-later reports this as a warning in the popup and sync report, and the
-verifier as `older-extension-wrote`.
+#### Version requirement and downgrade detection
+
+- Top-level `requires_extension` in the index (index version stays 2): the
+  oldest extension version allowed to write to the archive (currently
+  `"0.5.29"`), written with every index by 0.5.29 or later.
+- `archive/.ai-archive.json`, written with every index by 0.5.29 or later:
+
+  ```json
+  { "format": "ai-archive", "requires_extension": "0.5.29", "written_by_extension": "0.5.29" }
+  ```
+
+  plus, while one is unacknowledged, `"downgrade_warning": { "detected_at":
+  …, "reason": … }`. Fields a version does not know are kept when it
+  rewrites the file. The viewer and verifier ignore it as an attachment. An
+  archive without it (every archive before 0.5.29) is valid; the first sync
+  that commits adds it.
+- From 0.5.29 on, an extension older than the requirement in the index **or**
+  in the marker file refuses to sync, before downloading or writing anything.
+
+What extensions before 0.5.29 do (verified by running the released 0.5.28
+code in `extension/background.test.js`, fixture
+`test-fixtures/extension-0.5.28/background.js`): they never read either
+marker, so **nothing stops them from syncing**. When they write, they
+rewrite the index as `{ version, updated_at, conversations }` (dropping
+`requires_extension`), re-export changed conversations from Claude's preview,
+delete the archived original and preview of those conversations from the
+latest version of the archive (git history keeps them), and drop their
+`variant`, `preview_of`, `file_uuid`, `preview_only` and `retained_assets`
+records. They never write, rename or delete `archive/.ai-archive.json`.
+
+So the marker file survives such a write while the index marker does not.
+The next sync of 0.5.29 or later detects it (`index-rewritten-without-marker`)
+even when the older extension re-exported every conversation that had image
+records, reports it in the popup (a warning shown first, with an "I
+understand" button) and in the sync report, and stores the warning in the
+marker file. Every later sync reports it again until the user acknowledges
+that exact warning; the next sync after that removes it from the marker
+file. For an archive without a marker file, original-first records without
+`requires_extension` are detected the same way
+(`original-first-records-without-marker`). The verifier reports both as
+`older-extension-wrote`.
+
+Limitations, by design: detection happens only after an older extension has
+written; it cannot undo what that sync did (the files are recovered from the
+repository history, and the affected conversations regain originals only
+where Claude still serves them or the history is restored); it relies on the
+marker file still being there (deleting it by hand removes the evidence); and
+nothing is detected until a 0.5.29+ sync (or the verifier) runs. Every
+installed copy of the extension must be updated to 0.5.29 or later.
 
 Migration: none. `exporter_version` is unchanged, so already-archived
 conversations are not re-exported by this change; old entries remain valid
 and readable. A conversation is exported with originals the next time it is
 re-exported for any other reason (it changed on Claude, or a "Latest N" sync
 includes it). An index rebuild (dry run) cannot recover `preview_only[]`,
-`retained_assets[]`, `variant` or `preview_of` from Markdown alone; only the
-visible notes survive.
+`retained_assets[]`, `variant`, `preview_of` or `file_uuid` from Markdown
+alone; only the visible notes survive. The dry run therefore never reports
+an entry holding them as unchanged: it lists them as "not preserved by a
+rebuild" for that entry. It also never writes `requires_extension` or the
+marker file.
 
 ## Index contract
 

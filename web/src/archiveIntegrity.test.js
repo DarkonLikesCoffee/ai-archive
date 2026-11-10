@@ -284,3 +284,11 @@ test('original-first records without the requires_extension marker report an old
   assert.deepEqual(codes(await auditArchive(inputs(archive))), []);
   assert.deepEqual(codes(await auditArchive(inputs(cleanArchive()))), [], 'an archive from before 0.5.29 raises nothing');
 });
+
+test('the marker file reveals an older extension even after it removed every image record from the index', async () => {
+  const archive = cleanArchive();
+  archive.files.set('archive/.ai-archive.json', bytes('{"format":"ai-archive","requires_extension":"0.5.29"}'));
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), ['warning:older-extension-wrote:archive/index.json'], 'no image records left, still detected');
+  archive.index.requires_extension = '0.5.29';
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), [], 'and nothing once the index has its marker');
+});

@@ -153,8 +153,15 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
   const originalFirst = index.conversations.some((entry) => entry && (
     (Array.isArray(entry.assets) && entry.assets.some((asset) => asset?.variant === 'original' || asset?.variant === 'preview'))
     || Array.isArray(entry.preview_only) || Array.isArray(entry.retained_assets)));
-  if (originalFirst && index.requires_extension == null) {
-    findings.push(finding('warning', 'older-extension-wrote', 'archive/index.json', 'The index records original and preview images but not "requires_extension", which every extension that writes those records adds: an extension older than 0.5.29 has rewritten the index since. In conversations it re-exported, original images may have been replaced by previews; the originals remain in the repository history.'));
+  // archive/.ai-archive.json is written only by 0.5.29 or later, with every
+  // index, and older extensions never touch it: present while the index lacks
+  // requires_extension means an older extension rewrote the index, even when
+  // it re-exported every conversation that had image records.
+  const markerFile = blobs.has('archive/.ai-archive.json');
+  if (index.requires_extension == null && (markerFile || originalFirst)) {
+    findings.push(finding('warning', 'older-extension-wrote', 'archive/index.json', markerFile
+      ? 'archive/.ai-archive.json shows that AI Archive 0.5.29 or later wrote this archive, but the index no longer has "requires_extension": an extension older than 0.5.29 has rewritten the index since. In conversations it re-exported, original images may have been replaced by previews; the originals remain in the repository history.'
+      : 'The index records original and preview images but not "requires_extension", which every extension that writes those records adds: an extension older than 0.5.29 has rewritten the index since. In conversations it re-exported, original images may have been replaced by previews; the originals remain in the repository history.'));
   }
 
   index.conversations.forEach((entry, position) => {

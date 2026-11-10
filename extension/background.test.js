@@ -155,7 +155,7 @@ test('associates same-named sandbox assets only when their full paths identify t
 
 const gitBlobShaOf = (bytes) => createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), Buffer.from(bytes)])).digest('hex');
 
-function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [], extraTreePaths = [], baseTreeTruncated = false, archivedBytes = {} }) {
+function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanceBranchOnRecheck = false, missingPaths = [], failOnce = null, patchOutcome = null, cancelAt = null, blobDelayMs = 0, blobResponder = null, treeTamper = null, sourcePatches = [], extraTreePaths = [], baseTreeTruncated = false, archivedBytes = {}, markerText = null, source = backgroundSource }) {
   const listeners = [];
   const createdTrees = new Map();
   const blobContents = new Map();
@@ -183,6 +183,8 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
             github_repo: 'example-archive',
             github_token: 'test-token',
             archive_account: 'personal',
+            // Values the extension stored (for example an acknowledged warning).
+            ...storedValues,
           };
         },
         set: async (values) => { Object.assign(storedValues, values); },
@@ -214,7 +216,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       ]).filter(Boolean);
     } catch {}
     const missing = new Set(missingPaths);
-    return new Map([...new Set([...indexedPaths, ...extraTreePaths, ...(indexText == null ? [] : ['archive/index.json'])])]
+    return new Map([...new Set([...indexedPaths, ...extraTreePaths, ...(indexText == null ? [] : ['archive/index.json']), ...(markerText == null ? [] : ['archive/.ai-archive.json'])])]
       .filter((path) => !missing.has(path))
       // A file whose real bytes the test states gets its real Git blob ID.
       .map((path) => [path, archivedBytes[path] ? gitBlobShaOf(archivedBytes[path]) : `existing-${path}`]));
@@ -258,6 +260,10 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
       const tree = createdTrees.get(sha);
       if (!tree) return response({ message: 'Not Found' }, 404);
       return response({ sha, truncated: false, tree: [...tree].map(([path, blob]) => ({ path, type: 'blob', mode: '100644', sha: blob })) });
+    }
+    if (pathname.endsWith('/contents/archive/.ai-archive.json') && method === 'GET') {
+      if (markerText == null) return response({ message: 'Not Found' }, 404);
+      return response({ content: Buffer.from(markerText, 'utf8').toString('base64'), encoding: 'base64' });
     }
     if (pathname.endsWith('/contents/archive/index.json') && method === 'GET') {
       if (indexText == null) return response({ message: 'Not Found' }, 404);
@@ -346,7 +352,7 @@ function makeBackgroundSyncHarness({ indexText, indexEncoding = 'base64', advanc
     Blob, Response, CompressionStream, crypto: webcrypto, btoa, atob, setTimeout, clearTimeout,
   };
   // Keep retry backoff instant in tests; the retry policy itself is unchanged.
-  let fastSource = backgroundSource.replace('const GITHUB_RETRY_BASE_DELAY_MS = 1000;', 'const GITHUB_RETRY_BASE_DELAY_MS = 1;');
+  let fastSource = source.replace('const GITHUB_RETRY_BASE_DELAY_MS = 1000;', 'const GITHUB_RETRY_BASE_DELAY_MS = 1;');
   for (const [from, to] of sourcePatches) {
     assert.ok(fastSource.includes(from), `test patch target exists: ${from}`);
     fastSource = fastSource.replace(from, to);
@@ -357,7 +363,10 @@ globalThis.__testHooks = {
   conversationPath, indexEntry, sha256, archiveState, archiveSyncState, archiveAccounts, broadcast,
   createBlob, gitHubError, syncCommitMessage, base64RequestBytes, formatBytes,
   MAX_BLOB_REQUEST_BYTES, MAX_ARCHIVED_FILE_BYTES, BlobTooLargeError,
-  EXTENSION_VERSION, ARCHIVE_REQUIRES_EXTENSION, compareVersions,
+  // Absent from extensions before 0.5.29 (see the 0.5.28 fixture).
+  EXTENSION_VERSION: typeof EXTENSION_VERSION === 'undefined' ? undefined : EXTENSION_VERSION,
+  ARCHIVE_REQUIRES_EXTENSION: typeof ARCHIVE_REQUIRES_EXTENSION === 'undefined' ? undefined : ARCHIVE_REQUIRES_EXTENSION,
+  compareVersions: typeof compareVersions === 'undefined' ? undefined : compareVersions,
 };
 `, context, { filename: 'extension/background.js' });
 
@@ -375,7 +384,8 @@ globalThis.__testHooks = {
       const tree = commit && createdTrees.get(commit.body.tree);
       if (!tree) return null;
       const indexBlob = blobContents.get(tree.get('archive/index.json'));
-      return { tree, index: indexBlob ? JSON.parse(indexBlob.content) : null };
+      const markerBlob = blobContents.get(tree.get('archive/.ai-archive.json'));
+      return { tree, index: indexBlob ? JSON.parse(indexBlob.content) : null, marker: markerBlob ? markerBlob.content : null };
     },
     send(message, sender = { tab: { id: 7 } }) {
       let response;
@@ -869,9 +879,10 @@ test('uploads blobs with bounded concurrency and reads settings only once per sy
   assert.ok(metrics.maxActiveBlobRequests > 1, 'independent blobs should upload in parallel');
   assert.ok(metrics.maxActiveBlobRequests <= 4, 'blob uploads must stay within the concurrency limit');
   assert.equal(metrics.settingsReadCount, 1, 'GitHub settings should be read once per sync, not once per request');
-  assert.equal(metrics.blobCount, 14, '12 assets, one conversation Markdown file, and one index blob should be created');
+  assert.equal(metrics.blobCount, 15, '12 assets, one conversation Markdown file, one index blob and the archive marker file should be created');
   const treeRequest = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST');
-  assert.equal(treeRequest.body.tree.filter(item => item.sha).length, 14);
+  assert.equal(treeRequest.body.tree.filter(item => item.sha).length, 15);
+  assert.ok(treeRequest.body.tree.some((item) => item.path === 'archive/.ai-archive.json' && item.sha), 'the marker file is written with the index');
 });
 
 
@@ -940,8 +951,11 @@ test('compacts legacy search text to gzip without rewriting unchanged conversati
   const blobWrites = harness.requests.filter(
     (request) => request.pathname.endsWith('/git/blobs') && request.method === 'POST',
   );
-  assert.equal(blobWrites.length, 1, 'the index should be the only new blob; Markdown must not be rewritten');
-  const compactIndex = JSON.parse(blobWrites[0].body.content);
+  const markerWrites = blobWrites.filter((request) => String(request.body.content).includes('"format": "ai-archive"'));
+  assert.equal(markerWrites.length, 1, 'the archive marker file is written with the index');
+  const otherWrites = blobWrites.filter((request) => !markerWrites.includes(request));
+  assert.equal(otherWrites.length, 1, 'the index should be the only other new blob; Markdown must not be rewritten');
+  const compactIndex = JSON.parse(otherWrites[0].body.content);
   const compactedEntry = compactIndex.conversations[0];
 
   assert.equal(compactedEntry.search_text, undefined, 'plain duplicated search text should be removed from the index');
@@ -3049,4 +3063,188 @@ test('an index with original-first records but no marker reports that an older e
     assert.equal(result.partial, expected, `${label}: shown as a sync with problems`);
     assert.equal(/older than 0\.5\.29 has written to this archive/.test(messages.join(' ')), expected, `${label}: the summary says so`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Archived originals are never demoted; shared folders; the archive marker
+// file and downgrade detection against the real 0.5.28 code. Synthetic only.
+// ---------------------------------------------------------------------------
+
+const oldBackgroundSource = await readFile(fileURLToPath(new URL('../test-fixtures/extension-0.5.28/background.js', import.meta.url)), 'utf8');
+const treePosts = (harness) => harness.requests.filter((r) => r.pathname.endsWith('/git/trees') && r.method === 'POST').flatMap((r) => r.body.tree);
+const archivedOriginalEntry = async (id) => {
+  const hooks = loadBackgroundAssetHelpers();
+  const original = imageAsset('1700000000000_image.png', `verified original ${id}`, { file_uuid: `img-${id}`, mime: 'image/jpeg', detected_extension: 'jpg', variant: 'original' });
+  const { entry } = await buildIndexEntry(hooks, imageConversationWith(id, [original]));
+  return { entry, original };
+};
+
+test('image originals and previews record their Claude file UUID in the index; other files do not', async () => {
+  const { entry } = await archivedOriginalEntry('conv-uuid');
+  assert.equal(entry.assets[0].file_uuid, 'img-conv-uuid');
+  const { entry: plainEntry } = await buildIndexEntry(loadBackgroundAssetHelpers(), conversationWith('conv-plain', [fileAsset('notes.txt', 'text', 'conv-plain-m1', { file_uuid: 'f-1' })]));
+  assert.equal('file_uuid' in plainEntry.assets[0], false, 'non-image assets keep their old shape');
+});
+
+test('the archive state lists archived originals for the Claude tab', async () => {
+  const { entry } = await archivedOriginalEntry('conv-state');
+  const other = { ...entry, account: 'work', id: 'conv-work' };
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [entry, other] }) });
+  const state = plainJson(await harness.hooks.archiveSyncState());
+  assert.deepEqual(state.originals, [{ id: 'conv-state', file_uuid: 'img-conv-state', path: entry.assets[0].path, sha256: entry.assets[0].sha256, size: entry.assets[0].size, mime: 'image/jpeg' }]);
+});
+
+test('a re-export that refers to the archived original keeps linking it, writes nothing for it and marks nothing preview-only', async () => {
+  const { entry: previous, original } = await archivedOriginalEntry('conv-keep');
+  previous.content_sha256 = 'changed on Claude';
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [previous] }), markerText: '{}' });
+  const reuse = { name: original.name, mime: 'image/jpeg', base64: '', size: previous.assets[0].size, sha256: original.sha256, variant: 'original', reuse_path: previous.assets[0].path, file_uuid: 'img-conv-keep', source: 'message', message_external_id: 'conv-keep-m1' };
+  await harness.sync([imageConversationWith('conv-keep', [reuse])], () => {});
+  const { index } = harness.lastCommittedArchive();
+  const [entry] = index.conversations;
+  assert.deepEqual(entry.assets.map((a) => [a.path, a.variant, a.file_uuid]), [[previous.assets[0].path, 'original', 'img-conv-keep']]);
+  assert.equal(entry.preview_only, undefined);
+  assert.equal(entry.retained_assets, undefined);
+  assert.equal(treePosts(harness).some((t) => t.path === previous.assets[0].path), false, 'the archived original is neither rewritten nor deleted');
+  assert.ok(markdownOf(harness, entry.title).includes(previous.assets[0].path.split('/assets/').pop()), 'and still linked');
+});
+
+test('a reference to an archived original that is not the archived file keeps the archived copy instead', async () => {
+  for (const [label, change] of [['another SHA-256', { sha256: 'f'.repeat(64) }], ['a path the entry does not list', { reuse_path: 'archive/conversations/claude/personal/assets/x/elsewhere.jpg' }]]) {
+    const { entry: previous, original } = await archivedOriginalEntry('conv-bad-ref');
+    previous.content_sha256 = 'changed on Claude';
+    const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [previous] }) });
+    const reuse = { name: original.name, mime: 'image/jpeg', base64: '', size: 1, sha256: original.sha256, variant: 'original', reuse_path: previous.assets[0].path, file_uuid: 'img-conv-bad-ref', source: 'message', message_external_id: 'conv-bad-ref-m1', ...change };
+    const result = await harness.sync([imageConversationWith('conv-bad-ref', [reuse])], () => {});
+    assert.deepEqual(plainJson(result.report.keptPrevious.map((item) => item.id)), ['conv-bad-ref'], `${label}: the archived copy is kept`);
+    assert.equal(treePosts(harness).some((t) => t.sha === null), false, `${label}: nothing deleted`);
+  }
+});
+
+test('a sync without archive state that gets only a preview links the archived original again and keeps the preview as its preview', async () => {
+  const { entry: previous } = await archivedOriginalEntry('conv-decay');
+  previous.content_sha256 = 'changed on Claude';
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [previous] }) });
+  const preview = imageAsset('1700000000000_image.png', 'webp preview', { file_uuid: 'img-conv-decay', mime: 'image/webp', detected_extension: 'webp', variant: 'preview', preview_reason: 'original-unavailable', original_status: 404, original_checked_at: '2026-12-01T00:00:00.000Z' });
+  await harness.sync([imageConversationWith('conv-decay', [preview])], () => {});
+  const { index } = harness.lastCommittedArchive();
+  const [entry] = index.conversations;
+  const original = entry.assets.find((a) => a.variant === 'original');
+  const kept = entry.assets.find((a) => a.variant === 'preview');
+  assert.equal(original.path, previous.assets[0].path, 'the verified original stays linked');
+  assert.equal(kept.preview_of, original.path, 'the new preview is its preview');
+  assert.equal(entry.preview_only, undefined, 'never demoted to preview-only');
+  assert.equal(entry.retained_assets, undefined, 'and not moved to the kept files');
+  assert.equal(treePosts(harness).some((t) => t.path === original.path), false, 'the original is neither rewritten nor deleted');
+  const markdown = markdownOf(harness, entry.title);
+  assert.equal(markdown.includes('Preview only'), false);
+  assert.equal(markdown.split(`](assets/${original.path.split('/assets/').pop()})`).length - 1, 1);
+});
+
+test('a file one conversation keeps is not deleted when another conversation sharing the folder drops it', async () => {
+  const shared = 'archive/conversations/claude/personal/assets/shared-folder/aaaaaaaa-photo.png';
+  const keeper = { id: 'conv-keeper', provider: 'claude', account: 'personal', path: 'archive/conversations/claude/personal/keeper.md', title: 'Keeper', updated_at: '2026-10-01T00:00:00Z', message_count: 1, format_version: 4, exporter_version: 1, assets: [], retained_assets: [{ path: shared, name: 'photo.png' }] };
+  const dropper = sampleConversation()[0];
+  const hooks = loadBackgroundAssetHelpers();
+  const previous = { id: dropper.external_id, provider: 'claude', account: 'personal', path: hooks.conversationPath(dropper, 'claude', 'personal'), title: dropper.title, updated_at: 'old', message_count: 1, format_version: 4, assets: [{ path: shared, sha256: 'a'.repeat(64), size: 3, mime: 'image/png', name: 'photo.png' }] };
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, conversations: [keeper, previous] }), extraTreePaths: [shared] });
+  await harness.sync([dropper], () => {});
+  assert.equal(treePosts(harness).some((t) => t.path === shared && t.sha === null), false, 'the kept file survives');
+});
+
+test('the archive marker file requirement is enforced even when the index lost its own', async () => {
+  const marker = JSON.stringify({ format: 'ai-archive', requires_extension: '0.6.0' });
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex(), markerText: marker });
+  await assert.rejects(harness.sync(sampleConversation(), () => {}), (error) => error.blocksSync === true && /requires AI Archive 0\.6\.0 or later \(archive\/\.ai-archive\.json\)/.test(error.message));
+  assert.equal(harness.requests.some((r) => r.method === 'POST' || r.method === 'PATCH'), false);
+});
+
+// The real sequence: 0.5.29 archives an original; 0.5.28 re-exports that
+// conversation (the only original-first one); 0.5.29 syncs again.
+async function downgradeSequence() {
+  const name = '1700000000000_image.png';
+  // 1. 0.5.29 writes the archive.
+  const first = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const original = imageAsset(name, 'verified original jpeg', { file_uuid: 'img-only', mime: 'image/jpeg', detected_extension: 'jpg', variant: 'original' });
+  await first.sync([imageConversationWith('conv-only', [original])], () => {});
+  const written = first.lastCommittedArchive();
+  // 2. 0.5.28 re-exports the conversation from Claude's preview.
+  const old = makeBackgroundSyncHarness({ indexText: JSON.stringify(written.index), markerText: written.marker, source: oldBackgroundSource });
+  const preview = { ...fileAsset(name, 'webp preview bytes', 'conv-only-m1', { mime: 'image/webp', file_uuid: 'img-only' }) };
+  const reexport = imageConversationWith('conv-only', [preview]);
+  reexport.source_updated_at = '2026-11-01T00:00:00.000Z';
+  await old.sync([reexport], () => {});
+  const rewritten = old.lastCommittedArchive();
+  return { written, old, rewritten, originalPath: written.index.conversations[0].assets[0].path };
+}
+
+test('0.5.28 really drops the index marker, deletes the re-exported original, and leaves the marker file alone', async () => {
+  const { written, old, rewritten, originalPath } = await downgradeSequence();
+  assert.equal(written.index.requires_extension, '0.5.29');
+  assert.match(written.marker, /"requires_extension": "0\.5\.29"/);
+  assert.equal(rewritten.index.requires_extension, undefined, 'the older extension drops the index marker');
+  assert.equal(rewritten.index.conversations.some((e) => (e.assets || []).some((a) => a.variant)), false, 'and every original/preview record');
+  assert.ok(treePosts(old).some((t) => t.path === originalPath && t.sha === null), 'and deletes the original from the latest version (history keeps it)');
+  assert.equal(treePosts(old).some((t) => t.path === 'archive/.ai-archive.json'), false, 'it never writes or deletes the marker file');
+});
+
+test('0.5.29 detects that rewrite even when the only original-first conversation was re-exported, and keeps warning until acknowledged', async () => {
+  const { written, rewritten } = await downgradeSequence();
+  // The heuristic alone would miss this case: no image records are left.
+  assert.equal(rewritten.index.conversations.some((e) => (e.assets || []).some((a) => a.variant) || e.preview_only || e.retained_assets), false);
+
+  // 3. 0.5.29 syncs: warned, and the warning is stored in the marker file.
+  const next = makeBackgroundSyncHarness({ indexText: JSON.stringify(rewritten.index), markerText: written.marker });
+  const messages = [];
+  const result = await next.sync(sampleConversation(), (event) => { if (event?.stage === 'done') messages.push(event.message); });
+  assert.equal(result.report.olderExtensionWrote, true);
+  assert.equal(result.report.downgradeWarning.reason, 'index-rewritten-without-marker');
+  assert.equal(result.partial, true);
+  assert.match(messages.join(' '), /older than 0\.5\.29 has written to this archive/);
+  const afterDetection = next.lastCommittedArchive();
+  assert.equal(afterDetection.index.requires_extension, '0.5.29', 'the index gets its marker back');
+  const stored = JSON.parse(afterDetection.marker);
+  assert.equal(stored.downgrade_warning.reason, 'index-rewritten-without-marker', 'the warning is kept in the marker file');
+
+  // 4. A later sync, with the index marker restored, still warns.
+  const later = makeBackgroundSyncHarness({ indexText: JSON.stringify(afterDetection.index), markerText: afterDetection.marker });
+  const again = await later.sync(sampleConversation(), () => {});
+  assert.equal(again.report.olderExtensionWrote, true, 'persistent until acknowledged');
+
+  // 5. Acknowledged in the popup: the next sync clears it from the marker.
+  const acked = makeBackgroundSyncHarness({ indexText: JSON.stringify(afterDetection.index), markerText: afterDetection.marker });
+  assert.deepEqual(plainJson(await acked.request({ type: 'acknowledgeDowngradeWarning', detected_at: stored.downgrade_warning.detected_at })), { ok: true });
+  const cleared = await acked.sync(sampleConversation(), () => {});
+  assert.equal(Boolean(cleared.report.olderExtensionWrote), false);
+  assert.equal(JSON.parse(acked.lastCommittedArchive().marker).downgrade_warning, undefined);
+  // Acknowledging another (older) warning does not clear this one.
+  const otherAck = makeBackgroundSyncHarness({ indexText: JSON.stringify(afterDetection.index), markerText: afterDetection.marker });
+  await otherAck.request({ type: 'acknowledgeDowngradeWarning', detected_at: 'some other time' });
+  assert.equal((await otherAck.sync(sampleConversation(), () => {})).report.olderExtensionWrote, true);
+});
+
+test('archives without a marker file and without image records raise no downgrade warning, and get no commit just for the marker', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [] }) });
+  const result = await harness.sync([], () => {});
+  assert.equal(Boolean(result.report.olderExtensionWrote), false);
+  assert.equal(result.commit, null, 'an old archive with nothing to change is not committed to just to add the marker');
+});
+
+test('an unchanged marker file is not uploaded again; a missing one is added with the next commit', async () => {
+  const current = `${JSON.stringify({ format: 'ai-archive', requires_extension: '0.5.29', written_by_extension: '0.5.29' }, null, 2)}\n`;
+  const same = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [] }), markerText: current });
+  await same.sync(sampleConversation(), () => {});
+  assert.equal(treePosts(same).some((t) => t.path === 'archive/.ai-archive.json'), false, 'left as it is');
+  const missing = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  await missing.sync(sampleConversation(), () => {});
+  assert.ok(treePosts(missing).some((t) => t.path === 'archive/.ai-archive.json' && t.sha), 'added');
+});
+
+test('fields of the marker file this version does not know are kept when it is rewritten', async () => {
+  const marker = JSON.stringify({ format: 'ai-archive', requires_extension: '0.5.29', written_by_extension: '0.5.31', future_field: { kept: true } });
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [] }), markerText: marker });
+  await harness.sync(sampleConversation(), () => {});
+  const written = JSON.parse(harness.lastCommittedArchive().marker);
+  assert.deepEqual(written.future_field, { kept: true });
+  assert.equal(written.requires_extension, '0.5.29');
 });

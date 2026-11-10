@@ -274,6 +274,7 @@ function handleClaude(url) {
     const index = JSON.parse(files['archive/index.json']);
     check('index lists both conversations', index.conversations.length === 2 && index.conversations.every((c) => c.exporter_version === 1));
     check('the index records the oldest extension allowed to write to it', index.requires_extension === '0.5.29', String(index.requires_extension));
+    check('the archive marker file is written with it', JSON.parse(files['archive/.ai-archive.json'] || '{}').requires_extension === '0.5.29');
     const tripPath = mdPaths.find((file) => files[file].toString().includes('Lisbon'));
     const trip = tripPath ? files[tripPath].toString() : '';
     check('Markdown keeps both turns', trip.includes('## You') && trip.includes('Day one: Alfama'));

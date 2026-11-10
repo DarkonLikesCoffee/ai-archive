@@ -2,6 +2,43 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Review fixes for PR #102: originals never demoted, unique pairing, persistent downgrade detection — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+Fixes for the defects found by the final review of PR #102. Each was reproduced first in scratch copies running the real code.
+
+1. **Archived originals were demoted.** A re-export after Claude stopped serving an archived original (404/410) moved the original to `retained_assets`, stopped linking it, and listed the image as preview-only.
+   - Image assets now record `file_uuid`, and the archive state sends archived originals to the Claude tab.
+   - On 404/410 the tab sends a `reuse_path` reference instead of downgrading. `applyArchivedOriginals` (background) accepts it only if the previous entry lists that path, SHA-256 and file UUID and the file exists; otherwise the image is reported as not archived and the archived copy is kept.
+   - A sync without archive state ("Latest N") that received only a preview re-links the archived original and keeps the preview as its `preview_of`.
+   - Reused originals are never uploaded again.
+2. **Ambiguous pairing.** `labelSandboxOriginals` pairs only when the name is unique among the sandbox uploads, the conversation's image attachments and the previews.
+3. **Downgrade detection missed the only-conversation case; the warning was one-shot.**
+   - New `archive/.ai-archive.json` (`requires_extension`, `written_by_extension`, and an optional `downgrade_warning`).
+   - Verified with the released 0.5.28 code, now a test fixture at `test-fixtures/extension-0.5.28/background.js`: 0.5.28 never reads, writes or deletes the marker file; it drops the index marker; it deletes the re-exported original from the latest version.
+   - Detection: the marker file says 0.5.29+ but the index has no marker. The warning is stored in the marker file and reported by every sync until acknowledged through the popup's "I understand", which stores the warning's `detected_at`; the next sync clears it. The marker file's requirement is also enforced as a version guard.
+   - The marker file is uploaded only when new or changed, and fields it does not know are kept when it is rewritten. Archives with nothing to change are not committed to just to add it.
+4. **Kept files could be deleted through a shared folder.** `retained_assets` paths are now part of the cleanup guard.
+5. **Rebuild dry run.** Entries holding `preview_only`, `retained_assets` or `assets.variant`/`preview_of`/`file_uuid` are reported as differing ("not preserved by a rebuild"), and the report separates fields a sync restores from fields it does not. HEIC, HEIF, TIFF, AVIF, BMP and ICO types were added.
+6. **Verifier.** `older-extension-wrote` now also fires when the marker file exists but the index marker does not.
+7. **Owner's four-image check script** (kept outside the repository): updated to the final schema, checking `variant`, `file_uuid`, `preview_of`, `preview_only`, `retained_assets`, the links, and both markers.
+
+**Tests (synthetic images only).**
+- `node --test extension/*.test.js`: 280/280. 17 new: 5 content, 12 background.
+- Two existing exact-count assertions now account for the marker file. They still check that the Markdown is not rewritten, and that 12 assets, one Markdown file and one index are uploaded.
+- `cd web && npm test`: 122/122 (3 new). `npm run build`: OK.
+- `node e2e/extension-sync.e2e.cjs`: exit 0, 55 PASS / 0 FAIL. 1 new check: the marker file. The existing "each new file uploaded exactly once" check found that the marker was re-uploaded on every commit; fixed.
+- `node web/e2e/viewer.e2e.cjs`: exit 0.
+- Negative checks, each fix disabled in turn: 1a (2 tests fail), 1b (1), 1c (1), 1d (4), 2 (2), 3a (1), 3b (1), 3c (1), 3d (1), 3e verifier (1), 4 (1), 5a (1), 5b (2), unchanged-marker upload (1), unknown marker fields (1).
+
+**Limitations (documented in `docs/archive-format-v1.md`).**
+- Versions before 0.5.29 cannot be stopped.
+- Detection happens only after they write, and only while the marker file exists.
+- The damage they do is recovered from git history.
+
+**Not verified.** No live Claude run. No real archive touched.
+
+**Next task.** The owner-approved live test (separate repository and Chrome profile). Then merge PR #100, merge `development` into this branch and retarget PR #102.
+
 ## Reconciling original-first images with the sandbox rule; display copies; downgrade protection — 2026-11-10 (extension 0.5.29, web 0.6.19)
 
 - **Branch.** `claude/original-first-reconciled`, based on PR #100's head (not yet merged; it is the branch's base) with PR #101 merged in. Conflicts were in docs, versions and the two test files only; both PRs' tests and docs are kept.

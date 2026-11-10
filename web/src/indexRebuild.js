@@ -30,7 +30,15 @@ const MIME_BY_EXTENSION = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
   pdf: 'application/pdf', txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', json: 'application/json',
   html: 'text/html', zip: 'application/zip',
+  heic: 'image/heic', heif: 'image/heif', tif: 'image/tiff', tiff: 'image/tiff', avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon',
 };
+// Fields of index assets a rebuild cannot recover from Markdown (written by
+// extension 0.5.29 or later for images).
+export const UNRECOVERABLE_ASSET_FIELDS = ['variant', 'preview_of', 'file_uuid'];
+// Lost fields that the next sync restores by re-exporting the conversation.
+// Every other lost field (the image records, incomplete[] details) is not
+// restored that way, so an entry that would lose one is never "unchanged".
+const RESTORED_BY_RESYNC = new Set(['exporter_version', 'format_version']);
 
 function dirname(path) {
   const at = String(path).lastIndexOf('/');
@@ -155,8 +163,13 @@ export async function planIndexRebuild({ index, tree, markdown, readBytes = null
     const before = (existing.assets || []).map(assetKey).sort().join();
     const after = result.entry.assets.map(assetKey).sort().join();
     if (before !== after) fields.push('assets');
-    const lost = UNRECOVERABLE_FIELDS.filter((field) => existing[field] != null && !(Array.isArray(existing[field]) && !existing[field].length));
+    const lost = [
+      ...UNRECOVERABLE_FIELDS.filter((field) => existing[field] != null && !(Array.isArray(existing[field]) && !existing[field].length)),
+      ...UNRECOVERABLE_ASSET_FIELDS.filter((field) => (existing.assets || []).some((asset) => asset?.[field] != null)).map((field) => `assets.${field}`),
+    ];
     if (lost.length) plan.lostIfApplied.push({ key, fields: lost });
+    const notPreserved = lost.filter((field) => !RESTORED_BY_RESYNC.has(field));
+    if (notPreserved.length) fields.push(`not preserved by a rebuild: ${notPreserved.join(', ')}`);
     if (fields.length || result.problems.length) plan.differs.push({ key, path, fields, problems: result.problems });
     else plan.unchanged.push(key);
   }
@@ -179,7 +192,13 @@ export function formatRebuildPlan(plan) {
   for (const item of plan.onlyInIndex) lines.push(`NOT REBUILT ${item.path ?? item.key}: no readable conversation file has this identity`);
   for (const item of plan.unreadable) lines.push(`UNREADABLE ${item.path}: ${item.problems.join('; ')}`);
   if (plan.lostIfApplied.length) {
-    lines.push(`${plan.lostIfApplied.length} entr${plan.lostIfApplied.length === 1 ? 'y' : 'ies'} would lose ${[...new Set(plan.lostIfApplied.flatMap((item) => item.fields))].join(', ')}; their next sync would re-export them.`);
+    const all = [...new Set(plan.lostIfApplied.flatMap((item) => item.fields))];
+    const restored = all.filter((field) => RESTORED_BY_RESYNC.has(field));
+    const kept = all.filter((field) => !RESTORED_BY_RESYNC.has(field));
+    const count = (filter) => plan.lostIfApplied.filter((item) => item.fields.some(filter)).length;
+    const entries = (n) => `${n} entr${n === 1 ? 'y' : 'ies'}`;
+    if (restored.length) lines.push(`${entries(count((field) => RESTORED_BY_RESYNC.has(field)))} would lose ${restored.join(', ')}; their next sync would re-export them.`);
+    if (kept.length) lines.push(`${entries(count((field) => !RESTORED_BY_RESYNC.has(field)))} would lose ${kept.join(', ')}, which neither the Markdown nor a later sync restores; keep the current index entries for them.`);
   }
   return lines.join('\n');
 }

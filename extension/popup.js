@@ -141,9 +141,14 @@ function describeSyncReport(report) {
   // First and always shown: an older extension rewrote this archive after it
   // began recording original images (see olderExtensionWroteArchive).
   if (report.olderExtensionWrote === true) {
+    const detectedAt = typeof report.downgradeWarning?.detected_at === 'string' ? report.downgradeWarning.detected_at : null;
     entries.push({ type: 'warning', title: 'An older AI Archive extension wrote to this archive',
       subtitle: 'Original images may have been replaced by previews',
-      details: ['An extension older than 0.5.29 rewrote the archive after it began recording original images. In conversations it re-exported, original images may have been replaced by Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.'] });
+      details: [
+        'An extension older than 0.5.29 rewrote the archive after it began recording original images. In conversations it re-exported, original images may have been replaced by Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.',
+        'This warning is shown after every sync until you acknowledge it.',
+      ],
+      ...(detectedAt ? { acknowledge: detectedAt } : {}) });
   }
   for (const item of Array.isArray(report.failed) ? report.failed : []) {
     entries.push({ type: 'failed', title: item.title || item.id, id: item.id,
@@ -229,6 +234,19 @@ function showSyncReport(report) {
       row.className = 'report-detail-line';
       row.textContent = line;
       body.append(row);
+    }
+    if (entry.acknowledge) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = 'I understand';
+      button.addEventListener('click', () => {
+        button.disabled = true;
+        chrome.runtime.sendMessage({ type: 'acknowledgeDowngradeWarning', detected_at: entry.acknowledge }, (response) => {
+          button.textContent = response?.ok ? 'Acknowledged: the next sync clears this warning' : 'Could not save; try again';
+          if (!response?.ok) button.disabled = false;
+        });
+      });
+      body.append(button);
     }
     details.append(body);
     list.append(details);

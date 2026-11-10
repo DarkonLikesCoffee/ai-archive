@@ -13,6 +13,11 @@
   // sync does not ask for those originals again; an explicit "Latest N" sync
   // has no archive state, so it asks again. See downloadMessageImage.
   let knownPreviewOnlyImages = null;
+  // Originals the archive already holds for image files (conversation ID ->
+  // file UUID -> { path, sha256, size, mime }), from the same archive state.
+  // When Claude no longer serves such an original, the archived one is linked
+  // again instead of the image being demoted to a preview.
+  let knownArchivedOriginals = null;
 
   // Per-sync counts of downloads over the upload limit: only counts, byte
   // totals and reason codes, never names, IDs or contents.
@@ -785,6 +790,11 @@
     return { ...rest, mime: detected.mime, detected_extension: detected.extension, variant: 'original' };
   }
 
+  function knownArchivedOriginal(conversationId, fileId) {
+    if (!knownArchivedOriginals || !conversationId || !fileId) return null;
+    return knownArchivedOriginals.get(String(conversationId))?.get(String(fileId)) || null;
+  }
+
   function knownPreviewOnly(conversationId, fileId) {
     if (!knownPreviewOnlyImages || !conversationId || !fileId) return null;
     return knownPreviewOnlyImages.get(String(conversationId))?.get(String(fileId)) || null;
@@ -859,6 +869,17 @@
         reason = 'original-unavailable';
       }
       if (accepted) return withDisplayCopy(accepted, url, name, signal);
+      // Claude no longer serves an original the archive already holds: link
+      // that archived original again (the background checks it is still the
+      // archived file), never demote it to a preview. No bytes are sent.
+      const archived = knownArchivedOriginal(conversationId, fileId);
+      if (archived) {
+        const extension = String(archived.path).split('/').pop().split('.').pop().toLowerCase();
+        return withDisplayCopy({
+          name: safeAssetName(name), mime: archived.mime || 'application/octet-stream', base64: '', size: archived.size, sha256: archived.sha256,
+          variant: 'original', reuse_path: archived.path, detected_extension: extension,
+        }, url, name, signal);
+      }
     }
     // The preview has its own bytes and identity: it is not looked up as an
     // oversized record of the original.
@@ -1046,15 +1067,25 @@
   // archived as a separate preview variant naming it (original_sha256), and is
   // no longer a preview-only image. Both files are kept. Anything ambiguous
   // leaves both as they are.
-  function labelSandboxOriginals(assets) {
+  function labelSandboxOriginals(assets, imageNameCounts = new Map()) {
     const uploadName = (asset) => {
       const relative = sandboxRelativePath(asset.source_path);
       return /^uploads\//.test(relative) ? relative.split('/').pop() : null;
     };
+    const previewNameCounts = new Map();
+    for (const asset of assets) {
+      if (asset.source !== 'message' || asset.variant !== 'preview') continue;
+      const key = String(asset.name || '').toLowerCase();
+      previewNameCounts.set(key, (previewNameCounts.get(key) || 0) + 1);
+    }
     for (const preview of assets) {
       if (preview.source !== 'message' || preview.variant !== 'preview' || preview.original_sha256) continue;
       const wanted = String(preview.name || '').toLowerCase();
       if (!wanted) continue;
+      // A name shared by several images of the conversation (pasted images
+      // are often all "image.png") cannot tell which one the upload is: no
+      // guess, both stay as they are.
+      if ((imageNameCounts.get(wanted) || 0) > 1 || (previewNameCounts.get(wanted) || 0) > 1) continue;
       const candidates = assets.filter((asset) => asset.source === 'sandbox' && !asset.variant
         && uploadName(asset) != null && safeAssetName(uploadName(asset)).toLowerCase() === wanted);
       if (candidates.length !== 1) continue;
@@ -1218,7 +1249,21 @@
       seen.add(key);
       assets.push(asset);
     }
-    labelSandboxOriginals(assets);
+    // How many distinct image attachments of the conversation have each name.
+    const imageNameCounts = new Map();
+    const countedImages = new Set();
+    for (const message of messages) {
+      for (const [position, file] of (Array.isArray(message?.files) ? message.files : []).entries()) {
+        const fileName = file?.file_name || file?.name || '';
+        if (!fileName || !isImageMessageFile(file, fileName)) continue;
+        const identity = messageFileId(file) || `${message?.uuid || ''}:${position}`;
+        if (countedImages.has(identity)) continue;
+        countedImages.add(identity);
+        const key = safeAssetName(fileName).toLowerCase();
+        imageNameCounts.set(key, (imageNameCounts.get(key) || 0) + 1);
+      }
+    }
+    labelSandboxOriginals(assets, imageNameCounts);
 
     // Some document uploads are represented only as attachments[].extracted_content.
     // Preserve those as downloadable text files instead of dumping their contents
@@ -1692,7 +1737,17 @@
               original_checked_at: typeof item.original_checked_at === 'string' ? item.original_checked_at : null,
             });
           }
-          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, previewOnly: previews, error: null });
+          const originals = new Map();
+          for (const item of Array.isArray(response.originals) ? response.originals : []) {
+            if (!item?.id || typeof item.file_uuid !== 'string' || !item.file_uuid || typeof item.path !== 'string' || !/^[0-9a-f]{64}$/.test(String(item.sha256))) continue;
+            if (!originals.has(String(item.id))) originals.set(String(item.id), new Map());
+            originals.get(String(item.id)).set(item.file_uuid, {
+              path: item.path, sha256: String(item.sha256),
+              size: Number.isSafeInteger(item.size) ? item.size : null,
+              mime: typeof item.mime === 'string' ? item.mime : null,
+            });
+          }
+          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, previewOnly: previews, originals, error: null });
         });
       } catch (error) {
         failed(error?.message || error);
@@ -1900,6 +1955,7 @@
       const archived = archivedState?.state || null;
       knownOversizedFiles = archivedState?.oversized || null;
       knownPreviewOnlyImages = archivedState?.previewOnly || null;
+      knownArchivedOriginals = archivedState?.originals || null;
       oversizedStats = newOversizedStats();
       const archiveStateError = archivedState?.error ? sanitizeError(archivedState.error) : null;
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
