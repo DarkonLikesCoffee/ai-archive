@@ -27,7 +27,10 @@ touching the real archive**. Run it only with the owner's explicit approval.
    other copy of the extension may write to the test repository.
 4. The originals recovered by hand, in one local folder, named
    `original-<first 8 characters of the conversation ID>-<stem>.<png|jpg>`.
-   The image Claude names `<stem>.png` is matched by that name.
+   The archived image whose name, without its extension, is `<stem>` is
+   matched (a pasted image is `<stem>.png`; an uploaded file keeps its own
+   extension). For the new test conversation of step 2, copy the two files
+   you uploaded into such a folder under these names.
 
 ## Procedure
 

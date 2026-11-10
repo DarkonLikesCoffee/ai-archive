@@ -14,6 +14,7 @@ This file is the durable handoff between Claude Code sessions. Keep entries fact
   - The popup's smallest choice is "Latest 10", which would copy 9 historical conversations. Syncing exactly one conversation uses the popup's own `sendToClaude({ type: 'startSync', limit: '1' })` from its DevTools console, with no code change.
   - Automatic sync must be confirmed off first; if on, it copies up to 20 conversations.
   - Copying historical conversations is a separate step that needs the owner's agreement on N.
+- **Check script.** It now finds an archived image by its name without the extension, so an uploaded `photo.jpg` (not only a pasted `…_image.png`) is checked. 1 new test; with the old exact-name match it fails. Web tests: 127/127.
 - **Not done.** No live step can be run from a cloud session: no browser, Claude login, test repository or token here. The owner runs the live steps; this session verifies the results read-only once given access to the test repository.
 
 ## Pre-live-test verification of PR #102 — 2026-11-10 (extension 0.5.29, web 0.6.19)

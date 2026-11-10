@@ -6,7 +6,8 @@
 //
 // Recovered files are named original-<first 8 characters of the
 // conversation ID>-<stem>.<png|jpg|jpeg>, as the DevTools download step
-// saves them; Claude's name for the image is <stem>.png.
+// saves them. Claude's name for the image is <stem> plus any extension: a
+// pasted image is <stem>.png, an uploaded file keeps its own extension.
 //
 // Schema checked (docs/archive-format-v1.md, "Image originals and previews"):
 //   assets[].variant, assets[].file_uuid, assets[].preview_of,
@@ -76,15 +77,17 @@ export async function checkRecoveredOriginals({ index, marker, recovered, readFi
   for (const { fileName, bytes } of recovered) {
     const [, conv8, stem] = String(fileName).match(RECOVERED_NAME) || [];
     if (!conv8) continue;
-    const claudeName = `${stem}.png`;
+    const stemOf = (name) => String(name || '').replace(/\.[^./]+$/, '');
+    const matching = (entryAssets) => (entryAssets || []).filter((a) => stemOf(a?.name) === stem);
     const format = imageFormat(bytes);
     const want = { size: bytes.length, sha: await sha256Hex(bytes), format, dims: imageDimensions(bytes, format) };
-    const check = section(`${conv8} ${claudeName} -> ${fileName} (${format}, ${want.dims ?? '?'}, ${want.size} bytes)`);
+    const check = section(`${conv8} ${stem}.* -> ${fileName} (${format}, ${want.dims ?? '?'}, ${want.size} bytes)`);
 
     const entries = (index?.conversations || []).filter((e) => String(e?.id).toLowerCase().startsWith(conv8.toLowerCase()));
     check(entries.length === 1, 'conversation is in the test archive', `${entries.length} entries`);
     const entry = entries[0];
-    const named = (entry?.assets || []).filter((a) => a?.name === claudeName);
+    const named = matching(entry?.assets);
+    const claudeName = named[0]?.name || `${stem}.png`;
     const originals = named.filter((a) => a.variant === 'original');
     check(originals.length === 1, "exactly one archived original with Claude's name", `${originals.length} found`);
     if (originals.length !== 1) continue;

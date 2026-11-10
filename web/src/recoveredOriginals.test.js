@@ -61,7 +61,7 @@ test('an archive the exporter wrote with the recovered originals passes every ch
   assert.deepEqual(failed(result), []);
   assert.equal(result.failures, 0);
   const report = formatRecoveredOriginalsReport(result);
-  assert.match(report, /abcd1234 2000_image\.png -> original-abcd1234-2000_image\.jpg \(jpeg, 4x3, 17 bytes\)/);
+  assert.match(report, /abcd1234 2000_image\.\* -> original-abcd1234-2000_image\.jpg \(jpeg, 4x3, 17 bytes\)/);
   assert.match(report, /PASS its preview names this original \(preview_of\)/);
   assert.match(report, /All checks passed\.$/);
   assert.equal(/[0-9a-f]{64}/.test(report), false, 'no hashes are printed');
@@ -111,4 +111,14 @@ test('the command-line wrapper reads a local clone and exits 0, 1 or 2', async (
   await writeFile(join(repo, 'archive/index.json'), JSON.stringify({ ...archive.index, requires_extension: undefined }));
   assert.equal((await exec(repo, folder)).code, 1);
   assert.equal((await exec(repo)).code, 2, 'usage error');
+});
+
+test('an uploaded JPEG keeps its own name: it is found by its name without the extension', async () => {
+  const archive = exportedArchive();
+  // As if the JPEG had been uploaded as "holiday.jpg" rather than pasted.
+  for (const a of archive.index.conversations[0].assets) if (a.name === '2000_image.png') a.name = 'holiday.jpg';
+  archive.recovered[1] = { fileName: 'original-abcd1234-holiday.jpg', bytes: archive.recovered[1].bytes };
+  const result = await run(archive);
+  assert.deepEqual(failed(result), []);
+  assert.match(formatRecoveredOriginalsReport(result), /abcd1234 holiday\.\* -> original-abcd1234-holiday\.jpg/);
 });
