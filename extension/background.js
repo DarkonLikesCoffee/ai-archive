@@ -348,8 +348,26 @@ function conversationMetadata(c, provider, account) {
   };
 }
 
+// A file name with the extension of the format its bytes were detected as
+// (see detectImageFormat in content.js), so a JPEG Claude named "x.png" is
+// stored as "x.jpg" and a WebP preview as "x.webp". Equivalent spellings
+// (jpg/jpeg, tif/tiff) are kept as they are. Assets without a detected
+// format keep their name, so their paths are unchanged.
+const EQUIVALENT_EXTENSIONS = { jpg: ['jpg', 'jpeg', 'jpe'], tiff: ['tiff', 'tif'], heic: ['heic'], heif: ['heif'] };
+const REPLACEABLE_EXTENSION = /^(png|jpe?g|jpe|gif|webp|bmp|tiff?|avif|heic|heif|svg|img)$/i;
+function nameWithDetectedExtension(name, extension) {
+  const value = String(name || 'file');
+  if (!/^[a-z0-9]{1,8}$/i.test(String(extension || ''))) return value;
+  const wanted = String(extension).toLowerCase();
+  const dot = value.lastIndexOf('.');
+  const current = dot > 0 ? value.slice(dot + 1).toLowerCase() : '';
+  if ((EQUIVALENT_EXTENSIONS[wanted] || [wanted]).includes(current)) return value;
+  const stem = dot > 0 && REPLACEABLE_EXTENSION.test(current) ? value.slice(0, dot) : value;
+  return `${stem}.${wanted}`;
+}
+
 function assetPath(c, asset, provider, accountSlug, usedPaths) {
-  const base = filenameSlug(asset.name || 'file');
+  const base = filenameSlug(nameWithDetectedExtension(asset.name || 'file', asset.detected_extension));
   const hash = String(asset.sha256 || '').slice(0, 8) || 'asset';
   let name = `${hash}-${base}`;
   // Use the full, path-safe conversation ID as the directory identity.
@@ -485,8 +503,21 @@ function assetMarkdown(asset, path) {
     return `**Not archived: ${label}** (${formatBytes(assetByteSize(asset))}; ${escapeMd(asset.omit_reason || tooLargeReason(assetByteSize(asset)))})`;
   }
   const rel = `assets/${String(path).split('/assets/').pop()}`;
-  if (isImageAsset(asset)) return `![${label}](${rel})`;
+  if (isImageAsset(asset)) {
+    const image = `![${label}](${rel})`;
+    return asset.variant === 'preview' ? `${image}\n\n${previewOnlyNote(asset)}` : image;
+  }
   return `[${label}](${rel})`;
+}
+
+// Shown under an image archived from Claude's preview, so nobody mistakes it
+// for the uploaded original. A 404/410 means only that Claude did not serve
+// the original when this conversation was archived.
+function previewOnlyNote(asset) {
+  const why = asset.preview_reason === 'no-file-id'
+    ? 'Claude gave no file ID to request the original upload'
+    : `Claude did not serve the original upload${Number.isSafeInteger(asset.original_status) ? ` (HTTP ${asset.original_status})` : ''} when this conversation was archived`;
+  return `*Preview only: this is Claude's preview image, not the original upload. ${why}.*`;
 }
 
 function isReplyExcerptAttachment(file) {
@@ -836,6 +867,57 @@ function normalizeAssetList(c, provider, accountSlug) {
   return { assets, byKey, omissions };
 }
 
+// Which copy of an image an asset holds: the uploaded original, or Claude's
+// preview because the original was not served. Absent for every other file
+// and for assets archived before this distinction existed.
+const ASSET_VARIANTS = new Set(['original', 'preview']);
+
+// Historical image files a re-export no longer links, kept instead of
+// deleted: when an export that tells originals from previews replaces an
+// image archived earlier (usually Claude's preview), the earlier file stays
+// in the repository and is listed here, so it is never lost and never an
+// unreferenced file. Files kept by an earlier sync stay listed. Only files
+// that still exist are listed; nothing is moved or rewritten.
+function retainedAssetsFor(previous, entry, previousAssets, existingPaths) {
+  const current = new Set((entry.assets || []).map((a) => a.path));
+  const tellsVariants = (entry.assets || []).some((a) => ASSET_VARIANTS.has(a?.variant));
+  const kept = new Map();
+  const keep = (a) => {
+    if (!a?.path || current.has(a.path) || kept.has(a.path) || !existingPaths.has(a.path)) return;
+    kept.set(a.path, {
+      path: a.path,
+      ...(typeof a.sha256 === 'string' ? { sha256: a.sha256 } : {}),
+      ...(Number.isSafeInteger(a.size) ? { size: a.size } : {}),
+      ...(typeof a.mime === 'string' ? { mime: a.mime } : {}),
+      ...(typeof a.name === 'string' ? { name: a.name } : {}),
+    });
+  };
+  for (const a of Array.isArray(previous?.retained_assets) ? previous.retained_assets : []) keep(a);
+  if (tellsVariants) {
+    for (const a of previousAssets) {
+      if (a?.path && !current.has(a.path) && isImageAsset(a)) keep(a);
+    }
+  }
+  return [...kept.values()];
+}
+
+function previewItems(assets) {
+  return (assets || []).filter((a) => a?.variant === 'preview' && !a.omitted && a.path).map((a) => {
+    const messageIds = Array.isArray(a.message_external_ids) && a.message_external_ids.length
+      ? a.message_external_ids
+      : (a.message_external_id ? [a.message_external_id] : []);
+    return {
+      path: a.path,
+      name: String(a.name || 'file'),
+      ...(a.file_uuid ? { file_uuid: String(a.file_uuid) } : {}),
+      ...(messageIds.length ? { message_external_id: String(messageIds[0]) } : {}),
+      reason: a.preview_reason === 'no-file-id' ? 'no-file-id' : 'original-unavailable',
+      ...(Number.isSafeInteger(a.original_status) ? { original_status: a.original_status } : {}),
+      ...(typeof a.original_checked_at === 'string' && a.original_checked_at ? { original_checked_at: a.original_checked_at } : {}),
+    };
+  });
+}
+
 function indexEntry(c, path, provider, account, assets) {
   const contents = c.messages.map((m) => contentWithoutInlineMarkers(c, m.content));
   return {
@@ -848,12 +930,19 @@ function indexEntry(c, path, provider, account, assets) {
     created_at: c.source_created_at || null,
     updated_at: c.source_updated_at || c.source_created_at || null,
     message_count: c.message_count || c.messages.length,
-    assets: assets.filter((a) => !a.omitted).map((a) => ({ path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name })),
+    assets: assets.filter((a) => !a.omitted).map((a) => ({
+      path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name,
+      ...(ASSET_VARIANTS.has(a.variant) ? { variant: a.variant } : {}),
+    })),
     format_version: 4,
     exporter_version: EXPORTER_VERSION,
     // Present only when files could not be archived; such a conversation is
     // never treated as unchanged, so every sync retries it.
     ...(incompleteItems(c).length ? { incomplete: incompleteItems(c) } : {}),
+    // Images archived only as Claude's preview. Not incomplete: the
+    // conversation can be skipped by later syncs. Their identity is kept so an
+    // explicit later attempt can ask Claude for the original again.
+    ...(previewItems(assets).length ? { previews: previewItems(assets) } : {}),
     preview: String(contents.find(Boolean) || '').slice(0, 300),
     search_text: [c.title, ...contents].join('\n').slice(0, 250000),
   };
@@ -1189,6 +1278,21 @@ async function archiveSyncState() {
       oversized.push({ id: String(entry.id), file_uuid: item.file_uuid, size: item.size, sha256: item.sha256 });
     }
   }
+  // Images this account's archive holds only as a preview because Claude did
+  // not serve the original: a normal sync does not ask for them again.
+  const previews = [];
+  for (const entry of index.conversations) {
+    if (entry?.provider !== 'claude' || entry.account !== account || entry.id == null) continue;
+    for (const item of Array.isArray(entry.previews) ? entry.previews : []) {
+      if (item?.reason !== 'original-unavailable' || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
+      previews.push({
+        id: String(entry.id),
+        file_uuid: item.file_uuid,
+        ...(Number.isSafeInteger(item.original_status) ? { original_status: item.original_status } : {}),
+        ...(typeof item.original_checked_at === 'string' ? { original_checked_at: item.original_checked_at } : {}),
+      });
+    }
+  }
   const conversations = index.conversations
     .filter((entry) => entry?.provider === 'claude' && entry.account === account
       && entry.exporter_version === EXPORTER_VERSION && entry.updated_at
@@ -1196,7 +1300,7 @@ async function archiveSyncState() {
       && [entry.path, ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : [])]
         .every((path) => path && existingPaths.has(path)))
     .map((entry) => ({ id: entry.id, updated_at: entry.updated_at }));
-  return { conversations, oversized };
+  return { conversations, oversized, previews };
 }
 
 async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null, oversizedDownloadsSkipped = 0, oversizedStats = null } = {}) {
@@ -1391,11 +1495,16 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       }
 
       const currentAssetPaths = new Set(entry.assets.map((a) => a.path));
+      const retained = retainedAssetsFor(previous, entry, previousAssets, existingPaths);
+      const retainedPaths = new Set(retained.map((a) => a.path));
       for (const oldAsset of previousAssets) {
-        if (oldAsset?.path && !currentAssetPaths.has(oldAsset.path)) {
+        if (oldAsset?.path && !currentAssetPaths.has(oldAsset.path) && !retainedPaths.has(oldAsset.path)) {
           changes.push({ path: oldAsset.path, delete: true });
         }
       }
+      if (retained.length) entry.retained_assets = retained;
+      if (JSON.stringify(previous?.previews || []) !== JSON.stringify(entry.previews || [])
+        || JSON.stringify(previous?.retained_assets || []) !== JSON.stringify(entry.retained_assets || [])) indexNeedsUpdate = true;
 
       map.set(key, entry);
       if (changed) {
@@ -2124,7 +2233,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === 'getArchiveState') {
     archiveSyncState()
-      .then(({ conversations, oversized }) => sendResponse({ ok: true, conversations, oversized }))
+      .then(({ conversations, oversized, previews }) => sendResponse({ ok: true, conversations, oversized, previews }))
       .catch((e) => sendResponse({ ok: false, error: e?.message || String(e), ...(e?.blocksSync ? { blocksSync: true } : {}) }));
     return true;
   }

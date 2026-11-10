@@ -2762,3 +2762,139 @@ test('the report names a category for every left-out conversation and every miss
   const [entry] = indexOf(harness).conversations;
   assert.equal(JSON.stringify(entry.incomplete).includes('categor'), false);
 });
+
+// ---------------------------------------------------------------------------
+// Originals and previews of images. Synthetic bytes only.
+// ---------------------------------------------------------------------------
+
+function imageAsset(name, bytesText, extra = {}) {
+  const bytes = Buffer.from(bytesText, 'utf8');
+  return { name, mime: 'image/png', base64: bytes.toString('base64'), sha256: sha256Hex(bytes), size: bytes.length, source: 'message', file_uuid: 'img-1', ...extra };
+}
+function imageConversationWith(id, assets) {
+  const conversation = conversationWith(id, assets);
+  conversation.messages[0].files = assets.map((asset) => ({ file_uuid: asset.file_uuid, file_name: asset.name }));
+  return conversation;
+}
+const plainJson = (value) => JSON.parse(JSON.stringify(value));
+
+test('an image is stored under the extension of its detected format; other files keep their names', () => {
+  const { assetPath } = loadBackgroundAssetHelpers();
+  const conversation = { external_id: 'conv-ext' };
+  const pathOf = (asset) => assetPath(conversation, { sha256: 'abcdef12'.padEnd(64, '0'), ...asset }, 'claude', 'personal', new Set()).split('/').pop();
+  assert.equal(pathOf({ name: '1700000000000_image.png', detected_extension: 'jpg' }), 'abcdef12-1700000000000_image.jpg');
+  assert.equal(pathOf({ name: '1700000000000_image.png', detected_extension: 'webp' }), 'abcdef12-1700000000000_image.webp');
+  assert.equal(pathOf({ name: 'photo.png', detected_extension: 'png' }), 'abcdef12-photo.png');
+  assert.equal(pathOf({ name: 'photo.JPEG', detected_extension: 'jpg' }), 'abcdef12-photo.JPEG', 'an equivalent spelling is kept');
+  assert.equal(pathOf({ name: 'scan.tif', detected_extension: 'tiff' }), 'abcdef12-scan.tif');
+  assert.equal(pathOf({ name: 'diagram', detected_extension: 'png' }), 'abcdef12-diagram.png', 'a name without an extension gets one');
+  assert.equal(pathOf({ name: 'export.final', detected_extension: 'png' }), 'abcdef12-export.final.png', 'a non-image extension is kept as part of the name');
+  assert.equal(pathOf({ name: 'notes.png' }), 'abcdef12-notes.png', 'without a detected format the path is unchanged');
+  assert.equal(pathOf({ name: 'x.png', detected_extension: '../evil' }), 'abcdef12-x.png', 'only a plain extension is ever applied');
+});
+
+test('a preview is linked with a visible note; an original and other files are linked as before', () => {
+  const { conversationMarkdown, normalizeAssetList } = loadBackgroundAssetHelpers();
+  const original = imageAsset('a.png', 'original bytes', { file_uuid: 'img-a', mime: 'image/jpeg', detected_extension: 'jpg', variant: 'original' });
+  const preview = imageAsset('b.png', 'preview bytes', { file_uuid: 'img-b', mime: 'image/webp', detected_extension: 'webp', variant: 'preview', preview_reason: 'original-unavailable', original_status: 404 });
+  const noId = imageAsset('c.png', 'no id bytes', { file_uuid: 'img-c', mime: 'image/webp', detected_extension: 'webp', variant: 'preview', preview_reason: 'no-file-id' });
+  const conversation = imageConversationWith('conv-md', [original, preview, noId]);
+  const normalized = normalizeAssetList(conversation, 'claude', 'personal');
+  const markdown = conversationMarkdown(conversation, 'claude', 'personal', normalized.byKey, normalized.assets);
+  const [a, b, c] = normalized.assets;
+  assert.match(a.path, /-a\.jpg$/);
+  assert.match(b.path, /-b\.webp$/);
+  assert.ok(markdown.includes(`![a.png](assets/${a.path.split('/assets/').pop()})`));
+  assert.ok(markdown.includes(`![b.png](assets/${b.path.split('/assets/').pop()})\n\n*Preview only: this is Claude's preview image, not the original upload. Claude did not serve the original upload (HTTP 404) when this conversation was archived.*`));
+  assert.ok(markdown.includes(`![c.png](assets/${c.path.split('/assets/').pop()})\n\n*Preview only: this is Claude's preview image, not the original upload. Claude gave no file ID to request the original upload.*`));
+  assert.equal((markdown.match(/Preview only/g) || []).length, 2, 'the original carries no note');
+  assert.equal(/Attachment not archived|Incomplete archive/.test(markdown), false, 'a preview is not reported as a missing file');
+});
+
+test('the index records which images are originals and which are previews, without marking the conversation incomplete', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const original = imageAsset('a.png', 'original bytes', { file_uuid: 'img-a', mime: 'image/jpeg', detected_extension: 'jpg', variant: 'original' });
+  const preview = imageAsset('b.png', 'preview bytes', { file_uuid: 'img-b', mime: 'image/webp', detected_extension: 'webp', variant: 'preview', preview_reason: 'original-unavailable', original_status: 410, original_checked_at: '2026-11-10T10:00:00.000Z' });
+  const text = fileAsset('notes.txt', 'plain text');
+  const { entry } = await buildIndexEntry(hooks, imageConversationWith('conv-index', [original, preview, text]));
+  const assets = plainJson(entry.assets);
+  assert.deepEqual(assets.map((a) => a.variant ?? null), ['original', 'preview', null], 'files that are not images get no variant');
+  assert.deepEqual(assets.map((a) => a.mime), ['image/jpeg', 'image/webp', 'text/plain']);
+  assert.equal(Object.keys(assets[2]).join(','), 'path,sha256,size,mime,name', 'other assets keep exactly their old shape');
+  assert.deepEqual(plainJson(entry.previews), [{
+    path: assets[1].path, name: 'b.png', file_uuid: 'img-b', message_external_id: 'conv-index-m1',
+    reason: 'original-unavailable', original_status: 410, original_checked_at: '2026-11-10T10:00:00.000Z',
+  }]);
+  assert.equal(entry.incomplete, undefined, 'a preview does not make the conversation incomplete');
+});
+
+test('replacing an archived preview with its original keeps the old file and lists it instead of deleting it', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const oldPreview = imageAsset('1700000000000_image.png', 'old webp preview bytes', { mime: 'image/webp' });
+  const before = imageConversationWith('conv-replace', [oldPreview]);
+  const { entry: previous } = await buildIndexEntry(hooks, before);
+  const oldPath = previous.assets[0].path;
+  assert.match(oldPath, /_image\.png$/, 'archived the old way: a preview under the .png name');
+
+  const original = imageAsset('1700000000000_image.png', 'original jpeg bytes', { mime: 'image/jpeg', detected_extension: 'jpg', variant: 'original' });
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previous] }) });
+  await harness.sync([imageConversationWith('conv-replace', [original])], () => {});
+
+  const tree = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST').body.tree;
+  assert.equal(tree.some((item) => item.path === oldPath && item.sha === null), false, 'the old preview file is not deleted');
+  const index = indexOf(harness);
+  const [entry] = index.conversations;
+  assert.equal(entry.assets.length, 1);
+  assert.match(entry.assets[0].path, /_image\.jpg$/);
+  assert.equal(entry.assets[0].variant, 'original');
+  assert.deepEqual(entry.retained_assets, [{ path: oldPath, sha256: previous.assets[0].sha256, size: previous.assets[0].size, mime: 'image/webp', name: '1700000000000_image.png' }]);
+  assert.equal(entry.incomplete, undefined);
+  const markdown = markdownOf(harness, entry.title);
+  assert.ok(markdown.includes(entry.assets[0].path.split('/assets/').pop()), 'the Markdown links the original');
+  assert.equal(markdown.includes(oldPath.split('/assets/').pop()), false, 'and no longer links the preview');
+});
+
+test('files kept by an earlier re-export stay listed by later syncs', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const original = imageAsset('1700000000000_image.png', 'original jpeg bytes', { mime: 'image/jpeg', detected_extension: 'jpg', variant: 'original' });
+  const { entry: previous } = await buildIndexEntry(hooks, imageConversationWith('conv-carry', [original]));
+  const kept = { path: 'archive/conversations/claude/personal/assets/conv-carry-x/aaaaaaaa-1700000000000_image.png', sha256: 'a'.repeat(64), size: 10, mime: 'image/webp', name: '1700000000000_image.png' };
+  previous.retained_assets = [kept];
+  previous.content_sha256 = 'force a re-export';
+  const harness = makeBackgroundSyncHarness({
+    indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previous] }),
+    extraTreePaths: [kept.path],
+  });
+  await harness.sync([imageConversationWith('conv-carry', [original])], () => {});
+  const [entry] = indexOf(harness).conversations;
+  assert.deepEqual(entry.retained_assets, [kept]);
+  const tree = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST').body.tree;
+  assert.equal(tree.some((item) => item.path === kept.path), false, 'the kept file is neither rewritten nor deleted');
+});
+
+test('an export that does not tell originals from previews still deletes a removed attachment', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const oldImage = imageAsset('old.png', 'old image bytes');
+  const { entry: previous } = await buildIndexEntry(hooks, imageConversationWith('conv-remove', [oldImage]));
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previous] }) });
+  await harness.sync([imageConversationWith('conv-remove', [fileAsset('notes.txt', 'text')])], () => {});
+  const tree = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST').body.tree;
+  assert.ok(tree.some((item) => item.path === previous.assets[0].path && item.sha === null), 'existing deletion behaviour is unchanged');
+  assert.equal(indexOf(harness).conversations[0].retained_assets, undefined);
+});
+
+test('the archive state lists preview-only images so a normal sync does not ask for them again, and they stay skippable', async () => {
+  const entry = (id, account, previews, extra = {}) => ({ id, provider: 'claude', account, path: `archive/conversations/claude/${account}/${id}.md`, assets: [], previews, exporter_version: 1, updated_at: '2026-10-01T00:00:00Z', ...extra });
+  const index = { version: 2, conversations: [
+    entry('c1', 'personal', [
+      { path: 'p1', name: 'a.png', file_uuid: 'u1', reason: 'original-unavailable', original_status: 404, original_checked_at: '2026-10-01T00:00:00.000Z' },
+      { path: 'p2', name: 'b.png', reason: 'no-file-id' },
+      { path: 'p3', name: 'c.png', file_uuid: 'u3', reason: 'something-else' },
+    ]),
+    entry('c2', 'work', [{ path: 'p4', name: 'd.png', file_uuid: 'u4', reason: 'original-unavailable', original_status: 410 }]),
+  ] };
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify(index) });
+  const state = await harness.hooks.archiveSyncState();
+  assert.deepEqual(plainJson(state.previews), [{ id: 'c1', file_uuid: 'u1', original_status: 404, original_checked_at: '2026-10-01T00:00:00.000Z' }], 'only this account, and only originals Claude did not serve');
+  assert.deepEqual(plainJson(state.conversations), [{ id: 'c1', updated_at: '2026-10-01T00:00:00Z' }], 'a conversation with previews is not incomplete, so it can be skipped');
+});

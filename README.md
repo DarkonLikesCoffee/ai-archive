@@ -1,5 +1,12 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.29 — original images instead of previews
+- Uploaded and pasted images are now archived from Claude's original upload. Before, every image was archived from Claude's smaller, lossy WebP preview, stored under the original's `.png` or `.jpg` name.
+- The type and extension of an image come from its bytes. A pasted image Claude names `…_image.png` is stored as `.jpg` when it is a JPEG.
+- If Claude does not serve the original (HTTP 404/410), the preview is archived under its real `.webp` extension, with a visible "Preview only" note and a `previews` record in the index. The conversation is not marked incomplete, and normal syncs do not ask for that original again; a "Latest N" sync does. Any other failure leaves the conversation out of that sync, so a later sync retries it: a preview is never substituted silently.
+- Conversations already archived are not re-exported by this update. When one is re-exported later and an original replaces an earlier image, the earlier file is kept and listed under `retained_assets`, not deleted. Format details: `docs/archive-format-v1.md`.
+- Web 0.6.19: the archive verifier counts kept files as referenced, and reports one that is missing.
+
 ## Extension v0.5.27 — why something was left out
 - The sync report and popup now say why each conversation or file was left out. A conversation shows "Download from Claude failed", "Claude's data failed a safety check" or "Too large for GitHub". A file shows "not available from Claude", "over the upload limit" or "refused by GitHub".
 - The diagnostic report records the same category for each conversation that could not be exported. Nothing in the archive changes: categories are derived from what is already recorded.

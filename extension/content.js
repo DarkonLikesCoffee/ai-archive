@@ -7,6 +7,12 @@
   // downloads of them that this sync skipped. See fetchAsset.
   let knownOversizedFiles = null;
   let oversizedStats = newOversizedStats();
+  // Images the archive holds only as Claude's preview because Claude did not
+  // serve the original (conversation ID -> file UUID -> { original_status,
+  // original_checked_at }), from the archive state of an "all" sync. A normal
+  // sync does not ask for those originals again; an explicit "Latest N" sync
+  // has no archive state, so it asks again. See downloadMessageImage.
+  let knownPreviewOnlyImages = null;
 
   // Per-sync counts of downloads over the upload limit: only counts, byte
   // totals and reason codes, never names, IDs or contents.
@@ -466,6 +472,48 @@
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
+  // The image format of a file from its bytes, never from its name or a
+  // declared type: Claude names a pasted image "…_image.png" whether its
+  // original is PNG or JPEG, and serves its preview as WebP under that name.
+  // Returns { format, mime, extension } or null for bytes that are not a
+  // recognised image.
+  const IMAGE_FORMATS = {
+    png: { mime: 'image/png', extension: 'png' },
+    jpeg: { mime: 'image/jpeg', extension: 'jpg' },
+    gif: { mime: 'image/gif', extension: 'gif' },
+    webp: { mime: 'image/webp', extension: 'webp' },
+    bmp: { mime: 'image/bmp', extension: 'bmp' },
+    tiff: { mime: 'image/tiff', extension: 'tiff' },
+    avif: { mime: 'image/avif', extension: 'avif' },
+    heic: { mime: 'image/heic', extension: 'heic' },
+    heif: { mime: 'image/heif', extension: 'heif' },
+    svg: { mime: 'image/svg+xml', extension: 'svg' },
+  };
+  function detectImageFormat(input) {
+    const b = input instanceof Uint8Array ? input : new Uint8Array(input || new ArrayBuffer(0));
+    const at = (offset, ...bytes) => b.length >= offset + bytes.length && bytes.every((x, i) => b[offset + i] === x);
+    const ascii = (offset, length) => (b.length >= offset + length ? String.fromCharCode(...b.subarray(offset, offset + length)) : '');
+    let format = null;
+    if (at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) format = 'png';
+    else if (at(0, 0xff, 0xd8, 0xff)) format = 'jpeg';
+    else if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') format = 'gif';
+    else if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') format = 'webp';
+    else if (ascii(0, 2) === 'BM' && b.length >= 26) format = 'bmp';
+    else if (at(0, 0x49, 0x49, 0x2a, 0x00) || at(0, 0x4d, 0x4d, 0x00, 0x2a)) format = 'tiff';
+    else if (ascii(4, 4) === 'ftyp') {
+      const brand = ascii(8, 4);
+      if (brand === 'avif' || brand === 'avis') format = 'avif';
+      else if (['heic', 'heix', 'heim', 'heis', 'hevc', 'hevx', 'hevm', 'hevs'].includes(brand)) format = 'heic';
+      else if (brand === 'mif1' || brand === 'msf1') format = 'heif';
+    } else {
+      // SVG is text: an optional BOM, XML declaration, comments and doctype,
+      // then the <svg> root element.
+      const head = String.fromCharCode(...b.subarray(0, 1024)).replace(/^\xef\xbb\xbf/, '');
+      if (/^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE\s+svg[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*<svg[\s>]/i.test(head)) format = 'svg';
+    }
+    return format ? { format, ...IMAGE_FORMATS[format] } : null;
+  }
+
   // Run only a small number of network tasks at once. Results stay in input
   // order, and after the first failure no new tasks are scheduled; workers
   // already in flight are allowed to settle before the error is propagated.
@@ -635,7 +683,7 @@
 
   // `route` names the download path for the counters only: message-url,
   // files-api, sandbox-path or sandbox-list.
-  async function fetchAsset(url, name, mime, signal, { conversationId = null, fileUuid = null, fileIdAmbiguous = false, declaredSize = null, route = 'message-url' } = {}) {
+  async function fetchAsset(url, name, mime, signal, { conversationId = null, fileUuid = null, fileIdAmbiguous = false, declaredSize = null, route = 'message-url', detect = false } = {}) {
     const known = knownOversizedFile(conversationId, fileUuid);
     const label = safeAssetName(name);
     if (!url) {
@@ -676,6 +724,8 @@
         base64: archivedAssetBase64(buffer),
         size: buffer.byteLength,
         sha256: await sha256Bytes(buffer),
+        // What the bytes are, for callers that must not trust names or types.
+        ...(detect ? { detected: detectImageFormat(new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 1024))) } : {}),
       };
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
@@ -698,6 +748,94 @@
 
   const UNAVAILABLE_STATUSES = new Set([404, 410]);
   const isUnavailable = (error) => UNAVAILABLE_STATUSES.has(error?.status);
+
+  // A message file that is an image upload. Claude marks images with
+  // file_kind "image"; a declared image type or an image file name counts too.
+  const IMAGE_NAME = /\.(png|jpe?g|gif|webp|bmp|tiff?|avif|heic|heif)$/i;
+  function isImageMessageFile(file, name) {
+    if (String(file?.file_kind || '').toLowerCase() === 'image') return true;
+    const declared = String(file?.mime_type || file?.content_type || file?.file_type || '').toLowerCase();
+    if (declared.startsWith('image/')) return true;
+    return IMAGE_NAME.test(String(name || file?.file_name || ''));
+  }
+
+  const messageFileId = (file) => {
+    const id = file?.file_uuid || file?.uuid;
+    return typeof id === 'string' && id.trim() ? id : null;
+  };
+
+  // Claude's original upload of a file, by its file UUID. Observed on a real
+  // account to serve the uploaded image bytes (PNG/JPEG) where the message
+  // file's preview URL serves a lossy WebP preview; it answers 404 for some
+  // images, which means only that Claude did not serve the original then.
+  const filesApiUrl = (org, fileId) => `/api/organizations/${encodeURIComponent(org)}/files/${encodeURIComponent(fileId)}/contents`;
+
+  // An image downloaded from the Files API is accepted as the original only
+  // when its bytes are a recognised image. Its type and extension come from
+  // those bytes. Anything else is a failed download (retried by a later
+  // sync), never a reason to keep a preview instead.
+  function acceptOriginalImage(asset, name) {
+    // A file over the upload limit whose download was skipped (see
+    // fetchAsset) has no bytes to check; it is not archived either way.
+    if (!asset.base64 && asset.size > MAX_ARCHIVED_FILE_BYTES) return { ...asset, variant: 'original' };
+    if (!asset.detected) {
+      throw Object.assign(new Error(`Failed to download attachment "${safeAssetName(name)}": Claude's original file is not a recognised image.`), { category: 'download-failed' });
+    }
+    const { detected, ...rest } = asset;
+    return { ...rest, mime: detected.mime, detected_extension: detected.extension, variant: 'original' };
+  }
+
+  function knownPreviewOnly(conversationId, fileId) {
+    if (!knownPreviewOnlyImages || !conversationId || !fileId) return null;
+    return knownPreviewOnlyImages.get(String(conversationId))?.get(String(fileId)) || null;
+  }
+
+  // One image attached to a message: Claude's original first, then, only if
+  // Claude does not serve the original (404/410, or no file ID to ask for
+  // it), the message file's preview URL, archived and labelled as a preview.
+  // Any other failure of the original (403, 429, 5xx, network, bytes that are
+  // not an image) fails the download, so the conversation is retried by a
+  // later sync instead of silently keeping the preview.
+  async function downloadMessageImage(org, conversationId, file, url, name, signal) {
+    const fileId = messageFileId(file);
+    const declaredSize = declaredFileSize(file);
+    const known = knownPreviewOnly(conversationId, fileId);
+    let originalStatus = null;
+    let checkedAt = null;
+    let reason = 'no-file-id';
+    if (fileId && known) {
+      // The archive already holds only the preview: Claude did not serve the
+      // original at the recorded time. Not asked again by a normal sync.
+      originalStatus = known.original_status ?? null;
+      checkedAt = known.original_checked_at ?? null;
+      reason = 'original-unavailable';
+    } else if (fileId) {
+      try {
+        const original = await fetchAsset(filesApiUrl(org, fileId), name, null, signal, {
+          conversationId, fileUuid: fileId, declaredSize, route: 'files-api', detect: true,
+        });
+        return acceptOriginalImage(original, name);
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e;
+        if (!isUnavailable(e)) throw e;
+        originalStatus = e.status;
+        checkedAt = new Date().toISOString();
+        reason = 'original-unavailable';
+      }
+    }
+    // The preview has its own bytes and identity: it is not looked up as an
+    // oversized record of the original.
+    const preview = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal, { route: 'message-url', detect: true });
+    const { detected, ...rest } = preview;
+    return {
+      ...rest,
+      ...(detected ? { mime: detected.mime, detected_extension: detected.extension } : {}),
+      variant: 'preview',
+      preview_reason: reason,
+      ...(originalStatus != null ? { original_status: originalStatus } : {}),
+      ...(checkedAt ? { original_checked_at: checkedAt } : {}),
+    };
+  }
 
   // Claude gives some uploads only as a sandbox path ("file_kind": "blob",
   // "path": "/mnt/user-data/uploads/…", no URL; seen on a real account). The
@@ -923,17 +1061,21 @@
       directTasks,
       ASSET_DOWNLOAD_CONCURRENCY,
       async ({ message, file, url, name, messageExternalIds, messageReferences }) => {
+        const image = isImageMessageFile(file, name);
         try {
-          const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal, {
-            conversationId, fileUuid: file.file_uuid || file.uuid || null,
-            declaredSize: declaredFileSize(file),
-          });
+          const asset = image
+            ? await downloadMessageImage(org, conversationId, file, url, name, signal)
+            : await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal, {
+              conversationId, fileUuid: file.file_uuid || file.uuid || null,
+              declaredSize: declaredFileSize(file),
+            });
           return { asset, message, file, messageExternalIds, messageReferences };
         } catch (e) {
           if (!isUnavailable(e)) throw e;
           // Handled like a file without a URL: the sandbox may still hold it.
+          // For an image, Claude's original was already asked for.
           for (const referenced of messageReferences) {
-            filesWithoutDownloadUrl.push({ message: referenced, file, name, reason: `Claude returned HTTP ${e.status} for its download` });
+            filesWithoutDownloadUrl.push({ message: referenced, file, name, reason: `Claude returned HTTP ${e.status} for its download`, ...(image ? { originalTried: true } : {}) });
           }
           return null;
         }
@@ -1146,7 +1288,7 @@
     // a complete archive and later syncs retry it.
     const byPathCache = new Map();
     const filesApiAssetCache = new Map();
-    for (const { message, file, name, reason } of filesWithoutDownloadUrl) {
+    for (const { message, file, name, reason, originalTried = false } of filesWithoutDownloadUrl) {
       const messageId = message.uuid || message.id || null;
       const fileId = file.file_uuid || file.uuid || null;
       const nameKeys = new Set([
@@ -1200,7 +1342,10 @@
       // still be validated against a live account.
       const downloadSource = String(file?.download_source || '').toLowerCase().replace(/-/g, '_');
       const fileApiId = file.file_uuid || file.uuid || null;
-      if (file?.file_kind === 'blob' && downloadSource === 'files_api' && fileApiId) {
+      // An image without a preview URL is asked for its original the same
+      // way, unless that was already tried for it in this sync.
+      const imageOriginal = isImageMessageFile(file, name) && !originalTried && Boolean(messageFileId(file));
+      if (((file?.file_kind === 'blob' && downloadSource === 'files_api') || imageOriginal) && fileApiId) {
         const cached = filesApiAssetCache.get(String(fileApiId));
         if (cached) {
           if (messageId && !cached.message_external_ids.includes(messageId)) {
@@ -1213,12 +1358,13 @@
           continue;
         }
 
-        const url = `/api/organizations/${encodeURIComponent(org)}/files/${encodeURIComponent(fileApiId)}/contents`;
+        const url = filesApiUrl(org, fileApiId);
         try {
           downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal, {
             conversationId, fileUuid: fileApiId, route: 'files-api',
-            declaredSize: declaredFileSize(file),
+            declaredSize: declaredFileSize(file), detect: imageOriginal,
           });
+          if (imageOriginal) downloaded = acceptOriginalImage(downloaded, name);
           const linked = {
             ...downloaded,
             source: 'message',
@@ -1449,7 +1595,16 @@
             if (!oversized.has(String(item.id))) oversized.set(String(item.id), new Map());
             oversized.get(String(item.id)).set(String(item.file_uuid), { size: item.size, sha256: String(item.sha256) });
           }
-          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, error: null });
+          const previews = new Map();
+          for (const item of Array.isArray(response.previews) ? response.previews : []) {
+            if (!item?.id || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
+            if (!previews.has(String(item.id))) previews.set(String(item.id), new Map());
+            previews.get(String(item.id)).set(item.file_uuid, {
+              original_status: Number.isSafeInteger(item.original_status) ? item.original_status : null,
+              original_checked_at: typeof item.original_checked_at === 'string' ? item.original_checked_at : null,
+            });
+          }
+          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, previews, error: null });
         });
       } catch (error) {
         failed(error?.message || error);
@@ -1656,6 +1811,7 @@
       if (archivedState?.blocksSync) throw new Error(archivedState.error);
       const archived = archivedState?.state || null;
       knownOversizedFiles = archivedState?.oversized || null;
+      knownPreviewOnlyImages = archivedState?.previews || null;
       oversizedStats = newOversizedStats();
       const archiveStateError = archivedState?.error ? sanitizeError(archivedState.error) : null;
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');

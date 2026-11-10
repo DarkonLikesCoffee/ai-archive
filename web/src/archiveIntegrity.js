@@ -163,6 +163,15 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
         findings.push(finding('error', 'asset-size-mismatch', asset.path, `The index records ${asset.size} bytes; the repository file has ${blob.size}.`));
       }
     }
+    // Earlier image files a re-export kept instead of deleting (usually
+    // Claude's previews replaced by originals): referenced, not linked.
+    for (const kept of Array.isArray(entry.retained_assets) ? entry.retained_assets : []) {
+      if (typeof kept?.path !== 'string' || !kept.path) continue;
+      claim(kept.path, label, 'asset');
+      if (!blobs.has(kept.path)) {
+        findings.push(finding('warning', 'retained-asset-missing', kept.path, `A file the index lists as kept from an earlier export of ${label} is not in the repository.`));
+      }
+    }
     if (Array.isArray(entry.incomplete) && entry.incomplete.length) {
       const listed = entry.incomplete.slice(0, 5).map((item) => `${item?.name || item?.kind || 'file'} (${missingCategory(item)})`).join('; ');
       findings.push(finding('warning', 'conversation-incomplete', entry.path,

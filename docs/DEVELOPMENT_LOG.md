@@ -2,6 +2,29 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Original images instead of Claude's previews — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+- **Failure.** Image attachments were archived from Claude's WebP preview under the original's name (`….png`/`….jpg`): `collectMessageAssets` took `preview_asset.url || preview_url || document_asset.url` for every file, `fetchAsset` kept Claude's name and declared type, and `assetPath` took the extension from the name. The original route (`/files/{uuid}/contents`) was used only for `file_kind: blob` files. On the owner's archive this affects 729 images (read-only inventory; no private data in this repository).
+- **Evidence for the original route.** The owner's read-only DevTools probe and four verified full downloads: Claude served PNG/JPEG originals there for 4 images in 2 conversations; one SHA-256 equals the original already in the archive. Other images answered 404 (inconclusive). Claude's own names do not match the format either: three originals named `…_image.png` are JPEG.
+- **Change (based on `development`; PR #100 is not merged and not included).**
+  - `content.js`: for an image message file (`file_kind: image`, an image type or an image name) with a file UUID, the original is requested first and accepted only if its bytes are a recognised image (PNG, JPEG, GIF, WebP, BMP, TIFF, AVIF, HEIC/HEIF, SVG). Its MIME type and extension come from the bytes (`detectImageFormat`). Only on 404/410, or when there is no file UUID, is the preview archived, marked `variant: 'preview'` with the reason, status and time. Any other failure (403, 429, 5xx, network, non-image bytes) fails the conversation for this sync. Images without a preview URL take the same original route. Non-image files are unchanged.
+  - Archive state: images recorded as preview-only are not asked for again by a normal sync; a "Latest N" sync (no archive state) asks again.
+  - `background.js`: paths take the detected extension; preview images get a visible "Preview only" note; index assets gain `variant`; entries gain `previews[]` (not `incomplete`, so still skippable) and `retained_assets[]`. When an export that records `variant` replaces an earlier image, the earlier file is kept and listed instead of deleted.
+  - Web verifier: `retained_assets` count as referenced; a missing one is a warning. The rebuild dry run lists `previews`/`retained_assets` as not recoverable.
+  - Format documented in `docs/archive-format-v1.md` ("Image originals and previews"). `EXPORTER_VERSION` unchanged: nothing already archived is re-exported by this change.
+- **Tests (all synthetic images; no real images or hashes committed).**
+  - `node --test extension/*.test.js`: 243/243. 12 new content tests: original-first in an upgraded workspace; JPEG under a `.png` name; every recognised format; 404 and 410 fall back to a labelled preview; 403, 429, 500, 503, network error, non-image bytes and a truncated signature fail the conversation without requesting the preview; no file ID; sandbox workspace dedup and the unchanged name-collision rule; no preview URL; both unavailable; known preview-only not re-asked, but re-asked by Latest N; non-image files unchanged. 7 new background tests: path extensions, Markdown notes, index fields and shape compatibility, keeping the replaced preview, carrying kept files forward, unchanged deletion for older exports, archive state. The test harness answers an unconfigured Files API request with 404.
+  - With original-first disabled, 9 of the new content tests fail. With retention disabled, the retention test fails.
+  - `cd web && npm test`: 111/111 (2 new). `npm run build`: OK.
+  - `node e2e/extension-sync.e2e.cjs`: exit 0, 53 PASS, 0 FAIL. It now serves a synthetic original for the pasted map and checks the archive holds it as `map.jpg`, `variant: original`, with the preview never requested.
+  - `node web/e2e/viewer.e2e.cjs`: exit 0.
+- **Not verified.** No live Claude or real-archive run. The live check (one conversation, separate test repository, compare against the owner's recovered originals) awaits the owner's approval.
+- **Risks.**
+  - The Files API is undocumented.
+  - A 403 on originals (if Claude ever answers so for images) would fail those conversations every sync until handled.
+  - When PR #100 merges, its sandbox `uploads/` rule must be reconciled with this change: with an original from the Files API, the sandbox copy has the same bytes and is deduplicated; with a preview fallback, PR #100 would also archive the sandbox original, and that preview should then not be listed in `previews`.
+- **Next task.** The owner-approved live test (procedure in the PR). Then design the explicit, opt-in recovery for already-archived previews, with a dry run, never touching unrelated conversations.
+
 ## First real integrity run diagnosed; self-explaining findings — 2026-11-06 (web 0.6.17)
 
 - **Owner's run (web 0.6.16, `--markdown --hashes`).** 824 conversations, 1,420 attachments hashed, 931 Markdown files, 381.8 MB in 2,298 requests, 0 retries, 0 failures; 6 errors and 60 warnings (56 `file-unreferenced`, 4 `conversation-incomplete`).
