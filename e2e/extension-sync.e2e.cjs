@@ -27,6 +27,10 @@ const OWNER = 'me';
 const REPO = 'archive';
 const TOKEN = 'good-token';
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==', 'base64');
+// The original upload of the pasted map: synthetic JPEG bytes (a JPEG
+// signature and test data), which Claude names "map.png" and previews as
+// another image. The archive must hold these bytes, as a .jpg.
+const MAP_ORIGINAL = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]), Buffer.from('JFIF synthetic map original'), Buffer.from([0xff, 0xd9])]);
 
 const check = (name, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`);
@@ -194,6 +198,8 @@ function handleClaude(url) {
   const big = url.pathname.match(/^\/api\/fake-assets\/big-(\d+)\.bin$/);
   if (big && BIG_FILES[Number(big[1])]) return { status: 200, contentType: 'application/octet-stream', body: BIG_FILES[Number(big[1])] };
   if (url.pathname === '/api/fake-assets/map.png') return { status: 200, contentType: 'image/png', body: PNG };
+  // Claude's Files API: the original upload of the pasted map.
+  if (url.pathname === `/api/organizations/${ORG}/files/img-1/contents`) return { status: 200, contentType: 'image/png', body: MAP_ORIGINAL };
   if (url.pathname.startsWith('/api/')) return { status: 404, body: 'not found' };
   return { status: 200, contentType: 'text/html', body: '<!doctype html><title>Claude</title><p>Fake claude.ai</p>' };
 }
@@ -270,7 +276,11 @@ function handleClaude(url) {
     const tripPath = mdPaths.find((file) => files[file].toString().includes('Lisbon'));
     const trip = tripPath ? files[tripPath].toString() : '';
     check('Markdown keeps both turns', trip.includes('## You') && trip.includes('Day one: Alfama'));
-    check('image attachment is archived byte-for-byte', assetPaths.length === 1 && files[assetPaths[0]].equals(PNG), assetPaths.join(', '));
+    check('image attachment is archived byte-for-byte from its original upload, under the extension of its bytes', assetPaths.length === 1 && files[assetPaths[0]].equals(MAP_ORIGINAL) && assetPaths[0].endsWith('-map.jpg'), assetPaths.join(', '));
+    const tripEntry = index.conversations.find((c) => c.path === tripPath);
+    check('the index records the image as the original, as a JPEG, with no previews', tripEntry?.assets?.[0]?.variant === 'original' && tripEntry.assets[0].mime === 'image/jpeg' && tripEntry.assets[0].name === 'map.png' && !tripEntry.previews && !tripEntry.incomplete, JSON.stringify(tripEntry?.assets));
+    check('the preview is not downloaded when the original is served', !claudeRequests.includes('/api/fake-assets/map.png') && claudeRequests.includes(`/api/organizations/${ORG}/files/img-1/contents`));
+    check('the Markdown does not call the original a preview', !trip.includes('Preview only'));
     check('Markdown embeds the archived image', assetPaths.length === 1 && trip.includes(`](${path.posix.relative(path.posix.dirname(tripPath), assetPaths[0])}`), trip.match(/!\[[^\]]*\]\([^)]*\)/)?.[0]);
 
     // Nothing changed: incremental sync downloads nothing and commits nothing.

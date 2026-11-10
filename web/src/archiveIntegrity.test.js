@@ -228,3 +228,26 @@ test('scanAssetLinks: one entry per target with counts, fences and inline code',
   const links = scanAssetLinks('a [x](assets/d/1.png) `[y](assets/d/2.png)`\n~~~\n[z](assets/d/1.png)\n~~~\n[x](assets/d/1.png)\n````\n```\n[w](assets/d/3.png)\n````\n');
   assert.deepEqual(links.map((l) => [l.ref, l.count, l.inCode]), [['assets/d/1.png', 3, false], ['assets/d/2.png', 1, true], ['assets/d/3.png', 1, true]]);
 });
+
+test('images kept from an earlier export are referenced, not orphans; a missing kept file is a warning', async () => {
+  const archive = cleanArchive();
+  const kept = `${ROOT}/assets/conv-a/2-map.png`;
+  archive.files.set(kept, bytes('synthetic preview bytes'));
+  archive.index.conversations[0].assets[0].variant = 'original';
+  archive.index.conversations[0].retained_assets = [{ path: kept, name: 'map.png', mime: 'image/webp' }];
+  archive.index.conversations[0].previews = [];
+  const clean = await auditArchive(inputs(archive));
+  assert.deepEqual(codes(clean), [], 'a kept file and the new fields raise nothing');
+
+  archive.files.delete(kept);
+  const missing = await auditArchive(inputs(archive));
+  assert.deepEqual(codes(missing), [`warning:retained-asset-missing:${kept}`]);
+});
+
+test('without retained_assets, the same file is still reported as unreferenced', async () => {
+  const archive = cleanArchive();
+  const stray = `${ROOT}/assets/conv-a/2-map.png`;
+  archive.files.set(stray, bytes('synthetic preview bytes'));
+  const result = await auditArchive(inputs(archive));
+  assert.deepEqual(codes(result), [`warning:file-unreferenced:${stray}`]);
+});

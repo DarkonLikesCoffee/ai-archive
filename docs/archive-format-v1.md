@@ -125,6 +125,60 @@ The attachment path is stable and provider/account scoped:
 archive/conversations/<provider>/<account>/<conversation assets>
 ```
 
+### Image originals and previews (extension 0.5.29)
+
+Claude serves each uploaded image in two forms: the original upload, through
+`/api/organizations/{org}/files/{file_uuid}/contents`, and a smaller lossy
+WebP preview through the message file's `preview_asset.url`. Exporters before
+0.5.29 archived only the preview, under Claude's file name (often `….png` or
+`….jpg`), so those files are WebP bytes behind a misleading extension.
+
+From 0.5.29 an image attachment is exported as follows:
+
+1. The original is requested first. It is accepted only when its bytes are a
+   recognised image (PNG, JPEG, GIF, WebP, BMP, TIFF, AVIF, HEIC/HEIF or
+   SVG). Its `mime` and its path's extension come from those bytes; the
+   index `name` and the Markdown label keep Claude's file name.
+2. Only when Claude answers the original with 404/410, or the file has no
+   Claude file UUID, is the preview archived instead. It is stored under its
+   real extension (normally `.webp`) and the Markdown shows a note under the
+   image: `*Preview only: this is Claude's preview image, not the original
+   upload. …*`. A 404/410 means only that Claude did not serve the original
+   when the conversation was archived.
+3. Any other failure of the original (403, 429, 5xx, network error, bytes
+   that are not an image) fails the conversation for that sync; a later sync
+   retries it. A preview is never substituted silently.
+
+Index fields (all optional and additive; readers ignore them when absent):
+
+- `assets[].variant`: `"original"` or `"preview"`, on image assets written
+  by 0.5.29 or later. Absent on every other asset and on all older entries,
+  whose images may be either.
+- `previews[]`: one item per image archived only as a preview:
+  `path`, `name`, `file_uuid` (when Claude gave one), `message_external_id`,
+  `reason` (`original-unavailable` or `no-file-id`), and for
+  `original-unavailable` the `original_status` (404/410) and
+  `original_checked_at` (when Claude was asked). A conversation with previews
+  is **not** `incomplete`: incremental sync may still skip it, and a normal
+  sync does not ask Claude for those originals again. An explicit "Latest N"
+  sync asks again, as does any re-export of the conversation that has no
+  archive state. These items are the identity a later, explicit recovery
+  needs.
+- `retained_assets[]`: files a re-export no longer links but deliberately
+  kept instead of deleting: when an export that records `variant` replaces an
+  earlier image (normally a preview under a `.png`/`.jpg` name), the earlier
+  file stays in the repository and is listed here with its `path`, `sha256`,
+  `size`, `mime` and `name`. Later syncs keep the list. Nothing is moved or
+  rewritten.
+
+Migration: none. `exporter_version` is unchanged, so already-archived
+conversations are not re-exported by this change; old entries remain valid
+and readable. A conversation is exported with originals the next time it is
+re-exported for any other reason (it changed on Claude, or a "Latest N" sync
+includes it). An index rebuild (dry run) cannot recover `previews[]`,
+`retained_assets[]` or `variant` from Markdown alone; only the visible
+"Preview only" notes survive.
+
 ## Index contract
 
 The current index has a top-level `version` and each conversation entry has `format_version`.
