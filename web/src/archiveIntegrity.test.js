@@ -235,7 +235,8 @@ test('images kept from an earlier export are referenced, not orphans; a missing 
   archive.files.set(kept, bytes('synthetic preview bytes'));
   archive.index.conversations[0].assets[0].variant = 'original';
   archive.index.conversations[0].retained_assets = [{ path: kept, name: 'map.png', mime: 'image/webp' }];
-  archive.index.conversations[0].previews = [];
+  archive.index.conversations[0].preview_only = [];
+  archive.index.requires_extension = '0.5.29';
   const clean = await auditArchive(inputs(archive));
   assert.deepEqual(codes(clean), [], 'a kept file and the new fields raise nothing');
 
@@ -250,4 +251,36 @@ test('without retained_assets, the same file is still reported as unreferenced',
   archive.files.set(stray, bytes('synthetic preview bytes'));
   const result = await auditArchive(inputs(archive));
   assert.deepEqual(codes(result), [`warning:file-unreferenced:${stray}`]);
+});
+
+test('an original with its preview is consistent; a dangling preview_of or a contradicting preview_only is a warning', async () => {
+  const archive = cleanArchive();
+  const preview = `${ROOT}/assets/conv-a/2-map.webp`;
+  archive.files.set(preview, bytes('synthetic preview'));
+  archive.files.set(`${ROOT}/A--conv-a.md`, bytes(`# A\n\n![map.png](assets/conv-a/1-map.png)\n\n*Also archived: [Claude's preview of this image](assets/conv-a/2-map.webp).*\n`));
+  const entry = archive.index.conversations[0];
+  archive.index.requires_extension = '0.5.29';
+  entry.assets[0].variant = 'original';
+  entry.assets.push({ path: preview, size: 17, sha256: sha(bytes('synthetic preview')), name: 'map.png', variant: 'preview', preview_of: entry.assets[0].path });
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), []);
+
+  entry.preview_only = [{ path: preview, name: 'map.png', reason: 'original-unavailable' }];
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), [`warning:preview-only-has-original:${preview}`]);
+  delete entry.preview_only;
+
+  entry.assets[1].preview_of = `${ROOT}/assets/conv-a/gone.png`;
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), [`warning:preview-of-missing:${preview}`]);
+  entry.assets[1].preview_of = entry.assets[0].path;
+
+  entry.preview_only = [{ path: `${ROOT}/assets/conv-a/not-indexed.webp`, name: 'x.png', reason: 'original-unavailable' }];
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), [`warning:preview-only-unlisted:${ROOT}/assets/conv-a/not-indexed.webp`]);
+});
+
+test('original-first records without the requires_extension marker report an older extension; older archives do not', async () => {
+  const archive = cleanArchive();
+  archive.index.conversations[0].assets[0].variant = 'original';
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), ['warning:older-extension-wrote:archive/index.json']);
+  archive.index.requires_extension = '0.5.29';
+  assert.deepEqual(codes(await auditArchive(inputs(archive))), []);
+  assert.deepEqual(codes(await auditArchive(inputs(cleanArchive()))), [], 'an archive from before 0.5.29 raises nothing');
 });

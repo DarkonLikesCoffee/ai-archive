@@ -357,6 +357,7 @@ globalThis.__testHooks = {
   conversationPath, indexEntry, sha256, archiveState, archiveSyncState, archiveAccounts, broadcast,
   createBlob, gitHubError, syncCommitMessage, base64RequestBytes, formatBytes,
   MAX_BLOB_REQUEST_BYTES, MAX_ARCHIVED_FILE_BYTES, BlobTooLargeError,
+  EXTENSION_VERSION, ARCHIVE_REQUIRES_EXTENSION, compareVersions,
 };
 `, context, { filename: 'extension/background.js' });
 
@@ -2843,7 +2844,7 @@ test('the index records which images are originals and which are previews, witho
   assert.deepEqual(assets.map((a) => a.variant ?? null), ['original', 'preview', null], 'files that are not images get no variant');
   assert.deepEqual(assets.map((a) => a.mime), ['image/jpeg', 'image/webp', 'text/plain']);
   assert.equal(Object.keys(assets[2]).join(','), 'path,sha256,size,mime,name', 'other assets keep exactly their old shape');
-  assert.deepEqual(plainJson(entry.previews), [{
+  assert.deepEqual(plainJson(entry.preview_only), [{
     path: assets[1].path, name: 'b.png', file_uuid: 'img-b', message_external_id: 'conv-index-m1',
     reason: 'original-unavailable', original_status: 410, original_checked_at: '2026-11-10T10:00:00.000Z',
   }]);
@@ -2906,7 +2907,7 @@ test('an export that does not tell originals from previews still deletes a remov
 });
 
 test('the archive state lists preview-only images so a normal sync does not ask for them again, and they stay skippable', async () => {
-  const entry = (id, account, previews, extra = {}) => ({ id, provider: 'claude', account, path: `archive/conversations/claude/${account}/${id}.md`, assets: [], previews, exporter_version: 1, updated_at: '2026-10-01T00:00:00Z', ...extra });
+  const entry = (id, account, previews, extra = {}) => ({ id, provider: 'claude', account, path: `archive/conversations/claude/${account}/${id}.md`, assets: [], preview_only: previews, exporter_version: 1, updated_at: '2026-10-01T00:00:00Z', ...extra });
   const index = { version: 2, conversations: [
     entry('c1', 'personal', [
       { path: 'p1', name: 'a.png', file_uuid: 'u1', reason: 'original-unavailable', original_status: 404, original_checked_at: '2026-10-01T00:00:00.000Z' },
@@ -2917,6 +2918,135 @@ test('the archive state lists preview-only images so a normal sync does not ask 
   ] };
   const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify(index) });
   const state = await harness.hooks.archiveSyncState();
-  assert.deepEqual(plainJson(state.previews), [{ id: 'c1', file_uuid: 'u1', original_status: 404, original_checked_at: '2026-10-01T00:00:00.000Z' }], 'only this account, and only originals Claude did not serve');
+  assert.deepEqual(plainJson(state.preview_only), [{ id: 'c1', file_uuid: 'u1', original_status: 404, original_checked_at: '2026-10-01T00:00:00.000Z' }], 'only this account, and only originals Claude did not serve');
   assert.deepEqual(plainJson(state.conversations), [{ id: 'c1', updated_at: '2026-10-01T00:00:00Z' }], 'a conversation with previews is not incomplete, so it can be skipped');
+});
+
+// ---------------------------------------------------------------------------
+// Originals with their previews, display copies, and downgrade protection.
+// Synthetic bytes only.
+// ---------------------------------------------------------------------------
+
+const pairedConversation = (id, { originalMime = 'image/png', originalExtension = 'png', name = '1700000000000_image.png' } = {}) => {
+  const original = imageAsset(name, `original ${id}`, { file_uuid: 'img-p', mime: originalMime, detected_extension: originalExtension, variant: 'original', source: 'sandbox', source_path: `/mnt/user-data/uploads/${name}` });
+  const preview = imageAsset(name, `preview ${id}`, { file_uuid: 'img-p', mime: 'image/webp', detected_extension: 'webp', variant: 'preview', original_sha256: original.sha256 });
+  return { conversation: imageConversationWith(id, [original, preview]), original, preview };
+};
+const linkCount = (markdown, path) => markdown.split(`](assets/${path.split('/assets/').pop()})`).length - 1;
+
+test('an original and its preview are both archived and linked once, the original as the image', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const { conversation } = pairedConversation('conv-pair');
+  const { entry, markdown } = await buildIndexEntry(hooks, conversation);
+  const [original, preview] = plainJson(entry.assets);
+  assert.equal(original.variant, 'original');
+  assert.match(original.path, /_image\.png$/);
+  assert.equal(preview.variant, 'preview');
+  assert.match(preview.path, /_image\.webp$/);
+  assert.equal(preview.preview_of, original.path, 'the preview names its original');
+  assert.equal(original.preview_of, undefined);
+  assert.equal(entry.preview_only, undefined, 'an image whose original is archived is not preview-only');
+  assert.equal(entry.incomplete, undefined);
+  assert.ok(markdown.includes(`![1700000000000\\_image.png](assets/${original.path.split('/assets/').pop()})\n\n*Also archived: [Claude's preview of this image](assets/${preview.path.split('/assets/').pop()}).*`));
+  assert.equal(linkCount(markdown, original.path), 1);
+  assert.equal(linkCount(markdown, preview.path), 1);
+  assert.equal(markdown.includes('Preview only'), false);
+});
+
+test('an original the viewer cannot display is linked unchanged, with its preview shown inline', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  for (const [mime, extension] of [['image/heic', 'heic'], ['image/tiff', 'tiff'], ['image/svg+xml', 'svg']]) {
+    const { conversation } = pairedConversation(`conv-${extension}`, { originalMime: mime, originalExtension: extension, name: `photo.${extension}` });
+    const { entry, markdown } = await buildIndexEntry(hooks, conversation);
+    const [original, preview] = plainJson(entry.assets);
+    assert.equal(original.mime, mime);
+    assert.ok(original.path.endsWith(`photo.${extension}`), extension);
+    assert.equal(preview.preview_of, original.path, extension);
+    const rel = (p) => `assets/${p.split('/assets/').pop()}`;
+    assert.ok(markdown.includes(`![photo.${extension}](${rel(preview.path)})`), `${extension}: the preview is the inline image`);
+    assert.ok(markdown.includes(`The original upload is archived unchanged as [photo.${extension}](${rel(original.path)})`), `${extension}: the original is linked`);
+    assert.equal(linkCount(markdown, original.path), 1, extension);
+    assert.equal(linkCount(markdown, preview.path), 1, extension);
+    assert.equal(entry.preview_only, undefined, extension);
+  }
+});
+
+test('a preview whose original was downloaded but is too large to archive is preview-only, with that reason', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const { conversation, original } = pairedConversation('conv-big');
+  conversation.assets[0] = { ...conversation.assets[0], size: hooks.MAX_ARCHIVED_FILE_BYTES + 1, base64: '' };
+  const normalized = hooks.normalizeAssetList(conversation, 'claude', 'personal');
+  const entry = hooks.indexEntry(conversation, 'archive/x.md', 'claude', 'personal', normalized.assets);
+  assert.equal(entry.assets.length, 1, 'the original is not archived');
+  assert.equal(entry.assets[0].preview_of, undefined);
+  assert.equal(plainJson(entry.preview_only)[0].reason, 'original-not-archived');
+  assert.ok(original.sha256);
+});
+
+test('re-exporting an archived preview as an original plus preview keeps the earlier file', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const name = '1700000000000_image.png';
+  const { entry: previous } = await buildIndexEntry(hooks, imageConversationWith('conv-rp', [imageAsset(name, 'old webp preview', { file_uuid: 'img-p', mime: 'image/webp' })]));
+  const oldPath = previous.assets[0].path;
+  const { conversation } = pairedConversation('conv-rp');
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, updated_at: '', conversations: [previous] }) });
+  await harness.sync([conversation], () => {});
+  const tree = harness.requests.find((request) => request.pathname.endsWith('/git/trees') && request.method === 'POST').body.tree;
+  assert.equal(tree.some((item) => item.path === oldPath && item.sha === null), false, 'nothing is deleted');
+  const [entry] = indexOf(harness).conversations;
+  assert.deepEqual(entry.assets.map((a) => a.variant), ['original', 'preview']);
+  assert.deepEqual(entry.retained_assets.map((a) => a.path), [oldPath]);
+  assert.equal(entry.preview_only, undefined);
+});
+
+test('every index this version writes records the oldest extension allowed to write to it', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  await harness.sync(sampleConversation(), () => {});
+  const index = indexOf(harness);
+  assert.equal(index.requires_extension, '0.5.29');
+  assert.equal(index.version, 2, 'the index structure version is unchanged');
+});
+
+test('the extension version in background.js equals manifest.json', async () => {
+  const harness = makeBackgroundSyncHarness({ indexText: emptyIndex() });
+  const manifest = JSON.parse(await readFile(fileURLToPath(new URL('./manifest.json', import.meta.url)), 'utf8'));
+  assert.equal(harness.hooks.EXTENSION_VERSION, manifest.version);
+  assert.ok(harness.hooks.compareVersions(harness.hooks.EXTENSION_VERSION, harness.hooks.ARCHIVE_REQUIRES_EXTENSION) >= 0);
+});
+
+test('an extension older than the archive requires refuses to sync it, before anything is written', async () => {
+  for (const required of ['0.5.30', '0.6.0', '1.0', 'not-a-version']) {
+    const index = { version: 2, requires_extension: required, updated_at: '', conversations: [] };
+    const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify(index) });
+    await assert.rejects(harness.sync(sampleConversation(), () => {}), (error) => {
+      assert.equal(error.blocksSync, true, required);
+      assert.match(error.message, /This archive requires AI Archive .* or later; this extension is 0\.5\.29\. Update the extension before syncing\. No archive changes were published\./);
+      return true;
+    }, required);
+    await assert.rejects(harness.hooks.archiveSyncState(), /requires AI Archive/, `${required}: the incremental state refuses too`);
+    assert.equal(harness.requests.some((request) => request.method === 'POST' || request.method === 'PATCH'), false, `${required}: nothing written`);
+  }
+  for (const required of ['0.5.29', '0.5.28', '0.4']) {
+    const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: required, updated_at: '', conversations: [] }) });
+    await harness.sync(sampleConversation(), () => {});
+    assert.equal(indexOf(harness).requires_extension, '0.5.29', `${required}: synced, and the marker is current`);
+  }
+});
+
+test('an index with original-first records but no marker reports that an older extension wrote to the archive', async () => {
+  const hooks = loadBackgroundAssetHelpers();
+  const { entry: withVariants } = await buildIndexEntry(hooks, pairedConversation('conv-old-writer').conversation);
+  const cases = [
+    ['variant records, no marker', { version: 2, updated_at: '', conversations: [withVariants] }, true],
+    ['variant records with the marker', { version: 2, requires_extension: '0.5.29', updated_at: '', conversations: [withVariants] }, false],
+    ['an archive from before 0.5.29', { version: 2, updated_at: '', conversations: [] }, false],
+  ];
+  for (const [label, index, expected] of cases) {
+    const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify(index) });
+    const messages = [];
+    const result = await harness.sync(sampleConversation(), (progress) => { if (progress?.stage === 'done') messages.push(progress.message); });
+    assert.equal(Boolean(result.report.olderExtensionWrote), expected, label);
+    assert.equal(result.partial, expected, `${label}: shown as a sync with problems`);
+    assert.equal(/older than 0\.5\.29 has written to this archive/.test(messages.join(' ')), expected, `${label}: the summary says so`);
+  }
 });

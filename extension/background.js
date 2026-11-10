@@ -8,6 +8,15 @@ const SEARCH_TEXT_ENCODING = 'gzip-base64';
 // Incremental sync only skips conversations archived by the current version,
 // so a bump re-exports every conversation once on its next sync.
 const EXPORTER_VERSION = 1;
+// This extension's version (must equal manifest.json; a test checks it), and
+// the oldest extension version that may write to an archive this version
+// wrote. Every index this version writes records the latter as
+// requires_extension, and an extension older than an archive's
+// requires_extension refuses to sync it (see loadArchiveIndex). Extensions
+// before 0.5.29 never check it; they rewrite the index without it, which is
+// how a later sync notices them (see olderExtensionWroteArchive).
+const EXTENSION_VERSION = '0.5.29';
+const ARCHIVE_REQUIRES_EXTENSION = '0.5.29';
 let activeGitHubSettings = null;
 let syncAbortController = null;
 let cancelRequested = false;
@@ -510,12 +519,31 @@ function assetMarkdown(asset, path) {
   return `[${label}](${rel})`;
 }
 
+// Image types the web viewer shows inline (SAFE_INLINE_IMAGE_MIMES in
+// web/src/attachmentSecurity.js; DISPLAYABLE_IMAGE_MIMES in content.js).
+const DISPLAYABLE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/avif', 'image/x-icon']);
+const isDisplayableImage = (asset) => DISPLAYABLE_IMAGE_MIMES.has(String(asset?.mime || '').toLowerCase().split(';')[0].trim());
+
+// An original and Claude's preview of it, both archived. The original is the
+// image when the viewer can show it; otherwise (HEIC, HEIF, TIFF, SVG) the
+// preview is shown and the original, unchanged, is linked next to it.
+function pairedImageMarkdown(original, preview) {
+  const rel = (path) => `assets/${String(path).split('/assets/').pop()}`;
+  const label = escapeMarkdownLabel(original.name || 'file');
+  if (original.omitted || isDisplayableImage(original)) {
+    return `${assetMarkdown(original, original.path)}\n\n*Also archived: [Claude's preview of this image](${rel(preview.path)}).*`;
+  }
+  return `![${label}](${rel(preview.path)})\n\n*Shown: Claude's preview. The original upload is archived unchanged as [${label}](${rel(original.path)}) (${escapeMd(String(original.mime || 'image'))}), a format the archive viewer does not display inline.*`;
+}
+
 // Shown under an image archived from Claude's preview, so nobody mistakes it
 // for the uploaded original. A 404/410 means only that Claude did not serve
 // the original when this conversation was archived.
 function previewOnlyNote(asset) {
   const why = asset.preview_reason === 'no-file-id'
     ? 'Claude gave no file ID to request the original upload'
+    : asset.original_sha256
+      ? 'The original upload was downloaded but could not be archived (see the note about it)'
     : `Claude did not serve the original upload${Number.isSafeInteger(asset.original_status) ? ` (HTTP ${asset.original_status})` : ''} when this conversation was archived`;
   return `*Preview only: this is Claude's preview image, not the original upload. ${why}.*`;
 }
@@ -706,7 +734,16 @@ function attachmentMarkdown(message, assetMap, allAssets, missing = []) {
     // this message body, so do not repeat them in its trailing attachment list.
     // Other messages sharing the asset still list it as a normal attachment.
     if (!asset || used.has(asset.path) || inlineIndicesForMessage(asset, message).length) return;
+    // A preview kept next to its original is rendered with that original.
+    const original = asset.preview_of ? allAssets.find((other) => other.path === asset.preview_of) : null;
+    if (original && !used.has(original.path)) { addAsset(original); if (used.has(asset.path)) return; }
     used.add(asset.path);
+    const preview = allAssets.find((other) => other.preview_of === asset.path && !used.has(other.path));
+    if (preview) {
+      used.add(preview.path);
+      parts.push(pairedImageMarkdown(asset, preview));
+      return;
+    }
     parts.push(assetMarkdown(asset, asset.path));
   };
 
@@ -864,6 +901,14 @@ function normalizeAssetList(c, provider, accountSlug) {
     if (raw.name && !byKey.has(`name:${raw.name}`)) byKey.set(`name:${raw.name}`, asset);
     if (raw.source_path) byKey.set(`source:${raw.source_path}`, asset);
   }
+  // A preview kept next to its original names it by SHA-256 (see content.js);
+  // here it gets the original's path, when that original is archived.
+  const archivedOriginals = new Map(assets.filter((a) => a.variant === 'original' && !a.omitted).map((a) => [a.sha256, a]));
+  for (const asset of assets) {
+    if (asset.variant !== 'preview' || !asset.original_sha256) continue;
+    const original = archivedOriginals.get(asset.original_sha256);
+    if (original) asset.preview_of = original.path;
+  }
   return { assets, byKey, omissions };
 }
 
@@ -901,8 +946,11 @@ function retainedAssetsFor(previous, entry, previousAssets, existingPaths) {
   return [...kept.values()];
 }
 
+// Images archived only as Claude's preview: their original is not in the
+// archive. A preview kept next to its archived original (preview_of) is not
+// one of them.
 function previewItems(assets) {
-  return (assets || []).filter((a) => a?.variant === 'preview' && !a.omitted && a.path).map((a) => {
+  return (assets || []).filter((a) => a?.variant === 'preview' && !a.omitted && a.path && !a.preview_of).map((a) => {
     const messageIds = Array.isArray(a.message_external_ids) && a.message_external_ids.length
       ? a.message_external_ids
       : (a.message_external_id ? [a.message_external_id] : []);
@@ -911,7 +959,7 @@ function previewItems(assets) {
       name: String(a.name || 'file'),
       ...(a.file_uuid ? { file_uuid: String(a.file_uuid) } : {}),
       ...(messageIds.length ? { message_external_id: String(messageIds[0]) } : {}),
-      reason: a.preview_reason === 'no-file-id' ? 'no-file-id' : 'original-unavailable',
+      reason: a.preview_reason === 'no-file-id' ? 'no-file-id' : a.original_sha256 ? 'original-not-archived' : 'original-unavailable',
       ...(Number.isSafeInteger(a.original_status) ? { original_status: a.original_status } : {}),
       ...(typeof a.original_checked_at === 'string' && a.original_checked_at ? { original_checked_at: a.original_checked_at } : {}),
     };
@@ -933,6 +981,7 @@ function indexEntry(c, path, provider, account, assets) {
     assets: assets.filter((a) => !a.omitted).map((a) => ({
       path: a.path, sha256: a.sha256, size: a.size, mime: a.mime, name: a.name,
       ...(ASSET_VARIANTS.has(a.variant) ? { variant: a.variant } : {}),
+      ...(a.variant === 'preview' && a.preview_of ? { preview_of: a.preview_of } : {}),
     })),
     format_version: 4,
     exporter_version: EXPORTER_VERSION,
@@ -942,7 +991,7 @@ function indexEntry(c, path, provider, account, assets) {
     // Images archived only as Claude's preview. Not incomplete: the
     // conversation can be skipped by later syncs. Their identity is kept so an
     // explicit later attempt can ask Claude for the original again.
-    ...(previewItems(assets).length ? { previews: previewItems(assets) } : {}),
+    ...(previewItems(assets).length ? { preview_only: previewItems(assets) } : {}),
     preview: String(contents.find(Boolean) || '').slice(0, 300),
     search_text: [c.title, ...contents].join('\n').slice(0, 250000),
   };
@@ -1076,8 +1125,9 @@ function sanitizeOversizedStats(value) {
 
 // One sentence per outcome other than "written", so a partial sync is never
 // mistaken for a complete one. `report` lists every conversation by ID.
+const OLDER_EXTENSION_WARNING = 'Warning: an AI Archive extension older than 0.5.29 has written to this archive since it began recording original images. In conversations it re-exported, it may have replaced original images with Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.';
 function syncReportSummary(report) {
-  let text = '';
+  let text = report.olderExtensionWrote ? ` ${OLDER_EXTENSION_WARNING}` : '';
   if (report.listed != null) text += ` Claude listed ${plural(report.listed, 'conversation', 'conversations')}.`;
   if (report.unchanged) text += ` ${plural(report.unchanged, 'unchanged conversation was', 'unchanged conversations were')} not downloaded again.`;
   const skippedBytes = report.oversized?.skipped_bytes;
@@ -1121,6 +1171,31 @@ function archiveBlocked(message) {
 
 // Read the branch head, its full tree, and archive/index.json exactly as a
 // sync sees them. Shared by sync() and the incremental-sync archive state.
+// Compares dotted numeric versions ("0.5.29"); NaN when either is not one.
+function compareVersions(a, b) {
+  const parse = (v) => (/^\d+(\.\d+){0,3}$/.test(String(v)) ? String(v).split('.').map(Number) : null);
+  const x = parse(a);
+  const y = parse(b);
+  if (!x || !y) return NaN;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d) return Math.sign(d);
+  }
+  return 0;
+}
+
+// True when the index holds records only 0.5.29 or later writes (image
+// variants, preview-only images, kept files) but not the requires_extension
+// marker every such version writes with them: an older extension rewrote the
+// index since, and it may have replaced original images with previews in the
+// conversations it re-exported.
+function olderExtensionWroteArchive(index) {
+  if (!index || index.requires_extension != null) return false;
+  return (Array.isArray(index.conversations) ? index.conversations : []).some((entry) => entry && (
+    (Array.isArray(entry.assets) && entry.assets.some((asset) => ASSET_VARIANTS.has(asset?.variant)))
+    || Array.isArray(entry.preview_only) || Array.isArray(entry.retained_assets)));
+}
+
 async function loadArchiveIndex(ref) {
   const branch = ref ? ref.ref.split('/').pop() : 'main';
   let index = { version: 2, updated_at: new Date().toISOString(), conversations: [] };
@@ -1152,6 +1227,11 @@ async function loadArchiveIndex(ref) {
     }
     if (!parsedIndex || !Array.isArray(parsedIndex.conversations)) {
       throw archiveBlocked('archive/index.json has an invalid structure. Expected a conversations array; no archive changes were published.');
+    }
+    // An archive written by a newer extension may hold records this version
+    // does not understand; syncing could replace or drop them.
+    if (parsedIndex.requires_extension != null && !(compareVersions(EXTENSION_VERSION, parsedIndex.requires_extension) >= 0)) {
+      throw archiveBlocked(`This archive requires AI Archive ${String(parsedIndex.requires_extension).slice(0, 40)} or later; this extension is ${EXTENSION_VERSION}. Update the extension before syncing. No archive changes were published.`);
     }
     index = parsedIndex;
   }
@@ -1283,7 +1363,7 @@ async function archiveSyncState() {
   const previews = [];
   for (const entry of index.conversations) {
     if (entry?.provider !== 'claude' || entry.account !== account || entry.id == null) continue;
-    for (const item of Array.isArray(entry.previews) ? entry.previews : []) {
+    for (const item of Array.isArray(entry.preview_only) ? entry.preview_only : []) {
       if (item?.reason !== 'original-unavailable' || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
       previews.push({
         id: String(entry.id),
@@ -1300,7 +1380,7 @@ async function archiveSyncState() {
       && [entry.path, ...(Array.isArray(entry.assets) ? entry.assets.map((asset) => asset?.path) : [])]
         .every((path) => path && existingPaths.has(path)))
     .map((entry) => ({ id: entry.id, updated_at: entry.updated_at }));
-  return { conversations, oversized, previews };
+  return { conversations, oversized, preview_only: previews };
 }
 
 async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null, oversizedDownloadsSkipped = 0, oversizedStats = null } = {}) {
@@ -1334,6 +1414,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     const accountSlug = slugify(account);
     const provider = 'claude';
     let { ref, branch, baseCommit, baseTree, existingPaths, index } = await loadArchiveSnapshot();
+    if (olderExtensionWroteArchive(index)) report.olderExtensionWrote = true;
 
     const map = new Map(index.conversations.map((x) => [`${x.provider}:${x.account}:${x.id}`, x]));
     // Blob IDs on the branch, to notice an archived file whose bytes are not the
@@ -1503,7 +1584,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
         }
       }
       if (retained.length) entry.retained_assets = retained;
-      if (JSON.stringify(previous?.previews || []) !== JSON.stringify(entry.previews || [])
+      if (JSON.stringify(previous?.preview_only || []) !== JSON.stringify(entry.preview_only || [])
         || JSON.stringify(previous?.retained_assets || []) !== JSON.stringify(entry.retained_assets || [])) indexNeedsUpdate = true;
 
       map.set(key, entry);
@@ -1558,6 +1639,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
 
     const nextIndex = {
       version: 2,
+      requires_extension: ARCHIVE_REQUIRES_EXTENSION,
       updated_at: new Date().toISOString(),
       conversations: [...map.values()].sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '')),
     };
@@ -1624,7 +1706,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
 
     // A sync that left any conversation out, or archived one with files
     // missing, is partial: the popup says so instead of "complete".
-    const partial = report.failed.length > 0 || report.incomplete.length > 0 || report.keptPrevious.length > 0;
+    const partial = report.failed.length > 0 || report.incomplete.length > 0 || report.keptPrevious.length > 0 || report.olderExtensionWrote === true;
     const outcome = { report, partial };
     if (changedConversations === 0 && !indexNeedsUpdate && ref) {
       const head = partial ? 'Sync finished with problems: no archived conversation changed, so no GitHub commit was made.' : 'Everything is already up to date. No GitHub commit was needed.';
@@ -2233,7 +2315,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === 'getArchiveState') {
     archiveSyncState()
-      .then(({ conversations, oversized, previews }) => sendResponse({ ok: true, conversations, oversized, previews }))
+      .then(({ conversations, oversized, preview_only: previewOnly }) => sendResponse({ ok: true, conversations, oversized, preview_only: previewOnly }))
       .catch((e) => sendResponse({ ok: false, error: e?.message || String(e), ...(e?.blocksSync ? { blocksSync: true } : {}) }));
     return true;
   }

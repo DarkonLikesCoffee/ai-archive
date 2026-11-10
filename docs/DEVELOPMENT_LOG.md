@@ -2,6 +2,35 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Reconciling original-first images with the sandbox rule; display copies; downgrade protection — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+- **Branch.** `claude/original-first-reconciled`, based on PR #100's head (not yet merged; it is the branch's base) with PR #101 merged in. Conflicts were in docs, versions and the two test files only; both PRs' tests and docs are kept.
+- **Bug fixed.** With both PRs, a sandbox conversation whose Files API answered 404 archived the preview as "preview only" while PR #100's rule also archived the sandbox `uploads/` original, unlabelled and typed from the sandbox listing. The original was archived, but the archive said it was not.
+- **Owner decisions applied.**
+  - **Keep both files.** `labelSandboxOriginals` (content.js) makes exactly one same-named `uploads/` file with recognised image bytes the original: `variant: original`, type and extension from its bytes, linked to the same Claude file and message. The preview stays as `variant: preview` with `original_sha256`, which background.js turns into `preview_of: <original path>`. Such a preview is not preview-only. Anything ambiguous leaves both unlabelled or preview-only.
+  - **Schema.**
+    - `assets[].variant` and `assets[].preview_of`: linked files.
+    - `preview_only[]`, renamed from `previews` (never released): only images whose original is not archived. New reason `original-not-archived` (downloaded but too large).
+    - `retained_assets[]`: unlinked historical files.
+    - Markdown links each file once: the original as the image plus "Also archived: Claude's preview", or for non-displayable originals the preview inline plus a link to the unchanged original.
+  - **HEIC/HEIF/TIFF/SVG.** These originals are kept unchanged and also get Claude's preview as a display copy when it is a displayable image. A 404/410 or non-displayable preview leaves the original alone; other preview failures fail the conversation for that sync, like any download. Nothing is converted.
+  - **Downgrade protection.**
+    - Every index written records `requires_extension: "0.5.29"`; `loadArchiveIndex` refuses (blocksSync, before any download or write) when the running version (`EXTENSION_VERSION`, tested equal to manifest.json) is older or the value is not a version.
+    - Released versions (≤0.5.28) cannot be stopped: they never read the marker. But they write `{version, updated_at, conversations}` only (confirmed in their code), dropping it. So original-first records without the marker mean an older version wrote. The sync report, the popup (a warning entry first, sync shown as with problems) and the verifier (`older-extension-wrote`) say so.
+  - **Verifier.** New warnings `preview-of-missing`, `preview-only-unlisted`, `preview-only-has-original` and `older-extension-wrote`.
+- **Tests (synthetic images only).**
+  - `node --test extension/*.test.js`: 263/263 (PR #100 and #101 tests plus 17 new: 8 content, 8 background, 1 popup).
+  - `cd web && npm test`: 119/119 (2 new). `npm run build`: OK.
+  - `node e2e/extension-sync.e2e.cjs`: exit 0, 54 PASS / 0 FAIL (1 new: the index marker).
+  - `node web/e2e/viewer.e2e.cjs`: exit 0, 47 PASS.
+  - Checks that the tests catch each mechanism, each disabled in turn: sandbox labelling (2 fail), display copy (2), version guard (1), older-writer detection (1), pairing (3).
+- **Not verified.** No live Claude run; no real archive touched. Live test pending the owner's approval (separate test repository and Chrome profile).
+- **Risks.**
+  - A downgrade by a released version is detected only after it happened; the originals stay in git history.
+  - Display copies add one preview download per HEIC/TIFF/SVG image.
+  - The Files API is undocumented.
+- **Next task.** After PR #100 merges: merge `development` into this branch (no content change expected) and retarget its PR to `development`. Then the owner-approved live test.
+
 ## Original images instead of Claude's previews — 2026-11-10 (extension 0.5.29, web 0.6.19)
 
 - **Failure.** Image attachments were archived from Claude's WebP preview under the original's name (`….png`/`….jpg`): `collectMessageAssets` took `preview_asset.url || preview_url || document_asset.url` for every file, `fetchAsset` kept Claude's name and declared type, and `assetPath` took the extension from the name. The original route (`/files/{uuid}/contents`) was used only for `file_kind: blob` files. On the owner's archive this affects 729 images (read-only inventory; no private data in this repository).

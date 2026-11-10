@@ -790,6 +790,41 @@
     return knownPreviewOnlyImages.get(String(conversationId))?.get(String(fileId)) || null;
   }
 
+  // Image types the web viewer shows inline (SAFE_INLINE_IMAGE_MIMES in
+  // web/src/attachmentSecurity.js). An original of another type (HEIC, HEIF,
+  // TIFF, SVG) is kept as it is and also gets Claude's preview as a display
+  // copy, so the conversation does not lose its inline image.
+  const DISPLAYABLE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/avif', 'image/x-icon']);
+
+  // The format of an already downloaded file from the start of its base64.
+  function detectImageFormatFromBase64(base64) {
+    const head = String(base64 || '').replace(/\s+/g, '').slice(0, 1368);
+    if (!head) return null;
+    try { return detectImageFormat(base64ToBytes(head)); } catch { return null; }
+  }
+
+  // The preview of an original the viewer cannot show inline, as a separate
+  // preview variant that names its original (original_sha256). It is never
+  // a replacement: the original is archived either way. Claude answering the
+  // preview with 404/410, or bytes that are not a displayable image, leave
+  // the original alone; other failures fail the download like any other.
+  async function withDisplayCopy(original, url, name, signal) {
+    if (!url || !original.detected_extension || DISPLAYABLE_IMAGE_MIMES.has(original.mime)) return original;
+    try {
+      const preview = await fetchAsset(url, name, null, signal, { route: 'message-url', detect: true });
+      const { detected, ...rest } = preview;
+      if (!detected || !DISPLAYABLE_IMAGE_MIMES.has(detected.mime) || rest.sha256 === original.sha256) return original;
+      return {
+        ...original,
+        display_copy: { ...rest, mime: detected.mime, detected_extension: detected.extension, variant: 'preview', original_sha256: original.sha256 },
+      };
+    } catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      if (isUnavailable(e)) return original;
+      throw e;
+    }
+  }
+
   // One image attached to a message: Claude's original first, then, only if
   // Claude does not serve the original (404/410, or no file ID to ask for
   // it), the message file's preview URL, archived and labelled as a preview.
@@ -810,11 +845,12 @@
       checkedAt = known.original_checked_at ?? null;
       reason = 'original-unavailable';
     } else if (fileId) {
+      let accepted = null;
       try {
         const original = await fetchAsset(filesApiUrl(org, fileId), name, null, signal, {
           conversationId, fileUuid: fileId, declaredSize, route: 'files-api', detect: true,
         });
-        return acceptOriginalImage(original, name);
+        accepted = acceptOriginalImage(original, name);
       } catch (e) {
         if (e?.name === 'AbortError') throw e;
         if (!isUnavailable(e)) throw e;
@@ -822,6 +858,7 @@
         checkedAt = new Date().toISOString();
         reason = 'original-unavailable';
       }
+      if (accepted) return withDisplayCopy(accepted, url, name, signal);
     }
     // The preview has its own bytes and identity: it is not looked up as an
     // oversized record of the original.
@@ -1000,6 +1037,44 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
+  // A preview archived because the Files API did not serve the original, and
+  // the sandbox's uploads/ copy of that upload (kept by sandboxFileIsReferenced
+  // for a user's attachment): the sandbox file is the original. When exactly
+  // one uploads/ file has the image's name and its bytes are a recognised
+  // image, it becomes the original variant, with its type and extension from
+  // its bytes, linked to the same Claude file and messages; the preview stays
+  // archived as a separate preview variant naming it (original_sha256), and is
+  // no longer a preview-only image. Both files are kept. Anything ambiguous
+  // leaves both as they are.
+  function labelSandboxOriginals(assets) {
+    const uploadName = (asset) => {
+      const relative = sandboxRelativePath(asset.source_path);
+      return /^uploads\//.test(relative) ? relative.split('/').pop() : null;
+    };
+    for (const preview of assets) {
+      if (preview.source !== 'message' || preview.variant !== 'preview' || preview.original_sha256) continue;
+      const wanted = String(preview.name || '').toLowerCase();
+      if (!wanted) continue;
+      const candidates = assets.filter((asset) => asset.source === 'sandbox' && !asset.variant
+        && uploadName(asset) != null && safeAssetName(uploadName(asset)).toLowerCase() === wanted);
+      if (candidates.length !== 1) continue;
+      const [original] = candidates;
+      const detected = detectImageFormatFromBase64(original.base64);
+      if (!detected || original.sha256 === preview.sha256) continue;
+      original.variant = 'original';
+      original.mime = detected.mime;
+      original.detected_extension = detected.extension;
+      original.file_uuid ??= preview.file_uuid ?? null;
+      const ids = [...new Set([...(original.message_external_ids || []), ...(preview.message_external_ids || (preview.message_external_id ? [preview.message_external_id] : []))])];
+      if (ids.length) original.message_external_ids = ids;
+      original.message_external_id ??= preview.message_external_id ?? ids[0] ?? null;
+      preview.original_sha256 = original.sha256;
+      delete preview.preview_reason;
+      delete preview.original_status;
+      delete preview.original_checked_at;
+    }
+  }
+
   async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map(), incomplete = [], sandboxInfo = {}, sandboxSupported = true) {
     const assets = [];
     const seen = new Set();
@@ -1090,26 +1165,31 @@
       signal,
     );
 
-    for (const { asset, message, file, messageExternalIds, messageReferences } of directAssets.filter(Boolean)) {
+    for (const { asset: downloaded, message, file, messageExternalIds, messageReferences } of directAssets.filter(Boolean)) {
       const messageId = message.uuid || message.id || null;
       const linkedMessageIds = messageExternalIds.length
         ? messageExternalIds
         : (messageId ? [messageId] : []);
-      assets.push({
-        ...asset,
-        source: 'message',
-        file_uuid: file.file_uuid || file.uuid || null,
-        message_external_id: messageId,
-        ...(linkedMessageIds.length ? { message_external_ids: linkedMessageIds } : {}),
-      });
-      const nameKey = String(asset.name || '').toLowerCase();
-      const fingerprint = `${nameKey}|${asset.sha256}`;
-      messageAssetFingerprints.add(fingerprint);
-      // The shared download is associated with every source message, so also
-      // deduplicate its extracted-content representation independently for each.
-      for (const referencedMessage of messageReferences) {
-        fingerprintsForMessage(referencedMessage).add(fingerprint);
-        hashesForMessage(referencedMessage).add(asset.sha256);
+      // An original the viewer cannot display carries Claude's preview as a
+      // display copy: both are archived, linked to the same message file.
+      const { display_copy: displayCopy, ...asset } = downloaded;
+      for (const item of displayCopy ? [asset, displayCopy] : [asset]) {
+        assets.push({
+          ...item,
+          source: 'message',
+          file_uuid: file.file_uuid || file.uuid || null,
+          message_external_id: messageId,
+          ...(linkedMessageIds.length ? { message_external_ids: linkedMessageIds } : {}),
+        });
+        const nameKey = String(item.name || '').toLowerCase();
+        const fingerprint = `${nameKey}|${item.sha256}`;
+        messageAssetFingerprints.add(fingerprint);
+        // The shared download is associated with every source message, so also
+        // deduplicate its extracted-content representation independently for each.
+        for (const referencedMessage of messageReferences) {
+          fingerprintsForMessage(referencedMessage).add(fingerprint);
+          hashesForMessage(referencedMessage).add(item.sha256);
+        }
       }
     }
 
@@ -1138,6 +1218,7 @@
       seen.add(key);
       assets.push(asset);
     }
+    labelSandboxOriginals(assets);
 
     // Some document uploads are represented only as attachments[].extracted_content.
     // Preserve those as downloadable text files instead of dumping their contents
@@ -1603,7 +1684,7 @@
             oversized.get(String(item.id)).set(String(item.file_uuid), { size: item.size, sha256: String(item.sha256) });
           }
           const previews = new Map();
-          for (const item of Array.isArray(response.previews) ? response.previews : []) {
+          for (const item of Array.isArray(response.preview_only) ? response.preview_only : []) {
             if (!item?.id || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
             if (!previews.has(String(item.id))) previews.set(String(item.id), new Map());
             previews.get(String(item.id)).set(item.file_uuid, {
@@ -1611,7 +1692,7 @@
               original_checked_at: typeof item.original_checked_at === 'string' ? item.original_checked_at : null,
             });
           }
-          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, previews, error: null });
+          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, previewOnly: previews, error: null });
         });
       } catch (error) {
         failed(error?.message || error);
@@ -1818,7 +1899,7 @@
       if (archivedState?.blocksSync) throw new Error(archivedState.error);
       const archived = archivedState?.state || null;
       knownOversizedFiles = archivedState?.oversized || null;
-      knownPreviewOnlyImages = archivedState?.previews || null;
+      knownPreviewOnlyImages = archivedState?.previewOnly || null;
       oversizedStats = newOversizedStats();
       const archiveStateError = archivedState?.error ? sanitizeError(archivedState.error) : null;
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');

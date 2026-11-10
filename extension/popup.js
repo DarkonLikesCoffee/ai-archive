@@ -112,6 +112,7 @@ function describeLastSync(record, now = Date.now()) {
       : record.partial ? 'Last sync finished with problems' : 'Last sync';
   const hasReport = Boolean(record.report && (
     record.report.incomplete?.length || record.report.failed?.length || record.report.keptPrevious?.length
+    || record.report.olderExtensionWrote === true
   ));
   const message = hasReport ? '' : String(record.message || '');
   const summary = message.length > 150 ? `${message.slice(0, 150)}…` : message;
@@ -137,6 +138,13 @@ function missingCategoriesText(categories) {
 function describeSyncReport(report) {
   if (!report || typeof report !== 'object') return [];
   const entries = [];
+  // First and always shown: an older extension rewrote this archive after it
+  // began recording original images (see olderExtensionWroteArchive).
+  if (report.olderExtensionWrote === true) {
+    entries.push({ type: 'warning', title: 'An older AI Archive extension wrote to this archive',
+      subtitle: 'Original images may have been replaced by previews',
+      details: ['An extension older than 0.5.29 rewrote the archive after it began recording original images. In conversations it re-exported, original images may have been replaced by Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.'] });
+  }
   for (const item of Array.isArray(report.failed) ? report.failed : []) {
     entries.push({ type: 'failed', title: item.title || item.id, id: item.id,
       subtitle: `${FAILURE_LABELS[item.category] || 'Not exported'} · ${item.archived ? 'previous archive kept' : 'not in archive'}`,

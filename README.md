@@ -2,10 +2,13 @@
 
 ## Extension v0.5.29 — original images instead of previews
 - Uploaded and pasted images are now archived from Claude's original upload. Before, every image was archived from Claude's smaller, lossy WebP preview, stored under the original's `.png` or `.jpg` name.
-- The type and extension of an image come from its bytes. A pasted image Claude names `…_image.png` is stored as `.jpg` when it is a JPEG.
-- If Claude does not serve the original (HTTP 404/410), the preview is archived under its real `.webp` extension, with a visible "Preview only" note and a `previews` record in the index. The conversation is not marked incomplete, and normal syncs do not ask for that original again; a "Latest N" sync does. Any other failure leaves the conversation out of that sync, so a later sync retries it: a preview is never substituted silently.
-- Conversations already archived are not re-exported by this update. When one is re-exported later and an original replaces an earlier image, the earlier file is kept and listed under `retained_assets`, not deleted. Format details: `docs/archive-format-v1.md`.
-- Web 0.6.19: the archive verifier counts kept files as referenced, and reports one that is missing.
+- The type and extension of an image come from its bytes. A pasted image Claude names `…_image.png` is stored as `.jpg` when it is a JPEG. Originals are never converted.
+- If Claude does not serve the original (HTTP 404/410) but a sandbox conversation's `uploads/` folder holds it, that file is archived as the original and the preview is kept next to it, labelled as a preview.
+- If no original is available, the preview is archived under its real `.webp` extension, with a visible "Preview only" note and a `preview_only` record in the index. The conversation is not marked incomplete, and normal syncs do not ask for that original again; a "Latest N" sync does. Any other failure leaves the conversation out of that sync, so a later sync retries it: a preview is never substituted silently.
+- HEIC, HEIF, TIFF and SVG originals, which the archive viewer does not display inline, are kept unchanged and also get Claude's preview as a display copy, shown inline with a link to the original.
+- Conversations already archived are not re-exported by this update. When one is re-exported later and an original replaces an earlier image, the earlier file is kept and listed under `retained_assets`, not deleted.
+- Downgrade protection: every index this version writes records `requires_extension: "0.5.29"`, and newer extensions refuse to sync an archive that requires a later version. Older extensions cannot be stopped from writing, but they drop that marker, so the next sync with 0.5.29 or later warns that an older extension wrote to the archive and may have replaced originals with previews. Update every installed copy of the extension.
+- Format details: `docs/archive-format-v1.md`. Web 0.6.19: the verifier checks original/preview pairs, kept files and the marker.
 
 ## Extension v0.5.28 — same-named attachments are no longer merged by name
 - A pasted image is listed on its message with a *preview* (Claude serves a WebP preview under the upload's `.png` name), while the sandbox's `uploads/` folder holds the original. Because the two share a file name, the exporter skipped the original. It now downloads it as well and keeps both. A copy with the same name and the **same bytes** is still stored only once.
