@@ -31,17 +31,34 @@ touching the real archive**. Run it only with the owner's explicit approval.
 
 ## Procedure
 
-1. In the extension's settings (test profile), point it at the test
-   repository, with a test account name such as `image-test`.
-2. **New data.** Start a new Claude conversation, paste one screenshot and
-   upload one JPEG, then sync "Latest 10". Expected: both images archived as
+1. In the extension's settings (test profile), **first make sure automatic
+   sync is off** (it is off unless it was turned on): an automatic sync would
+   copy up to the 20 latest conversations before you choose what to sync. Then point
+   the extension at the test repository, with a test account name such as
+   `image-test`.
+2. **New data.** Start a new Claude conversation, paste one PNG screenshot and
+   upload one JPEG, and do not touch any other conversation. Then sync only
+   the most recently updated conversation, which is the new one. The popup's
+   smallest choice, "Latest 10", would also copy the 9 conversations before
+   it; to sync exactly one, open the extension popup, right-click it, choose
+   **Inspect**, and in that DevTools console run:
+
+   ```js
+   sendToClaude({ type: 'startSync', limit: '1' }, { openIfMissing: true })
+   ```
+
+   This is the popup's own sync call with a limit of 1. Check that the sync
+   report says 1 conversation before continuing. Expected: both images archived as
    originals (`variant: "original"`, extensions matching their bytes), no
    "Preview only" note, `requires_extension: "0.5.29"` in
    `archive/index.json`, and `archive/.ai-archive.json` present.
-3. **Recovered originals.** Sync "Latest N" with N just large enough to
-   include the conversations the recovered files come from. This copies N of
-   the owner's conversations into the private test repository; check their
-   positions in Claude's list first.
+3. **Recovered originals: stop and decide first.** The extension can only
+   sync the N most recently updated conversations ("Latest N") or all of
+   them; it cannot select conversations by ID. Find each recovered
+   conversation's position in Claude's conversation list (most recent
+   first): N must be at least the largest position, and the sync copies all
+   N of those conversations into the private test repository. Agree on N
+   with the owner before running it.
 4. Clone the test repository locally and run, from the root of this source
    repository:
 

@@ -344,3 +344,11 @@ test('a sync that found an older extension’s writes shows a warning first, eve
     'Last sync finished with problems 1 min ago.', 'the report panel carries it');
   assert.deepEqual(JSON.parse(JSON.stringify(describeSyncReport({ olderExtensionWrote: false }))), []);
 });
+
+test('an unreadable version marker is named as such in the popup, with the same acknowledgement', () => {
+  const { describeSyncReport } = loadPopup();
+  const [entry] = JSON.parse(JSON.stringify(describeSyncReport({ olderExtensionWrote: true, downgradeWarning: { detected_at: 'unreadable-marker-abc', reason: 'marker-unreadable' } })));
+  assert.equal(entry.title, "The archive's version marker could not be read");
+  assert.match(entry.details[0], /archive\/\.ai-archive\.json could not be read, so a warning that an older AI Archive extension wrote to this archive may have been lost/);
+  assert.equal(entry.acknowledge, 'unreadable-marker-abc');
+});

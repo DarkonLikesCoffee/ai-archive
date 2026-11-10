@@ -258,7 +258,12 @@ that exact warning; the next sync after that removes it from the marker
 file. For an archive without a marker file, original-first records without
 `requires_extension` are detected the same way
 (`original-first-records-without-marker`). The verifier reports both as
-`older-extension-wrote`.
+`older-extension-wrote`. A marker file that cannot be read, or whose
+`downgrade_warning` cannot be read, is never replaced silently: it is reported
+the same way (`marker-unreadable`, `warning-unreadable`, "the archive's
+version marker could not be read"), kept as an unacknowledged warning in the
+rewritten marker, and cleared only once acknowledged, because it may have
+held a warning nobody has seen.
 
 Limitations, by design: detection happens only after an older extension has
 written; it cannot undo what that sync did (the files are recovered from the

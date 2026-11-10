@@ -3258,3 +3258,40 @@ test('a kept file deleted outside AI Archive does not block syncs, and is still 
   assert.ok(result.commit, 'the sync is published');
   assert.deepEqual(plainJson(harness.lastCommittedArchive().index.conversations.find((e) => e.id === 'conv-kept-gone').retained_assets), [{ path: gone, name: 'gone.png' }], 'the untouched entry is left as it was');
 });
+
+test('a corrupted marker file, or an unreadable warning in it, never silently erases a downgrade warning', async () => {
+  const index = JSON.stringify({ version: 2, requires_extension: '0.5.29', updated_at: 't', conversations: [] });
+  const cases = [
+    ['invalid JSON', '{"format":"ai-archive","downgrade_warning":{"detected_at":"t1"', 'marker-unreadable'],
+    ['not an object', '"just a string"', 'marker-unreadable'],
+    ['a warning that is not an object', JSON.stringify({ format: 'ai-archive', requires_extension: '0.5.29', downgrade_warning: 'yes' }), 'warning-unreadable'],
+    ['a warning without detected_at', JSON.stringify({ format: 'ai-archive', requires_extension: '0.5.29', downgrade_warning: { reason: 'index-rewritten-without-marker' } }), 'warning-unreadable'],
+  ];
+  for (const [label, markerText, reason] of cases) {
+    // The index already has its own marker back, as after an earlier sync.
+    const first = makeBackgroundSyncHarness({ indexText: index, markerText });
+    const messages = [];
+    const result = await first.sync(sampleConversation(), (event) => { if (event?.stage === 'done') messages.push(event.message); });
+    assert.equal(result.report.olderExtensionWrote, true, `${label}: warned`);
+    assert.equal(result.report.downgradeWarning.reason, reason, label);
+    assert.match(messages.join(' '), /could not be read, so a warning that an older AI Archive extension wrote to this archive may have been lost/, label);
+    const rewritten = first.lastCommittedArchive().marker;
+    const stored = JSON.parse(rewritten);
+    assert.equal(stored.downgrade_warning.reason, reason, `${label}: the warning is kept in a readable marker`);
+    assert.equal(stored.requires_extension, '0.5.29', label);
+
+    const later = makeBackgroundSyncHarness({ indexText: index, markerText: rewritten });
+    assert.equal((await later.sync(sampleConversation(), () => {})).report.olderExtensionWrote, true, `${label}: still warned by the next sync`);
+
+    const acked = makeBackgroundSyncHarness({ indexText: index, markerText: rewritten });
+    await acked.request({ type: 'acknowledgeDowngradeWarning', detected_at: stored.downgrade_warning.detected_at });
+    assert.equal(Boolean((await acked.sync(sampleConversation(), () => {})).report.olderExtensionWrote), false, `${label}: cleared only once acknowledged`);
+    assert.equal(JSON.parse(acked.lastCommittedArchive().marker).downgrade_warning, undefined, label);
+  }
+});
+
+test('an unreadable marker file still blocks nothing it should not: a readable one without a warning raises nothing', async () => {
+  const marker = `${JSON.stringify({ format: 'ai-archive', requires_extension: '0.5.29', written_by_extension: '0.5.29' }, null, 2)}\n`;
+  const harness = makeBackgroundSyncHarness({ indexText: JSON.stringify({ version: 2, requires_extension: '0.5.29', conversations: [] }), markerText: marker });
+  assert.equal(Boolean((await harness.sync(sampleConversation(), () => {})).report.olderExtensionWrote), false);
+});

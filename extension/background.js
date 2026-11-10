@@ -1196,8 +1196,10 @@ function sanitizeOversizedStats(value) {
 // One sentence per outcome other than "written", so a partial sync is never
 // mistaken for a complete one. `report` lists every conversation by ID.
 const OLDER_EXTENSION_WARNING = 'Warning: an AI Archive extension older than 0.5.29 has written to this archive since it began recording original images. In conversations it re-exported, it may have replaced original images with Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.';
+const UNREADABLE_MARKER_WARNING = 'Warning: archive/.ai-archive.json could not be read, so a warning that an older AI Archive extension wrote to this archive may have been lost. Check that file\'s repository history; original images may have been replaced by Claude\'s previews, and the originals remain in the history. Update every installed copy of the extension to 0.5.29 or later.';
+const isUnreadableMarkerWarning = (warning) => warning?.reason === 'marker-unreadable' || warning?.reason === 'warning-unreadable';
 function syncReportSummary(report) {
-  let text = report.olderExtensionWrote ? ` ${OLDER_EXTENSION_WARNING}` : '';
+  let text = report.olderExtensionWrote ? ` ${isUnreadableMarkerWarning(report.downgradeWarning) ? UNREADABLE_MARKER_WARNING : OLDER_EXTENSION_WARNING}` : '';
   if (report.listed != null) text += ` Claude listed ${plural(report.listed, 'conversation', 'conversations')}.`;
   if (report.unchanged) text += ` ${plural(report.unchanged, 'unchanged conversation was', 'unchanged conversations were')} not downloaded again.`;
   const skippedBytes = report.oversized?.skipped_bytes;
@@ -1332,7 +1334,8 @@ async function loadArchiveSnapshot() {
   }
 
   const index = await loadArchiveIndex(ref);
-  const marker = ref ? await loadArchiveMarker(branch, existingPaths) : null;
+  const markerBlobSha = (baseTree?.tree || []).find((item) => item?.path === ARCHIVE_MARKER_PATH)?.sha || null;
+  const marker = ref ? await loadArchiveMarker(branch, existingPaths, markerBlobSha) : null;
   if (marker?.requires_extension != null && !(compareVersions(EXTENSION_VERSION, marker.requires_extension) >= 0)) {
     throw archiveBlocked(`This archive requires AI Archive ${String(marker.requires_extension).slice(0, 40)} or later (${ARCHIVE_MARKER_PATH}); this extension is ${EXTENSION_VERSION}. Update the extension before syncing. No archive changes were published.`);
   }
@@ -1342,14 +1345,17 @@ async function loadArchiveSnapshot() {
 // archive/.ai-archive.json, or null when the archive has none. A marker that
 // cannot be read is kept as { unreadable: true } and rewritten by the next
 // sync that commits.
-async function loadArchiveMarker(branch, existingPaths) {
+// blob_sha identifies an unreadable file, so a warning about it is stable
+// (and can be acknowledged) while the file stays the same.
+async function loadArchiveMarker(branch, existingPaths, blobSha = null) {
   if (!existingPaths.has(ARCHIVE_MARKER_PATH)) return null;
   const file = await getFile(ARCHIVE_MARKER_PATH, branch);
+  const unreadable = { unreadable: true, blob_sha: String(blobSha || file?.sha || 'unknown') };
   try {
     const value = JSON.parse(base64DecodeContent(String(file?.content || '')));
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : { unreadable: true };
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : unreadable;
   } catch {
-    return { unreadable: true };
+    return unreadable;
   }
 }
 
@@ -1359,13 +1365,24 @@ async function loadArchiveMarker(branch, existingPaths) {
 // without a marker, from original-first records without the index marker.
 // Once detected it is kept in the marker file until acknowledged.
 // detected_at is stable for one rewrite: the older extension's index time.
+// A marker that cannot be read, or whose warning cannot be read, may hide an
+// unacknowledged warning: that is itself reported, and kept until
+// acknowledged, never silently replaced by a clean marker.
 function downgradeWarningFor(index, marker) {
-  if (marker?.downgrade_warning && typeof marker.downgrade_warning === 'object') {
+  if (marker?.unreadable) {
+    return { detected_at: `unreadable-marker-${String(marker.blob_sha || 'unknown').slice(0, 64)}`, reason: 'marker-unreadable' };
+  }
+  if (marker && marker.downgrade_warning != null) {
     const kept = marker.downgrade_warning;
-    return { detected_at: String(kept.detected_at || 'unknown'), reason: String(kept.reason || 'index-rewritten-without-marker') };
+    if (typeof kept === 'object' && !Array.isArray(kept) && typeof kept.detected_at === 'string' && kept.detected_at) {
+      return { detected_at: kept.detected_at.slice(0, 100), reason: typeof kept.reason === 'string' && kept.reason ? kept.reason.slice(0, 80) : 'index-rewritten-without-marker' };
+    }
+    let shown = '';
+    try { shown = JSON.stringify(kept); } catch { shown = String(kept); }
+    return { detected_at: `unreadable-warning-${String(shown).slice(0, 60)}`, reason: 'warning-unreadable' };
   }
   if (index?.requires_extension != null) return null;
-  if (marker && (marker.requires_extension != null || marker.unreadable)) {
+  if (marker && marker.requires_extension != null) {
     return { detected_at: String(index?.updated_at || 'unknown'), reason: 'index-rewritten-without-marker' };
   }
   if (!marker && olderExtensionWroteArchive(index)) {

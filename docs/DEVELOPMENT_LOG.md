@@ -2,6 +2,20 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## A corrupted marker file no longer erases a downgrade warning — 2026-11-10 (extension 0.5.29)
+
+- **Bug, reproduced first in a scratch copy.** An unreadable `archive/.ai-archive.json` (invalid JSON or not an object), or a `downgrade_warning` that was not a readable object, raised no warning once the index had its `requires_extension` again. The next sync then rewrote the marker clean, silently erasing a warning nobody had acknowledged.
+- **Fix (`downgradeWarningFor`, `loadArchiveMarker`).**
+  - An unreadable marker is reported as `marker-unreadable`, and an unreadable warning as `warning-unreadable`. The popup and sync report say "the archive's version marker could not be read".
+  - The warning is kept in the rewritten, readable marker and cleared only after it is acknowledged.
+  - Its `detected_at` comes from the marker's blob ID, so it stays stable while the file is unchanged.
+- **Tests.** 2 background tests (4 corruption cases, each warned, kept, still warned on the next sync, cleared only after acknowledgement; and a readable marker raises nothing) and 1 popup test. With either new check removed, the test fails.
+- **Live-test procedure corrected** (`docs/live-test-original-images.md`).
+  - The popup's smallest choice is "Latest 10", which would copy 9 historical conversations. Syncing exactly one conversation uses the popup's own `sendToClaude({ type: 'startSync', limit: '1' })` from its DevTools console, with no code change.
+  - Automatic sync must be confirmed off first; if on, it copies up to 20 conversations.
+  - Copying historical conversations is a separate step that needs the owner's agreement on N.
+- **Not done.** No live step can be run from a cloud session: no browser, Claude login, test repository or token here. The owner runs the live steps; this session verifies the results read-only once given access to the test repository.
+
 ## Pre-live-test verification of PR #102 — 2026-11-10 (extension 0.5.29, web 0.6.19)
 
 - **CI for `c7e86da`.** `test-and-build` and `extension-e2e` both succeeded (run 42809195233).

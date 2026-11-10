@@ -142,10 +142,14 @@ function describeSyncReport(report) {
   // began recording original images (see olderExtensionWroteArchive).
   if (report.olderExtensionWrote === true) {
     const detectedAt = typeof report.downgradeWarning?.detected_at === 'string' ? report.downgradeWarning.detected_at : null;
-    entries.push({ type: 'warning', title: 'An older AI Archive extension wrote to this archive',
+    const unreadable = ['marker-unreadable', 'warning-unreadable'].includes(report.downgradeWarning?.reason);
+    entries.push({ type: 'warning',
+      title: unreadable ? "The archive's version marker could not be read" : 'An older AI Archive extension wrote to this archive',
       subtitle: 'Original images may have been replaced by previews',
       details: [
-        'An extension older than 0.5.29 rewrote the archive after it began recording original images. In conversations it re-exported, original images may have been replaced by Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.',
+        unreadable
+          ? 'archive/.ai-archive.json could not be read, so a warning that an older AI Archive extension wrote to this archive may have been lost. Check that file\'s repository history; original images may have been replaced by Claude\'s previews, and the originals remain in the history. Update every installed copy of the extension to 0.5.29 or later.'
+          : 'An extension older than 0.5.29 rewrote the archive after it began recording original images. In conversations it re-exported, original images may have been replaced by Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.',
         'This warning is shown after every sync until you acknowledge it.',
       ],
       ...(detectedAt ? { acknowledge: detectedAt } : {}) });
