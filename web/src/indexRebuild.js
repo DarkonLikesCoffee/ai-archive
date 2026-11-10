@@ -14,12 +14,15 @@
 //   not recoverable: exporter_version and format_version (never written to
 //     Markdown; leaving them out makes the next sync re-export the
 //     conversation, which is safe), incomplete[] details (only the visible
-//     "not archived" notes survive, without size, SHA-256 or reason codes)
+//     "not archived" notes survive, without size, SHA-256 or reason codes),
+//     previews[] (only the visible "Preview only" notes survive, without the
+//     Claude file UUID a later recovery needs), retained_assets[] (kept files
+//     no Markdown links), assets[].variant
 import { parseConversationMarkdown } from './github.js';
 
 export const EXACT_FIELDS = ['id', 'provider', 'account', 'title', 'model', 'created_at', 'updated_at', 'message_count', 'path', 'content_sha256'];
 export const APPROXIMATE_FIELDS = ['preview', 'search_text', 'assets.name', 'assets.mime'];
-export const UNRECOVERABLE_FIELDS = ['exporter_version', 'format_version', 'incomplete'];
+export const UNRECOVERABLE_FIELDS = ['exporter_version', 'format_version', 'incomplete', 'previews', 'retained_assets'];
 
 // "[label](assets/…)" or "![label](assets/…)", with the exporter's label escaping.
 const ASSET_LINK = /!?\[((?:\\.|[^\]\\])*)\]\((assets\/[^)\s]+)\)/g;
