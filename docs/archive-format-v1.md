@@ -195,7 +195,9 @@ Index fields (all optional and additive; readers ignore them when absent):
   `path` of that original (one of the same entry's `assets`). A preview with
   `preview_of` is never preview-only.
 - `preview_only[]`: one item per image whose original is **not** in the
-  archive: `path` (of the preview, one of the entry's `assets`), `name`,
+  archive (also `reason: "files-api-served-preview"` when Claude's Files API
+  returned a WebP identical to the preview: the bytes are kept as the
+  preview, never as the original): `path` (of the preview, one of the entry's `assets`), `name`,
   `file_uuid` (when Claude gave one), `message_external_id`, `reason`
   (`original-unavailable`, `no-file-id`, or `original-not-archived` when the
   original was downloaded but too large to archive), and for
@@ -206,12 +208,24 @@ Index fields (all optional and additive; readers ignore them when absent):
   explicit "Latest N" sync asks again, as does any re-export of the
   conversation that has no archive state. These items are the identity a
   later, explicit recovery needs.
-- `retained_assets[]`: files the Markdown no longer links but that were kept
-  instead of deleted: when an export that records `variant` replaces an
-  earlier image (normally a preview under a `.png`/`.jpg` name), the earlier
-  file stays in the repository and is listed here with its `path`, `sha256`,
-  `size`, `mime` and `name`. Later syncs keep the list. Nothing is moved or
-  rewritten.
+- `retained_assets[]`: files the Markdown no longer links, kept instead of
+  deleted. **From 0.5.29 a sync never deletes an attachment**: an image
+  replaced by its original, a preview stored again under its real extension,
+  and a file of any type whose message left Claude's active branch all stay
+  in the repository and are listed here with their `path`, `sha256`, `size`,
+  `mime`, `name` and:
+  - `reason`: `superseded` (the export holds an original or preview of the
+    same Claude file name) or `not-in-export`;
+  - `superseded_by`: the path of that original (or preview);
+  - `same_bytes_as`: the path of a current asset with identical bytes;
+  - `variant: "preview"` only when those identical bytes are a current
+    preview (typically an old WebP preview stored under a `.png`/`.jpg`
+    name). A kept file is never labelled `original`: its bytes were never
+    verified as Claude's upload.
+
+  Later syncs keep the list (and its annotations). Nothing is moved or
+  rewritten. Only a renamed conversation's old Markdown file is removed, its
+  content being written to the new path.
 
 So an image file is exactly one of: a linked asset (`assets[]`, with
 `variant`, and `preview_of` when it is the preview of an archived original), a
@@ -273,11 +287,23 @@ marker file still being there (deleting it by hand removes the evidence); and
 nothing is detected until a 0.5.29+ sync (or the verifier) runs. Every
 installed copy of the extension must be updated to 0.5.29 or later.
 
-Migration: none. `exporter_version` is unchanged, so already-archived
-conversations are not re-exported by this change; old entries remain valid
-and readable. A conversation is exported with originals the next time it is
-re-exported for any other reason (it changed on Claude, or a "Latest N" sync
-includes it). An index rebuild (dry run) cannot recover `preview_only[]`,
+Migration: `exporter_version` is **2** from 0.5.29. Entries written with 1
+(0.5.28 and earlier) are therefore not skipped: the next "All conversations"
+sync re-exports each of them once, which replaces archived previews by
+originals wherever Claude still serves them, labels the rest as previews, and
+keeps every earlier file (`retained_assets`). A conversation whose re-export
+fails keeps its archived copy and exporter version 1, so the next full sync
+retries it; an incomplete re-export that lacks a file the archived copy has
+(other than an image it represents by an original or preview of the same
+name) keeps the archived copy. Old entries remain valid and readable. Run the
+plan-only full sync first (popup: "Plan a full sync (writes nothing)"): it
+does everything a full sync does, writes nothing to GitHub (every write
+request is refused while it runs, and its attachments are never uploaded),
+and reports the conversations to re-export, originals found, preview-only
+images, new files, files kept instead of deleted, deletions (renamed
+Markdown only), files already unreferenced, failed conversations, and the
+count of images Claude lists only in `files_v2` (not exported; diagnostics).
+See `docs/full-resync-original-images.md`. An index rebuild (dry run) cannot recover `preview_only[]`,
 `retained_assets[]`, `variant`, `preview_of` or `file_uuid` from Markdown
 alone; only the visible notes survive. The dry run therefore never reports
 an entry holding them as unchanged: it lists them as "not preserved by a

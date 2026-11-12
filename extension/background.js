@@ -7,7 +7,11 @@ const SEARCH_TEXT_ENCODING = 'gzip-base64';
 // conversation would differ (content.js rendering or background.js output).
 // Incremental sync only skips conversations archived by the current version,
 // so a bump re-exports every conversation once on its next sync.
-const EXPORTER_VERSION = 1;
+// 2 (extension 0.5.29): images are archived from Claude's originals. Raising
+// it makes the next full sync re-export every conversation written by an
+// earlier exporter once, which is how archived WebP previews get their
+// originals (see docs/archive-format-v1.md, "Image originals and previews").
+const EXPORTER_VERSION = 2;
 // This extension's version (must equal manifest.json; a test checks it), and
 // the oldest extension version that may write to an archive this version
 // wrote. Every index this version writes records the latter as
@@ -38,6 +42,11 @@ const CONTENT_PROGRESS_STALE_MS = 5 * 60 * 1000;
 const CONTENT_ACTIVE_STAGES = ['fetching', 'preparing'];
 let contentSyncState = null;
 let pendingTransfer = null;
+// True while a plan-only sync runs (see sync's planOnly): gh() then refuses
+// every request that is not a GET, so nothing can be written to GitHub even
+// by mistake. Also set by a plan-only transfer before its sync starts.
+let planOnlyActive = false;
+const planOnlyTransfer = () => Boolean(pendingTransfer?.metadata?.planOnly);
 
 function contentSyncRunning() {
   return Boolean(contentSyncState
@@ -237,6 +246,9 @@ async function gh(path, opts = {}, allowAfterCancel = false) {
   const controller = syncAbortController;
   const signal = allowAfterCancel ? undefined : (requestSignal || controller?.signal);
   const method = String(opts.method || 'GET').toUpperCase();
+  if (method !== 'GET' && (planOnlyActive || planOnlyTransfer())) {
+    throw Object.assign(new Error(`A plan-only sync refused to write to GitHub (${method} ${String(path).split('?')[0]}). Nothing was published.`), { planOnlyRefused: true });
+  }
   const retryable = isRetryableGitHubRequest(path, method);
   const operation = gitHubOperation(path, method);
 
@@ -550,6 +562,8 @@ function pairedImageMarkdown(original, preview) {
 function previewOnlyNote(asset) {
   const why = asset.preview_reason === 'no-file-id'
     ? 'Claude gave no file ID to request the original upload'
+    : asset.preview_reason === 'files-api-served-preview'
+      ? 'Claude\'s file service returned the same bytes as its preview, so the original upload is not available'
     : asset.original_sha256
       ? 'The original upload was downloaded but could not be archived (see the note about it)'
     : `Claude did not serve the original upload${Number.isSafeInteger(asset.original_status) ? ` (HTTP ${asset.original_status})` : ''} when this conversation was archived`;
@@ -936,32 +950,45 @@ function normalizeAssetList(c, provider, accountSlug) {
 // and for assets archived before this distinction existed.
 const ASSET_VARIANTS = new Set(['original', 'preview']);
 
-// Historical image files a re-export no longer links, kept instead of
-// deleted: when an export that tells originals from previews replaces an
-// image archived earlier (usually Claude's preview), the earlier file stays
-// in the repository and is listed here, so it is never lost and never an
-// unreferenced file. Files kept by an earlier sync stay listed. Only files
-// that still exist are listed; nothing is moved or rewritten.
+// Earlier files a re-export no longer links, kept instead of deleted.
+// Attachments are never deleted by a sync: an image replaced by its original,
+// a preview stored again under its real extension, a file whose message left
+// Claude's active branch all stay in the repository and are listed here, so
+// nothing is lost and nothing becomes unreferenced. Files kept by an earlier
+// sync stay listed. Only files that still exist are listed; nothing is moved
+// or rewritten. A kept file is never labelled as an original: it is
+// historical, and its bytes were never verified as Claude's upload. When the
+// current export holds the same bytes, or an original or preview of the same
+// Claude file name, that relationship is recorded.
+const RETAINED_FIELDS = ['sha256', 'size', 'mime', 'name', 'reason', 'superseded_by', 'same_bytes_as', 'variant'];
 function retainedAssetsFor(previous, entry, previousAssets, existingPaths) {
-  const current = new Set((entry.assets || []).map((a) => a.path));
-  const tellsVariants = (entry.assets || []).some((a) => ASSET_VARIANTS.has(a?.variant));
+  const currentAssets = entry.assets || [];
+  const current = new Set(currentAssets.map((a) => a.path));
   const kept = new Map();
-  const keep = (a) => {
-    if (!a?.path || current.has(a.path) || kept.has(a.path) || !existingPaths.has(a.path)) return;
-    kept.set(a.path, {
-      path: a.path,
-      ...(typeof a.sha256 === 'string' ? { sha256: a.sha256 } : {}),
-      ...(Number.isSafeInteger(a.size) ? { size: a.size } : {}),
-      ...(typeof a.mime === 'string' ? { mime: a.mime } : {}),
-      ...(typeof a.name === 'string' ? { name: a.name } : {}),
-    });
+  const annotate = (a) => {
+    const sameBytes = currentAssets.find((c) => c.sha256 && c.sha256 === a.sha256);
+    const named = isImageAsset(a) ? currentAssets.filter((c) => ASSET_VARIANTS.has(c.variant) && c.name === a.name) : [];
+    const supersededBy = named.find((c) => c.variant === 'original') || named[0] || null;
+    return {
+      reason: supersededBy ? 'superseded' : 'not-in-export',
+      ...(supersededBy ? { superseded_by: supersededBy.path } : {}),
+      ...(sameBytes ? { same_bytes_as: sameBytes.path } : {}),
+      // The same bytes as a current preview: this kept file is that preview.
+      ...(sameBytes?.variant === 'preview' ? { variant: 'preview' } : {}),
+    };
   };
-  for (const a of Array.isArray(previous?.retained_assets) ? previous.retained_assets : []) keep(a);
-  if (tellsVariants) {
-    for (const a of previousAssets) {
-      if (a?.path && !current.has(a.path) && isImageAsset(a)) keep(a);
+  const keep = (a, fresh) => {
+    if (!a?.path || current.has(a.path) || kept.has(a.path) || !existingPaths.has(a.path)) return;
+    const record = { path: a.path };
+    const source = fresh ? { ...a, ...annotate(a) } : a;
+    for (const field of RETAINED_FIELDS) {
+      if (field === 'size' ? Number.isSafeInteger(source.size) : typeof source[field] === 'string' && source[field]) record[field] = source[field];
     }
-  }
+    if (record.variant && record.variant !== 'preview') delete record.variant;
+    kept.set(a.path, record);
+  };
+  for (const a of Array.isArray(previous?.retained_assets) ? previous.retained_assets : []) keep(a, false);
+  for (const a of previousAssets) keep(a, true);
   return [...kept.values()];
 }
 
@@ -1028,7 +1055,7 @@ function previewItems(assets) {
       name: String(a.name || 'file'),
       ...(a.file_uuid ? { file_uuid: String(a.file_uuid) } : {}),
       ...(messageIds.length ? { message_external_id: String(messageIds[0]) } : {}),
-      reason: a.preview_reason === 'no-file-id' ? 'no-file-id' : a.original_sha256 ? 'original-not-archived' : 'original-unavailable',
+      reason: ['no-file-id', 'files-api-served-preview'].includes(a.preview_reason) ? a.preview_reason : a.original_sha256 ? 'original-not-archived' : 'original-unavailable',
       ...(Number.isSafeInteger(a.original_status) ? { original_status: a.original_status } : {}),
       ...(typeof a.original_checked_at === 'string' && a.original_checked_at ? { original_checked_at: a.original_checked_at } : {}),
     };
@@ -1210,6 +1237,9 @@ function syncReportSummary(report) {
     const reasons = Object.entries(report.oversized.downloaded_reasons || {})
       .map(([reason, count]) => `${OVERSIZED_REASON_LABELS[reason] || reason}: ${count}`).join('; ');
     text += ` ${plural(report.oversized.downloaded, 'attachment over the upload limit was', 'attachments over the upload limit were')} downloaded in full (${formatBytes(report.oversized.downloaded_bytes)}) and left out, because the download could not be skipped safely${reasons ? ` (${reasons})` : ''}.`;
+  }
+  if (report.filesV2OnlyImages?.images) {
+    text += ` Diagnostics: ${plural(report.filesV2OnlyImages.images, 'image is', 'images are')} listed by Claude only in files_v2 (in ${plural(report.filesV2OnlyImages.conversations, 'conversation', 'conversations')}); the exporter does not read files_v2, so ${report.filesV2OnlyImages.images === 1 ? 'it was' : 'they were'} not archived.`;
   }
   if (report.repairedFiles) {
     text += ` ${plural(report.repairedFiles, 'archived attachment did', 'archived attachments did')} not hold the bytes just downloaded and verified (changed outside AI Archive?) and ${report.repairedFiles === 1 ? 'was' : 'were'} rewritten with them; the previous version${report.repairedFiles === 1 ? ' remains' : 's remain'} in the repository history.`;
@@ -1503,7 +1533,7 @@ async function archiveSyncState() {
   for (const entry of index.conversations) {
     if (entry?.provider !== 'claude' || entry.account !== account || entry.id == null) continue;
     for (const item of Array.isArray(entry.preview_only) ? entry.preview_only : []) {
-      if (item?.reason !== 'original-unavailable' || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
+      if (!['original-unavailable', 'files-api-served-preview'].includes(item?.reason) || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
       previews.push({
         id: String(entry.id),
         file_uuid: item.file_uuid,
@@ -1534,7 +1564,77 @@ async function archiveSyncState() {
   return { conversations, oversized, preview_only: previews, originals };
 }
 
-async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null, oversizedDownloadsSkipped = 0, oversizedStats = null } = {}) {
+// Counts only: image files Claude lists in a message's files_v2 but not in its
+// files (the exporter reads files only). Diagnostics, nothing is exported.
+function sanitizeFilesV2Counts(value) {
+  if (!value || typeof value !== 'object') return null;
+  const images = Number.isSafeInteger(value.images) && value.images >= 0 ? value.images : null;
+  const conversations = Number.isSafeInteger(value.conversations) && value.conversations >= 0 ? value.conversations : null;
+  return images == null || conversations == null ? null : { images, conversations };
+}
+
+// The report of a plan-only sync: what a real sync of the same data would do.
+// Titles and paths stay in the extension (popup and local storage).
+function planReport({ report, planItems, nextIndex, existingPaths, changes, changedConversations, indexNeedsUpdate, filesV2OnlyImages, downgradeWarning }) {
+  const referenced = new Set(nextIndex.conversations.flatMap((e) => [e?.path,
+    ...(Array.isArray(e?.assets) ? e.assets.map((a) => a?.path) : []),
+    ...(Array.isArray(e?.retained_assets) ? e.retained_assets.map((a) => a?.path) : [])]).filter(Boolean));
+  const orphaned = [...existingPaths].filter((path) => path.startsWith('archive/conversations/') && !referenced.has(path)).sort();
+  const writes = changes.filter((change) => !change.delete);
+  const deletes = changes.filter((change) => change.delete).map((change) => change.path);
+  const sum = (field) => planItems.reduce((total, item) => total + (Array.isArray(item[field]) ? item[field].length : Number(item[field]) || 0), 0);
+  const items = planItems.map((item) => ({ ...item }));
+  return {
+    mode: 'plan-only',
+    published: false,
+    exporter_version: EXPORTER_VERSION,
+    totals: {
+      conversations_exported: planItems.filter((item) => item.status === 'changed' || item.status === 'unchanged').length,
+      conversations_to_change: changedConversations,
+      conversations_re_exported_from_older_exporter: planItems.filter((item) => item.status === 'changed' && item.previous_exporter_version !== EXPORTER_VERSION && item.previous_exporter_version !== 'new').length,
+      conversations_new: planItems.filter((item) => item.previous_exporter_version === 'new').length,
+      conversations_unchanged_not_downloaded: report.unchanged,
+      conversations_failed: report.failed.length,
+      conversations_kept_previous: report.keptPrevious.length,
+      conversations_with_files_not_archived: report.incomplete.length,
+      originals: sum('originals'),
+      originals_already_archived: sum('originals_already_archived'),
+      previews_kept_with_original: sum('previews_with_original'),
+      preview_only_images: sum('preview_only'),
+      new_files: writes.filter((change) => change.path.includes('/assets/')).length,
+      markdown_files_written: writes.filter((change) => change.path.endsWith('.md') && !change.path.includes('/assets/')).length,
+      files_retained_instead_of_deleted: sum('retained_this_sync'),
+      markdown_files_renamed: planItems.filter((item) => item.markdown_renamed_from).length,
+      deletions: deletes.length,
+      orphaned_files: orphaned.length,
+      index_would_be_written: changedConversations > 0 || indexNeedsUpdate,
+      ...(filesV2OnlyImages ? { files_v2_only_images: filesV2OnlyImages.images, files_v2_only_conversations: filesV2OnlyImages.conversations } : {}),
+      downgrade_warning: Boolean(downgradeWarning),
+    },
+    failed: report.failed.map((item) => ({ id: item.id, title: item.title, error: item.error, category: item.category, archived: item.archived })),
+    kept_previous: report.keptPrevious,
+    // Deletions a real sync would make: only Markdown files of renamed
+    // conversations (their content moves to the new path). Never attachments.
+    deletions: deletes,
+    orphaned_files: orphaned.slice(0, 1000),
+    conversations: items.filter((item) => item.status !== 'unchanged' || item.preview_only.length || item.retained_this_sync.length),
+  };
+}
+
+function planSummary(plan) {
+  const t = plan.totals;
+  return [
+    `Plan only: nothing was written to GitHub.`,
+    `${t.conversations_to_change} conversation(s) would change (${t.conversations_re_exported_from_older_exporter} re-exported from an older exporter, ${t.conversations_new} new); ${t.conversations_unchanged_not_downloaded} unchanged were not downloaded.`,
+    `Images: ${t.originals} original(s) (${t.originals_already_archived} already archived), ${t.previews_kept_with_original} preview(s) kept next to an original, ${t.preview_only_images} preview-only.`,
+    `Files: ${t.new_files} new, ${t.markdown_files_written} Markdown written, ${t.files_retained_instead_of_deleted} earlier file(s) kept instead of deleted, ${t.deletions} deletion(s) (renamed Markdown only), ${t.orphaned_files} file(s) already unreferenced.`,
+    `${t.conversations_failed} conversation(s) failed, ${t.conversations_kept_previous} kept their archived copy, ${t.conversations_with_files_not_archived} with files not archived.`,
+    ...(t.files_v2_only_images != null ? [`files_v2: ${t.files_v2_only_images} image(s) in ${t.files_v2_only_conversations} conversation(s) are listed only there (not exported; diagnostics only).`] : []),
+    ...(t.downgrade_warning ? ['A downgrade warning is active (see the warning).'] : []),
+  ].join(' ');
+}
+
+async function sync(conversations, onProgress, skipped = [], { fullList = false, unchangedIds = [], listed = null, archiveStateError = null, oversizedDownloadsSkipped = 0, oversizedStats = null, planOnly = false, filesV2OnlyImages = null } = {}) {
   const unchanged = Array.isArray(unchangedIds) ? unchangedIds.map(String) : [];
   const failedItems = Array.isArray(skipped) ? skipped : [];
   const report = {
@@ -1547,9 +1647,14 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     incomplete: [],
     failed: [],
     keptPrevious: [],
+    ...(filesV2OnlyImages?.images ? { filesV2OnlyImages } : {}),
   };
   let skippedNote = '';
   syncRunning = true;
+  // A plan-only sync computes everything a real sync would and publishes
+  // nothing: gh() refuses every write while this is set.
+  planOnlyActive = planOnly === true;
+  const planItems = [];
   cancelRequested = false;
   syncAbortController = new AbortController();
   activeProgressCallback = onProgress;
@@ -1614,7 +1719,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     // reused, never uploaded again.
     const unstaged = conversations.flatMap((c) => (Array.isArray(c?.assets) ? c.assets : []))
       .filter((asset) => asset?.sha256 && asset.base64 && !asset.blob_sha && !asset.upload_error);
-    if (unstaged.length) {
+    if (unstaged.length && !planOnly) {
       if (!ref) {
         await initializeEmptyRepository();
         assertNotCancelled();
@@ -1693,10 +1798,16 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       const missingItems = incompleteItems(c);
       // Never let an incomplete export replace an archived copy that has files
       // the new export lacks: keep the archived copy until a complete export.
+      // An earlier image the new export represents by an original or preview
+      // of the same Claude file name is not lost (it is kept as a retained
+      // file); anything else missing from the new export is.
       if (missingItems.length && previous) {
         const exportedPaths = new Set(entry.assets.map((asset) => asset.path));
-        if (previousAssets.some((asset) => asset?.path && !exportedPaths.has(asset.path))) {
+        const representedImages = new Set(entry.assets.filter((asset) => ASSET_VARIANTS.has(asset.variant)).map((asset) => asset.name));
+        const lost = (asset) => asset?.path && !exportedPaths.has(asset.path) && !(isImageAsset(asset) && representedImages.has(asset.name));
+        if (previousAssets.some(lost)) {
           report.keptPrevious.push({ id: String(c.external_id), title: c.title || String(c.external_id) });
+          planItems.push({ id: String(c.external_id), title: c.title || String(c.external_id), status: 'kept-previous', previous_exporter_version: previous?.exporter_version ?? null, reason: 'the new export is missing files the archived copy has', missing: missingItems.map(missingLabel) });
           onProgress?.({ stage: 'checking', current: i + 1, total, changed: changedConversations });
           continue;
         }
@@ -1740,18 +1851,29 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       }
 
       const currentAssetPaths = new Set(entry.assets.map((a) => a.path));
+      // Attachments are never deleted: every earlier file the new export no
+      // longer links is kept in the repository and listed (retainedAssetsFor).
       const retained = retainedAssetsFor(previous, entry, previousAssets, existingPaths);
-      const retainedPaths = new Set(retained.map((a) => a.path));
-      for (const oldAsset of previousAssets) {
-        if (oldAsset?.path && !currentAssetPaths.has(oldAsset.path) && !retainedPaths.has(oldAsset.path)) {
-          changes.push({ path: oldAsset.path, delete: true });
-        }
-      }
       if (retained.length) entry.retained_assets = retained;
       if (JSON.stringify(previous?.preview_only || []) !== JSON.stringify(entry.preview_only || [])
         || JSON.stringify(previous?.retained_assets || []) !== JSON.stringify(entry.retained_assets || [])) indexNeedsUpdate = true;
 
       map.set(key, entry);
+      const newFiles = [];
+      const planItem = {
+        id: String(c.external_id), title: c.title || String(c.external_id), status: changed ? 'changed' : 'unchanged',
+        previous_exporter_version: previous ? (previous.exporter_version ?? null) : 'new',
+        originals: entry.assets.filter((a) => a.variant === 'original').length,
+        originals_already_archived: normalizedAssets.assets.filter((a) => a.reused).length,
+        previews_with_original: entry.assets.filter((a) => a.variant === 'preview' && a.preview_of).length,
+        preview_only: (entry.preview_only || []).map((item) => ({ name: item.name, reason: item.reason, ...(item.original_status ? { original_status: item.original_status } : {}) })),
+        new_files: newFiles,
+        retained_this_sync: (entry.retained_assets || []).filter((a) => !(previous?.retained_assets || []).some((r) => r?.path === a.path))
+          .map((a) => ({ path: a.path, reason: a.reason, ...(a.superseded_by ? { superseded_by: a.superseded_by } : {}), ...(a.same_bytes_as ? { same_bytes_as: a.same_bytes_as } : {}) })),
+        ...(changed && previous?.path && previous.path !== path ? { markdown_renamed_from: previous.path } : {}),
+        ...(missingItems.length ? { not_archived: missingItems.map(missingLabel) } : {}),
+      };
+      planItems.push(planItem);
       if (changed) {
         changes.push({ path, content: markdown, encoding: 'utf-8' });
         for (const asset of normalizedAssets.assets) {
@@ -1761,6 +1883,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
           if (repairing) report.repairedFiles = (report.repairedFiles || 0) + 1;
           if (!previousAsset || !existingPaths.has(asset.path) || repairing) {
             assetWrites += 1;
+            newFiles.push({ path: asset.path, size: asset.size, ...(asset.variant ? { variant: asset.variant } : {}), ...(repairing ? { repair: true } : {}) });
             changes.push(asset.blob_sha
               ? { path: asset.path, sha: asset.blob_sha }
               : { path: asset.path, content: asset.base64, encoding: 'base64' });
@@ -1846,6 +1969,16 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
       if (missing.length) {
         throw new Error(`Archive integrity check failed: ${missing.length} file(s) referenced by "${archived.title || archived.id}" are missing from GitHub (${missing.slice(0, 3).join(', ')}). Sync that conversation to repair it; no archive changes were published.`);
       }
+    }
+
+    // Plan only: everything above is what a real sync would publish. Report
+    // it and stop before the first write (gh() would refuse it anyway).
+    if (planOnly) {
+      const plan = planReport({ report, planItems, nextIndex, existingPaths, changes, changedConversations, indexNeedsUpdate, filesV2OnlyImages, downgradeWarning });
+      const message = planSummary(plan);
+      try { await chrome.storage.local.set({ last_sync_plan: { at: new Date().toISOString(), plan } }); } catch {}
+      onProgress?.({ stage: 'done', total, changed: changedConversations, commit: null, planOnly: true, message, report: { ...report, plan }, partial: false });
+      return { total, changed: changedConversations, commit: null, skipped: skipped.length, planOnly: true, plan, report: { ...report, plan } };
     }
 
     // An empty repository has no ref/base tree. GitHub will reject /git/blobs
@@ -2052,6 +2185,7 @@ async function sync(conversations, onProgress, skipped = [], { fullList = false,
     throw error;
   } finally {
     syncRunning = false;
+    planOnlyActive = false;
     syncAbortController = null;
     activeProgressCallback = null;
     activeGitHubSettings = null;
@@ -2361,7 +2495,8 @@ function transferUploadContext(transfer) {
 }
 
 async function stageAsset(transfer, asset, base64) {
-  const context = await transferUploadContext(transfer);
+  // A plan-only transfer keeps the bytes: nothing is uploaded.
+  const context = transfer.metadata?.planOnly ? null : await transferUploadContext(transfer);
   if (pendingTransfer !== transfer) return;
   if (!context) {
     asset.base64 = base64;
@@ -2463,6 +2598,9 @@ function completeTransfer(msg) {
     archiveStateError: typeof metadata.archiveStateError === 'string' ? metadata.archiveStateError.slice(0, 300) : null,
     oversizedDownloadsSkipped: Number.isSafeInteger(metadata.oversizedDownloadsSkipped) && metadata.oversizedDownloadsSkipped > 0 ? metadata.oversizedDownloadsSkipped : 0,
     oversizedStats: sanitizeOversizedStats(metadata.oversizedStats),
+    // Plan only if either the start or the end of the transfer says so.
+    planOnly: metadata.planOnly === true || transfer.metadata?.planOnly === true,
+    filesV2OnlyImages: sanitizeFilesV2Counts(metadata.filesV2OnlyImages),
     conversations: transfer.conversations,
   };
 }
@@ -2605,6 +2743,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       archiveStateError: typeof payload.archiveStateError === 'string' ? payload.archiveStateError : null,
       oversizedDownloadsSkipped: Number.isSafeInteger(payload.oversizedDownloadsSkipped) ? payload.oversizedDownloadsSkipped : 0,
       oversizedStats: sanitizeOversizedStats(payload.oversizedStats),
+      planOnly: payload.planOnly === true,
+      filesV2OnlyImages: sanitizeFilesV2Counts(payload.filesV2OnlyImages),
     })
       .finally(() => {
         if (runningTransferId === msg.transferId) runningTransferId = null;

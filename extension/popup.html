@@ -72,6 +72,8 @@
   </select>
   <label class="toggle"><input id="autoSync" type="checkbox"><span>Automatically sync when Claude opens</span></label>
   <button id="sync">Sync Claude</button>
+  <button id="planSync" class="secondary" type="button" title="Downloads every conversation a full sync would, and reports what it would change. Writes nothing to GitHub.">Plan a full sync (writes nothing)</button>
+  <button id="copyPlan" class="secondary hidden" type="button" title="Copies the last plan report as JSON. It contains conversation titles and file paths; keep it private.">Copy last plan report</button>
   <div id="lastSync" class="last-sync"></div>
   <section id="syncReport" class="sync-report hidden" aria-live="polite"></section>
   <button id="copyDiagnostics" class="secondary hidden" type="button" title="Copies the structure of Claude's responses for the conversations that were not archived completely: no message text, titles, file names, file contents or credentials">Copy diagnostic report</button>

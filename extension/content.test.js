@@ -80,6 +80,7 @@ function createHarness(conversation, {
 } = {}) {
   const listeners = [];
   const requests = [];
+  const runtimeMessages = [];
   const bodyReads = [];
   const bodyCancels = [];
   const handoffs = [];
@@ -119,6 +120,7 @@ function createHarness(conversation, {
         },
       },
       sendMessage(message, callback) {
+        runtimeMessages.push(message);
         if (message.type === 'syncProgress') {
           progressMessages.push(message);
           if (message.stage === 'error') resolveErrorProgress(message);
@@ -311,6 +313,7 @@ function createHarness(conversation, {
   return {
     onMessage: listeners[0],
     requests,
+    runtimeMessages,
     bodyReads,
     bodyCancels,
     transferChunks,
@@ -4218,7 +4221,8 @@ test('HEIC, TIFF and SVG originals are kept unchanged and get Claude’s preview
 });
 
 test('a displayable original gets no display copy, and the preview is never requested', async () => {
-  for (const format of ['png', 'jpeg', 'gif', 'webp', 'bmp', 'avif']) {
+  // WebP is compared with the preview (see the Files API WebP tests).
+  for (const format of ['png', 'jpeg', 'gif', 'bmp', 'avif']) {
     const previewUrl = `https://files.example/${format}/preview`;
     const harness = createHarness(imageConversation(`conv-nd-${format}`, [pastedImage(`img-nd-${format}`, previewUrl)]), {
       assetResponses: { [ORIGINAL_URL(`img-nd-${format}`)]: { bytes: syntheticImage(format, 'x') }, [previewUrl]: { bytes: syntheticImage('webp', 'p') } },
@@ -4395,5 +4399,72 @@ test('two attachments of the same name in different messages are not paired with
   const [exported] = (await harness.firstHandoff).conversations;
   const preview = exported.assets.find((asset) => asset.source === 'message' && asset.variant === 'preview');
   assert.equal(preview.original_sha256, undefined);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+// ---------------------------------------------------------------------------
+// Files API WebP check, plan-only handoff, files_v2 diagnostics. Synthetic only.
+// ---------------------------------------------------------------------------
+
+test('a WebP from the Files API that is the same as the preview is archived as a preview, never as the original', async () => {
+  const same = syntheticImage('webp', 'served twice');
+  const previewUrl = 'https://files.example/w1/preview';
+  const harness = createHarness(imageConversation('conv-w1', [pastedImage('img-w1', previewUrl)]), {
+    assetResponses: { [ORIGINAL_URL('img-w1')]: { bytes: same }, [previewUrl]: { bytes: same } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [asset] = (await harness.firstHandoff).conversations[0].assets;
+  assert.equal(asset.variant, 'preview');
+  assert.equal(asset.preview_reason, 'files-api-served-preview');
+  assert.equal(asset.mime, 'image/webp');
+  assert.equal(asset.detected_extension, 'webp');
+  assert.equal(asset.sha256, sha256Of(same), 'the bytes are kept');
+  assert.ok(harness.requests.includes(previewUrl), 'the preview was compared');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a WebP from the Files API that differs from the preview, or with no preview to compare, stays the original', async () => {
+  for (const [label, previewResponse] of [['different preview', { bytes: syntheticImage('webp', 'smaller preview') }], ['preview 404', { status: 404 }]]) {
+    const upload = syntheticImage('webp', 'a WebP upload');
+    const previewUrl = `https://files.example/w2-${label}/preview`;
+    const harness = createHarness(imageConversation('conv-w2', [pastedImage('img-w2', previewUrl)]), {
+      assetResponses: { [ORIGINAL_URL('img-w2')]: { bytes: upload }, [previewUrl]: previewResponse },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [asset] = (await harness.firstHandoff).conversations[0].assets;
+    assert.equal(asset.variant, 'original', label);
+    assert.equal(asset.sha256, sha256Of(upload), label);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('a plan-only sync says so in the first and the last message of its transfer; a normal sync does not', async () => {
+  for (const planOnly of [true, false]) {
+    const harness = createHarness(plainConversation('conv-plan'), { storage: {} });
+    harness.onMessage({ type: 'startSync', limit: 'all', ...(planOnly ? { planOnly: true } : {}) }, {}, () => {});
+    const handoff = await harness.firstHandoff;
+    const start = harness.runtimeMessages.find((m) => m.type === 'syncTransferStart');
+    assert.equal(start.metadata?.planOnly === true, planOnly, `start (${planOnly})`);
+    assert.equal(handoff.planOnly === true, planOnly, `end (${planOnly})`);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('images listed only in files_v2 are counted for diagnostics and not exported', async () => {
+  const conversation = imageConversation('conv-v2', [pastedImage('img-in-files', 'https://files.example/v2a')]);
+  conversation.chat_messages[0].files_v2 = [
+    { file_uuid: 'img-in-files', file_name: '1700000000000_image.png', file_kind: 'image' },
+    { file_uuid: 'img-only-v2', file_name: 'extra.png', file_kind: 'image', preview_asset: { url: 'https://files.example/v2b' } },
+    { file_uuid: 'doc-only-v2', file_name: 'notes.pdf', file_kind: 'document' },
+  ];
+  const harness = createHarness(conversation, { assetResponses: { [ORIGINAL_URL('img-in-files')]: { bytes: syntheticImage('png', 'v2') } }, storage: {} });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.deepEqual(plain(handoff.filesV2OnlyImages), { images: 1, conversations: 1 });
+  assert.equal(handoff.conversations[0].assets.length, 1, 'files_v2 is not an export source');
+  assert.equal(harness.requests.some((url) => url.includes('img-only-v2') || url.includes('v2b')), false);
   harness.finishFirstHandoff({ ok: true });
 });

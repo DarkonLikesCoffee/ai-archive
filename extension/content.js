@@ -18,6 +18,9 @@
   // When Claude no longer serves such an original, the archived one is linked
   // again instead of the image being demoted to a preview.
   let knownArchivedOriginals = null;
+  // Diagnostics only: image files Claude lists in a message's files_v2 but not
+  // in its files, which the exporter reads (counts, never names or IDs).
+  let filesV2OnlyImages = { images: 0, conversations: 0 };
 
   // Per-sync counts of downloads over the upload limit: only counts, byte
   // totals and reason codes, never names, IDs or contents.
@@ -835,6 +838,22 @@
     }
   }
 
+  // The Files API's WebP compared with the message file's preview: returns a
+  // preview-only asset when both are the same bytes, or null when they differ
+  // or the preview is unavailable (404/410). Other failures fail the download.
+  async function sameAsPreview(accepted, url, name, signal) {
+    try {
+      const preview = await fetchAsset(url, name, null, signal, { route: 'message-url', detect: true });
+      if (preview.sha256 !== accepted.sha256) return null;
+      const { variant, detected_extension: extension, ...rest } = accepted;
+      return { ...rest, mime: 'image/webp', detected_extension: 'webp', variant: 'preview', preview_reason: 'files-api-served-preview', original_status: 200, original_checked_at: new Date().toISOString() };
+    } catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      if (isUnavailable(e)) return null;
+      throw e;
+    }
+  }
+
   // One image attached to a message: Claude's original first, then, only if
   // Claude does not serve the original (404/410, or no file ID to ask for
   // it), the message file's preview URL, archived and labelled as a preview.
@@ -867,6 +886,13 @@
         originalStatus = e.status;
         checkedAt = new Date().toISOString();
         reason = 'original-unavailable';
+      }
+      if (accepted?.mime === 'image/webp' && url) {
+        // A WebP from the Files API may be Claude's preview rather than the
+        // upload. If the preview URL serves the very same bytes, it is
+        // archived and labelled as a preview, never as the original.
+        const servedPreview = await sameAsPreview(accepted, url, name, signal);
+        if (servedPreview) return servedPreview;
       }
       if (accepted) return withDisplayCopy(accepted, url, name, signal);
       // Claude no longer serves an original the archive already holds: link
@@ -1104,6 +1130,24 @@
       delete preview.original_status;
       delete preview.original_checked_at;
     }
+  }
+
+  // Image entries of message.files_v2 with no entry in message.files for the
+  // same file UUID (or, without one, the same name). Counted, not exported.
+  function countFilesV2OnlyImages(messages) {
+    let count = 0;
+    for (const message of Array.isArray(messages) ? messages : []) {
+      const files = Array.isArray(message?.files) ? message.files : [];
+      const ids = new Set(files.map(messageFileId).filter(Boolean));
+      const names = new Set(files.map((f) => String(f?.file_name || f?.name || '').toLowerCase()).filter(Boolean));
+      for (const file of Array.isArray(message?.files_v2) ? message.files_v2 : []) {
+        const name = file?.file_name || file?.name || '';
+        if (!isImageMessageFile(file, name)) continue;
+        const id = messageFileId(file);
+        if (id ? !ids.has(id) : !names.has(String(name).toLowerCase())) count += 1;
+      }
+    }
+    return count;
   }
 
   async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map(), incomplete = [], sandboxInfo = {}, sandboxSupported = true) {
@@ -1680,6 +1724,8 @@
     // in the index so the conversation is retried by later syncs.
     const incomplete = [];
     const sandboxSupported = c.workspace_upgraded !== true && c.is_wiggle_enabled !== false;
+    const v2Only = countFilesV2OnlyImages(raw);
+    if (v2Only) { filesV2OnlyImages.images += v2Only; filesV2OnlyImages.conversations += 1; }
     const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage, incomplete, sandboxInfo, sandboxSupported);
     return {
       external_id: c.uuid,
@@ -1931,8 +1977,11 @@
     }
   }
 
-  async function runSync(limit = 'all', { automatic = false } = {}) {
+  async function runSync(limit = 'all', { automatic = false, planOnly = false } = {}) {
     if (syncing) return;
+    // An automatic sync is never plan-only, and a plan-only sync never publishes.
+    planOnly = planOnly === true && !automatic;
+    filesV2OnlyImages = { images: 0, conversations: 0 };
     syncing = true;
     currentAbortController = new AbortController();
     const signal = currentAbortController.signal;
@@ -1984,7 +2033,7 @@
       let firstExportError = null;
       // The transfer starts before fetching, so a busy extension is reported
       // at once instead of after every conversation has been downloaded.
-      const transfer = await createTransferSession(signal);
+      const transfer = await createTransferSession(signal, { planOnly });
       let result;
       try {
         for (let i = 0; i < selected.length; i++) {
@@ -2058,6 +2107,8 @@
         // while the first batch is still being committed to GitHub.
         result = await transfer.finish({
           skipped, unchangedIds, fullList: limit === 'all', listed: listData.length,
+          ...(planOnly ? { planOnly: true } : {}),
+          filesV2OnlyImages: { ...filesV2OnlyImages },
           ...(archiveStateError ? { archiveStateError } : {}),
           ...(oversizedStats.skipped ? { oversizedDownloadsSkipped: oversizedStats.skipped } : {}),
           ...(oversizedStats.detected ? { oversizedStats: { ...oversizedStats, downloaded_reasons: { ...oversizedStats.downloaded_reasons }, downloaded_routes: { ...oversizedStats.downloaded_routes } } } : {}),
@@ -2167,7 +2218,7 @@
     return { id, records, payloads };
   }
 
-  async function createTransferSession(signal) {
+  async function createTransferSession(signal, { planOnly = false } = {}) {
     const transferId = createInlineMarkerNonce();
     let lostError = null;
     let finishing = false;
@@ -2177,7 +2228,9 @@
     let batchIndex = 0;
     let sentConversations = 0;
 
-    const started = await sendRuntimeMessage({ type: 'syncTransferStart', transferId, protocol: 2 });
+    // A plan-only transfer says so from its first message, so the extension
+    // never uploads its attachments.
+    const started = await sendRuntimeMessage({ type: 'syncTransferStart', transferId, protocol: 2, ...(planOnly ? { metadata: { planOnly: true } } : {}) });
     if (!started?.ok) {
       throw new Error(started?.error || 'The extension could not prepare the sync transfer. Nothing was published; sync again.');
     }
@@ -2324,7 +2377,7 @@
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'startSync') {
-      runSync(msg.limit || 'all');
+      runSync(msg.limit || 'all', { planOnly: msg.planOnly === true });
       sendResponse({ ok: true });
       return false;
     }

@@ -272,7 +272,7 @@ function handleClaude(url) {
     check('empty repository is initialized, then one sync commit', github.commitCount() === 2, `commits=${github.commitCount()}`);
     check('both conversations are published as Markdown', mdPaths.length === 2, mdPaths.join(', '));
     const index = JSON.parse(files['archive/index.json']);
-    check('index lists both conversations', index.conversations.length === 2 && index.conversations.every((c) => c.exporter_version === 1));
+    check('index lists both conversations', index.conversations.length === 2 && index.conversations.every((c) => c.exporter_version === 2));
     check('the index records the oldest extension allowed to write to it', index.requires_extension === '0.5.29', String(index.requires_extension));
     check('the archive marker file is written with it', JSON.parse(files['archive/.ai-archive.json'] || '{}').requires_extension === '0.5.29');
     const tripPath = mdPaths.find((file) => files[file].toString().includes('Lisbon'));
@@ -321,7 +321,14 @@ function handleClaude(url) {
     last = await syncAll();
     check('retry after the outage publishes the change', github.commitCount() === 4 && /1 conversation changed/.test(last), last);
     files = github.files();
-    check('the image that left the conversation is removed', !Object.keys(files).some((file) => file.includes('/assets/')), Object.keys(files).join(', '));
+    // 0.5.29: attachments are never deleted. The image is kept and listed.
+    const keptIndex = JSON.parse(files['archive/index.json']);
+    const keptTrip = keptIndex.conversations.find((c) => c.id === 'conv-a');
+    const keptPath = Object.keys(files).find((file) => file.includes('/assets/'));
+    check('the image that left the conversation is kept, unlinked and listed as retained, not deleted',
+      Boolean(keptPath) && !files[keptTrip.path].toString().includes(keptPath.split('/assets/')[1])
+        && keptTrip.retained_assets?.some((kept) => kept.path === keptPath && kept.reason === 'not-in-export' && kept.variant === undefined),
+      JSON.stringify(keptTrip.retained_assets));
 
     // Reopening the popup shows the stored outcome of the last sync.
     await popup.reload();

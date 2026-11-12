@@ -2,6 +2,46 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Migration fixes for the full re-sync — 2026-11-12 (extension 0.5.29, exporter version 2)
+
+Fixes from the root-cause audit (each reproduced first against the PR #102 code; synthetic data only).
+
+1. **A full sync re-exported nothing.** Unchanged entries with `exporter_version: 1` were skipped. `EXPORTER_VERSION` is now 2, so every earlier entry is re-exported once. A failed re-export keeps the archived copy and version 1, so it is retried.
+2. **The incomplete-conversation guard blocked corrections.** An earlier image the new export represents by an original or preview of the same Claude file name is no longer "lost". Any other missing file still keeps the archived copy.
+3. **Never delete attachments (owner's requirement).** Every earlier file the export no longer links, of any type, is kept and listed in `retained_assets`.
+   - Each kept file records `reason` (`superseded` or `not-in-export`), `superseded_by` and `same_bytes_as`. `variant: "preview"` is set only when it is identical to a current preview.
+   - A kept file is never labelled as an original.
+   - Only a renamed conversation's old Markdown file is removed.
+4. **Plan-only full sync.**
+   - Popup: "Plan a full sync (writes nothing)".
+   - The flag travels with the transfer's first message, and attachments are not staged.
+   - `gh()` refuses every non-GET request while it runs. The plan exits before the first write, even for an empty repository.
+   - The report: totals, failed conversations with reasons, kept-previous, deletions, orphaned files, and per-conversation details. It is stored locally (`last_sync_plan`) and copied as JSON from the popup.
+5. **Files API WebP check.** When the Files API returns WebP and the preview is the same bytes, the image is archived as a preview (`files-api-served-preview`), never as the original.
+6. **`files_v2` diagnostics.** Image entries only in `files_v2` are counted (counts only) and reported. They are not exported.
+
+**Tests.**
+- Migration against an archive written by the real 0.5.28 code: an original served, an original unavailable, your two incomplete conversations with five previews, a non-image file that left the export, a failed re-export.
+- The guard's protection still holds; a second full sync with fresh downloads publishes nothing.
+- Plan-only: full report and no write request, including an empty repository, a plan-only transfer, and an injected write attempt.
+- The WebP check; `files_v2` counts.
+- Changed expectations for the new rules: attachments kept, not deleted; exporter version 2.
+- Negative checks: each fix disabled fails 1–7 tests.
+
+**Results.**
+- `node --test extension/*.test.js`: 298/298.
+- `cd web && npm test`: 127/127. `npm run build`: OK.
+- `node e2e/extension-sync.e2e.cjs`: exit 0, 55 PASS / 0 FAIL. Its check "the image that left the conversation is removed" now checks that it is kept and listed.
+- `node web/e2e/viewer.e2e.cjs`: exit 0, 47 PASS.
+
+**Archive-side pre-plan of the owner's read-only copy** (`15d25de`; counts only; run in the cloud session, no Claude data):
+- Main account: 802 conversations, all exporter version 1, all to be re-exported; 652 images (612 WebP under `.png`/`.jpg`); 243 conversations with images.
+- Second profile: 12 conversations, 114 WebP images, needing its own login.
+- Test profile: 10 entries.
+- 56 files already unreferenced.
+
+**Not done.** The plan-only run against Claude must run in the owner's browser. No real sync. No archive changes.
+
 ## A corrupted marker file no longer erases a downgrade warning — 2026-11-10 (extension 0.5.29)
 
 - **Bug, reproduced first in a scratch copy.** An unreadable `archive/.ai-archive.json` (invalid JSON or not an object), or a `downgrade_warning` that was not a readable object, raised no warning once the index had its `requires_extension` again. The next sync then rewrote the marker clean, silently erasing a warning nobody had acknowledged.
