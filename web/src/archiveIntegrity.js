@@ -146,6 +146,24 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
     referenced.add(path);
   };
 
+  // Records only extension 0.5.29 or later writes, without the marker every
+  // such version writes with them: an older extension rewrote the index since,
+  // and may have replaced original images with previews (see
+  // olderExtensionWroteArchive in extension/background.js).
+  const originalFirst = index.conversations.some((entry) => entry && (
+    (Array.isArray(entry.assets) && entry.assets.some((asset) => asset?.variant === 'original' || asset?.variant === 'preview'))
+    || Array.isArray(entry.preview_only) || Array.isArray(entry.retained_assets)));
+  // archive/.ai-archive.json is written only by 0.5.29 or later, with every
+  // index, and older extensions never touch it: present while the index lacks
+  // requires_extension means an older extension rewrote the index, even when
+  // it re-exported every conversation that had image records.
+  const markerFile = blobs.has('archive/.ai-archive.json');
+  if (index.requires_extension == null && (markerFile || originalFirst)) {
+    findings.push(finding('warning', 'older-extension-wrote', 'archive/index.json', markerFile
+      ? 'archive/.ai-archive.json shows that AI Archive 0.5.29 or later wrote this archive, but the index no longer has "requires_extension": an extension older than 0.5.29 has rewritten the index since. In conversations it re-exported, original images may have been replaced by previews; the originals remain in the repository history.'
+      : 'The index records original and preview images but not "requires_extension", which every extension that writes those records adds: an extension older than 0.5.29 has rewritten the index since. In conversations it re-exported, original images may have been replaced by previews; the originals remain in the repository history.'));
+  }
+
   index.conversations.forEach((entry, position) => {
     checked.conversations += 1;
     if (!entry || typeof entry !== 'object') {
@@ -186,6 +204,31 @@ export async function auditArchive({ index, tree, markdown = null, readBytes = n
         findings.push(finding('error', 'asset-missing', asset.path, `An attachment of ${label} is not in the repository.`));
       } else if (blob.size != null && asset.size != null && Number(blob.size) !== Number(asset.size)) {
         findings.push(finding('error', 'asset-size-mismatch', asset.path, `The index records ${asset.size} bytes; the repository file has ${blob.size}.`));
+      }
+    }
+    // A preview kept next to its original must name one of this entry's
+    // assets; a preview-only image must be an indexed asset with no original.
+    const assetPaths = new Set((Array.isArray(entry.assets) ? entry.assets : []).map((asset) => asset?.path).filter(Boolean));
+    for (const asset of Array.isArray(entry.assets) ? entry.assets : []) {
+      if (asset?.preview_of != null && !assetPaths.has(asset.preview_of)) {
+        findings.push(finding('warning', 'preview-of-missing', asset.path ?? entry.path, `A preview in ${label} names its original as ${asset.preview_of}, which is not one of the conversation's indexed attachments.`));
+      }
+    }
+    for (const item of Array.isArray(entry.preview_only) ? entry.preview_only : []) {
+      const asset = (entry.assets || []).find((candidate) => candidate?.path === item?.path);
+      if (!asset) {
+        findings.push(finding('warning', 'preview-only-unlisted', item?.path ?? entry.path, `${label} lists a preview-only image that is not one of its indexed attachments.`));
+      } else if (asset.preview_of) {
+        findings.push(finding('warning', 'preview-only-has-original', item.path, `${label} lists this image as preview-only, but its original is archived (${asset.preview_of}).`));
+      }
+    }
+    // Earlier image files a re-export kept instead of deleting (usually
+    // Claude's previews replaced by originals): referenced, not linked.
+    for (const kept of Array.isArray(entry.retained_assets) ? entry.retained_assets : []) {
+      if (typeof kept?.path !== 'string' || !kept.path) continue;
+      claim(kept.path, label, 'asset');
+      if (!blobs.has(kept.path)) {
+        findings.push(finding('warning', 'retained-asset-missing', kept.path, `A file the index lists as kept from an earlier export of ${label} is not in the repository.`));
       }
     }
     if (Array.isArray(entry.incomplete) && entry.incomplete.length) {

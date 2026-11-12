@@ -328,3 +328,27 @@ test('the popup report names why a conversation or file was left out, and keeps 
     'Conversation archived · attachments missing',
   ]);
 });
+
+test('a sync that found an older extension’s writes shows a warning first, even with nothing else to report', () => {
+  const { describeLastSync, describeSyncReport } = loadPopup();
+  const now = Date.parse('2026-11-10T12:00:00Z');
+  const report = { olderExtensionWrote: true, incomplete: [{ id: 'c-1', title: 'Other', missing: ['x.bin'] }] };
+  const entries = JSON.parse(JSON.stringify(describeSyncReport(report)));
+  assert.equal(entries[0].type, 'warning');
+  assert.equal(entries[0].title, 'An older AI Archive extension wrote to this archive');
+  assert.match(entries[0].details[0], /may have been replaced by Claude's previews; the originals remain in the repository history\. Update every installed copy of the extension to 0\.5\.29 or later\./);
+  assert.equal(entries[1].type, 'incomplete');
+  const alone = JSON.parse(JSON.stringify(describeSyncReport({ olderExtensionWrote: true })));
+  assert.equal(alone.length, 1, 'shown on its own too');
+  assert.equal(describeLastSync({ stage: 'done', at: '2026-11-10T11:59:00Z', message: 'Sync finished with problems: …', partial: true, report: { olderExtensionWrote: true } }, now),
+    'Last sync finished with problems 1 min ago.', 'the report panel carries it');
+  assert.deepEqual(JSON.parse(JSON.stringify(describeSyncReport({ olderExtensionWrote: false }))), []);
+});
+
+test('an unreadable version marker is named as such in the popup, with the same acknowledgement', () => {
+  const { describeSyncReport } = loadPopup();
+  const [entry] = JSON.parse(JSON.stringify(describeSyncReport({ olderExtensionWrote: true, downgradeWarning: { detected_at: 'unreadable-marker-abc', reason: 'marker-unreadable' } })));
+  assert.equal(entry.title, "The archive's version marker could not be read");
+  assert.match(entry.details[0], /archive\/\.ai-archive\.json could not be read, so a warning that an older AI Archive extension wrote to this archive may have been lost/);
+  assert.equal(entry.acknowledge, 'unreadable-marker-abc');
+});

@@ -65,6 +65,7 @@ async function chooseArchiveAccount(value, { pending = false } = {}) {
   $('accountLogged').value = account;
   selectedArchiveAccount = account;
   $('sync').disabled = activeSync || !selectedArchiveAccount;
+  if ($('planSync')) $('planSync').disabled = activeSync || !selectedArchiveAccount;
   $('autoSync').disabled = false;
   updateAccountText(stored, account);
   return account;
@@ -112,6 +113,7 @@ function describeLastSync(record, now = Date.now()) {
       : record.partial ? 'Last sync finished with problems' : 'Last sync';
   const hasReport = Boolean(record.report && (
     record.report.incomplete?.length || record.report.failed?.length || record.report.keptPrevious?.length
+    || record.report.olderExtensionWrote === true
   ));
   const message = hasReport ? '' : String(record.message || '');
   const summary = message.length > 150 ? `${message.slice(0, 150)}…` : message;
@@ -137,6 +139,22 @@ function missingCategoriesText(categories) {
 function describeSyncReport(report) {
   if (!report || typeof report !== 'object') return [];
   const entries = [];
+  // First and always shown: an older extension rewrote this archive after it
+  // began recording original images (see olderExtensionWroteArchive).
+  if (report.olderExtensionWrote === true) {
+    const detectedAt = typeof report.downgradeWarning?.detected_at === 'string' ? report.downgradeWarning.detected_at : null;
+    const unreadable = ['marker-unreadable', 'warning-unreadable'].includes(report.downgradeWarning?.reason);
+    entries.push({ type: 'warning',
+      title: unreadable ? "The archive's version marker could not be read" : 'An older AI Archive extension wrote to this archive',
+      subtitle: 'Original images may have been replaced by previews',
+      details: [
+        unreadable
+          ? 'archive/.ai-archive.json could not be read, so a warning that an older AI Archive extension wrote to this archive may have been lost. Check that file\'s repository history; original images may have been replaced by Claude\'s previews, and the originals remain in the history. Update every installed copy of the extension to 0.5.29 or later.'
+          : 'An extension older than 0.5.29 rewrote the archive after it began recording original images. In conversations it re-exported, original images may have been replaced by Claude\'s previews; the originals remain in the repository history. Update every installed copy of the extension to 0.5.29 or later.',
+        'This warning is shown after every sync until you acknowledge it.',
+      ],
+      ...(detectedAt ? { acknowledge: detectedAt } : {}) });
+  }
   for (const item of Array.isArray(report.failed) ? report.failed : []) {
     entries.push({ type: 'failed', title: item.title || item.id, id: item.id,
       subtitle: `${FAILURE_LABELS[item.category] || 'Not exported'} · ${item.archived ? 'previous archive kept' : 'not in archive'}`,
@@ -222,6 +240,19 @@ function showSyncReport(report) {
       row.textContent = line;
       body.append(row);
     }
+    if (entry.acknowledge) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = 'I understand';
+      button.addEventListener('click', () => {
+        button.disabled = true;
+        chrome.runtime.sendMessage({ type: 'acknowledgeDowngradeWarning', detected_at: entry.acknowledge }, (response) => {
+          button.textContent = response?.ok ? 'Acknowledged: the next sync clears this warning' : 'Could not save; try again';
+          if (!response?.ok) button.disabled = false;
+        });
+      });
+      body.append(button);
+    }
     details.append(body);
     list.append(details);
   }
@@ -304,6 +335,7 @@ function setProgress(msg) {
   $('cancel').disabled = !['fetching','preparing','checking','initializing-repo','uploading','creating-tree','creating-commit','finalizing'].includes(msg.stage);
   activeSync = !$('cancel').disabled;
   $('sync').disabled = activeSync || !selectedArchiveAccount;
+  if ($('planSync')) $('planSync').disabled = activeSync || !selectedArchiveAccount;
   if (msg.stage === 'error') status.className = 'status err';
   else if (msg.stage === 'done' || msg.stage === 'cancelled') status.className = 'status ok';
 }
@@ -316,6 +348,7 @@ async function refresh() {
   $('lastSync').textContent = describeLastSync(s.last_sync);
   showSyncReport(s.last_sync?.report);
   await loadDiagnostics(s.last_sync_diagnostics);
+  await showCopyPlan();
   if (s.github_token) {
     $('setup').classList.add('hidden'); $('logged').classList.remove('hidden');
     const storedAccount = normalizeAccountName(s.archive_account);
@@ -511,6 +544,37 @@ $('sync').onclick = async () => {
   } catch (e) { status.className = 'status err'; status.textContent = e.message; }
 };
 
+// A plan-only full sync: everything a real "All conversations" sync does,
+// except that nothing is written to GitHub (see sync's planOnly).
+$('planSync').onclick = async () => {
+  try {
+    if (!selectedArchiveAccount) throw new Error('Select an archive account before planning a sync.');
+    status.className = 'status'; status.textContent = 'Planning a full sync: nothing will be written to GitHub…';
+    setProgress({ stage: 'fetching', current: 0, total: 0 });
+    await sendToClaude({ type: 'startSync', limit: 'all', planOnly: true }, { openIfMissing: true });
+  } catch (e) { status.className = 'status err'; status.textContent = e.message; }
+};
+
+$('copyPlan').onclick = async () => {
+  try {
+    const { last_sync_plan: stored } = await chrome.storage.local.get('last_sync_plan');
+    if (!stored?.plan) throw new Error('There is no plan report yet.');
+    await navigator.clipboard.writeText(JSON.stringify(stored, null, 2));
+    status.className = 'status ok';
+    status.textContent = 'Plan report copied. It contains conversation titles and file paths; keep it private.';
+  } catch (e) {
+    status.className = 'status err';
+    status.textContent = `Could not copy the plan report: ${e.message}`;
+  }
+};
+
+async function showCopyPlan() {
+  try {
+    const { last_sync_plan: stored } = await chrome.storage.local.get('last_sync_plan');
+    $('copyPlan')?.classList.toggle('hidden', !stored?.plan);
+  } catch {}
+}
+
 $('cancel').onclick = async () => {
   if (!activeSync) return;
   $('cancel').disabled = true;
@@ -574,6 +638,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     $('lastSync').textContent = describeLastSync({ stage: msg.stage, at: new Date().toISOString(), message: msg.message || msg.error, partial: msg.partial === true, report: msg.report });
     showSyncReport(msg.report);
     chrome.storage.local.get('last_sync_diagnostics').then((stored) => loadDiagnostics(stored.last_sync_diagnostics)).catch(() => showDiagnostics(null));
+    showCopyPlan();
   }
 });
 chrome.runtime.sendMessage({ type: 'getSyncState' }, (state) => { if (!chrome.runtime.lastError && state?.running) setProgress(state); });

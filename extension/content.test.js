@@ -69,6 +69,8 @@ function createHarness(conversation, {
   storage = null,
   archiveState = null,
   archiveOversized = [],
+  archivePreviews = [],
+  archiveOriginals = [],
   archiveStateResponse = null,
   handoffChunkChars = null,
   rejectChunkAt = -1,
@@ -78,6 +80,7 @@ function createHarness(conversation, {
 } = {}) {
   const listeners = [];
   const requests = [];
+  const runtimeMessages = [];
   const bodyReads = [];
   const bodyCancels = [];
   const handoffs = [];
@@ -117,13 +120,14 @@ function createHarness(conversation, {
         },
       },
       sendMessage(message, callback) {
+        runtimeMessages.push(message);
         if (message.type === 'syncProgress') {
           progressMessages.push(message);
           if (message.stage === 'error') resolveErrorProgress(message);
           if (message.stage === 'cancelled') resolveCancelledProgress(message);
         }
         if (message.type === 'getArchiveState') {
-          callback?.(archiveStateResponse || (archiveState ? { ok: true, conversations: archiveState, oversized: archiveOversized } : { ok: false, error: 'not configured in test' }));
+          callback?.(archiveStateResponse || (archiveState ? { ok: true, conversations: archiveState, oversized: archiveOversized, preview_only: archivePreviews, originals: archiveOriginals } : { ok: false, error: 'not configured in test' }));
           return Promise.resolve();
         }
         if (TRANSFER_TYPES.has(message.type)) {
@@ -171,8 +175,9 @@ function createHarness(conversation, {
     requests.push(requestUrl);
     if (/^https?:\/\//i.test(requestUrl) || requestUrl in assetResponses) {
       const configured = assetResponses[requestUrl] || {};
+      if (configured.networkError) throw new TypeError('Failed to fetch');
       const status = configured.status ?? 200;
-      const bytes = new TextEncoder().encode(configured.content ?? 'asset bytes');
+      const bytes = configured.bytes instanceof Uint8Array ? configured.bytes : new TextEncoder().encode(configured.content ?? 'asset bytes');
       activeDownloads += 1;
       maxActiveDownloads = Math.max(maxActiveDownloads, activeDownloads);
       try {
@@ -239,7 +244,7 @@ function createHarness(conversation, {
       const match = String(url).match(/[?&]path=([^&]*)/);
       const filePath = match ? decodeURIComponent(match[1]) : '';
       const status = sandboxDownloadStatuses[filePath] ?? 200;
-      const bytes = new TextEncoder().encode(sandboxContents[filePath] ?? '');
+      const bytes = sandboxContents[filePath] instanceof Uint8Array ? sandboxContents[filePath] : new TextEncoder().encode(sandboxContents[filePath] ?? '');
       activeDownloads += 1;
       maxActiveDownloads = Math.max(maxActiveDownloads, activeDownloads);
       try {
@@ -263,6 +268,11 @@ function createHarness(conversation, {
       } finally {
         activeDownloads -= 1;
       }
+    }
+    // Claude's Files API for a file the test configured nothing for: Claude
+    // does not serve that original (observed on a real account as HTTP 404).
+    if (/^\/api\/organizations\/[^/]+\/files\/[^/]+\/contents$/.test(parsedUrl.pathname)) {
+      return { ok: false, status: 404, json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0), body: { cancel: async () => {} }, headers: { get: () => null } };
     }
     throw new Error(`Unexpected request in test: ${url}`);
   };
@@ -303,6 +313,7 @@ function createHarness(conversation, {
   return {
     onMessage: listeners[0],
     requests,
+    runtimeMessages,
     bodyReads,
     bodyCancels,
     transferChunks,
@@ -3830,4 +3841,630 @@ test('a sandbox copy with the same name and the same bytes as the message file i
   const handoff = await harness.firstHandoff;
   harness.finishFirstHandoff({ ok: true });
   assert.equal(handoff.conversations[0].assets.length, 1, 'identical bytes are deduplicated by content');
+});
+
+// ---------------------------------------------------------------------------
+// Original-first image attachments. Every image here is synthetic: a valid
+// format signature followed by test bytes. No real conversation images.
+// ---------------------------------------------------------------------------
+
+const IMAGE_SIGNATURES = {
+  png: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52],
+  jpeg: [0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46, 0],
+  gif: [...Buffer.from('GIF89a')],
+  webp: [...Buffer.from('RIFF'), 0x24, 0, 0, 0, ...Buffer.from('WEBPVP8 ')],
+  bmp: [...Buffer.from('BM'), ...new Array(24).fill(0)],
+  tiff: [0x49, 0x49, 0x2a, 0x00],
+  avif: [0, 0, 0, 0x1c, ...Buffer.from('ftypavif')],
+  heic: [0, 0, 0, 0x18, ...Buffer.from('ftypheic')],
+  svg: [...Buffer.from('<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2">')],
+};
+const syntheticImage = (format, seed) => Uint8Array.from([...IMAGE_SIGNATURES[format], ...Buffer.from(`synthetic ${format} ${seed}`)]);
+const sha256Of = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const ORIGINAL_URL = (id) => `/api/organizations/org-id/files/${id}/contents`;
+
+function imageConversation(uuid, files, { upgraded = true, text = 'Look at this.' } = {}) {
+  const conversation = plainConversation(uuid);
+  if (upgraded) conversation.workspace_upgraded = true;
+  else conversation.is_wiggle_enabled = true;
+  conversation.chat_messages[0].content = [{ type: 'text', text }];
+  conversation.chat_messages[0].files = files;
+  return conversation;
+}
+const pastedImage = (id, previewUrl, extra = {}) => ({
+  file_uuid: id, file_name: '1700000000000_image.png', file_kind: 'image',
+  preview_asset: { url: previewUrl, file_variant: 'preview', image_width: 4, image_height: 3 },
+  thumbnail_asset: { url: `https://files.example/${id}/thumbnail`, file_variant: 'thumbnail' },
+  ...extra,
+});
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+test('an image is archived from Claude’s original upload, not from its WebP preview (upgraded workspace)', async () => {
+  const original = syntheticImage('png', 'original');
+  const previewUrl = 'https://files.example/img-1/preview';
+  const harness = createHarness(imageConversation('conv-original', [pastedImage('img-1', previewUrl)]), {
+    assetResponses: {
+      [ORIGINAL_URL('img-1')]: { bytes: original, contentType: 'image/png' },
+      [previewUrl]: { bytes: syntheticImage('webp', 'preview'), contentType: 'image/webp' },
+    },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(plain(exported.incomplete), []);
+  assert.equal(exported.assets.length, 1);
+  const [asset] = exported.assets;
+  assert.deepEqual(new Uint8Array(Buffer.from(asset.base64, 'base64')), original, 'the original bytes, unchanged');
+  assert.equal(asset.sha256, sha256Of(original));
+  assert.equal(asset.size, original.length);
+  assert.equal(asset.mime, 'image/png');
+  assert.equal(asset.detected_extension, 'png');
+  assert.equal(asset.variant, 'original');
+  assert.equal(asset.file_uuid, 'img-1');
+  assert.equal(asset.name, '1700000000000_image.png', 'Claude’s file name is kept as the label');
+  assert.equal(harness.requests.includes(previewUrl), false, 'the preview is never downloaded when the original is served');
+  assert.equal(harness.requests.some((url) => url.includes('thumbnail')), false, 'thumbnails are never downloaded');
+  assert.equal(harness.requests.some((url) => url.includes('/wiggle/')), false, 'an upgraded workspace has no sandbox to ask');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a JPEG original under a .png name gets its type and extension from its bytes', async () => {
+  const original = syntheticImage('jpeg', 'camera');
+  const previewUrl = 'https://files.example/img-2/preview';
+  const harness = createHarness(imageConversation('conv-jpeg', [pastedImage('img-2', previewUrl, { mime_type: 'image/png' })]), {
+    assetResponses: { [ORIGINAL_URL('img-2')]: { bytes: original, contentType: 'image/png' } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [asset] = (await harness.firstHandoff).conversations[0].assets;
+  assert.equal(asset.mime, 'image/jpeg', 'neither the declared type nor the response header decides it');
+  assert.equal(asset.detected_extension, 'jpg');
+  assert.equal(asset.name, '1700000000000_image.png');
+  assert.equal(asset.variant, 'original');
+  assert.equal(asset.sha256, sha256Of(original));
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('every recognised image format is accepted as an original with its own type and extension', async () => {
+  const expected = { png: ['image/png', 'png'], jpeg: ['image/jpeg', 'jpg'], gif: ['image/gif', 'gif'], webp: ['image/webp', 'webp'], bmp: ['image/bmp', 'bmp'], tiff: ['image/tiff', 'tiff'], avif: ['image/avif', 'avif'], heic: ['image/heic', 'heic'], svg: ['image/svg+xml', 'svg'] };
+  for (const [format, [mime, extension]] of Object.entries(expected)) {
+    const bytes = syntheticImage(format, 'format');
+    const harness = createHarness(imageConversation(`conv-${format}`, [pastedImage(`img-${format}`, `https://files.example/${format}`)]), {
+      assetResponses: { [ORIGINAL_URL(`img-${format}`)]: { bytes } },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [asset] = (await harness.firstHandoff).conversations[0].assets;
+    assert.equal(asset.mime, mime, format);
+    assert.equal(asset.detected_extension, extension, format);
+    assert.equal(asset.variant, 'original', format);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('when Claude does not serve the original (404/410), the preview is archived and labelled as a preview', async () => {
+  for (const status of [404, 410]) {
+    const preview = syntheticImage('webp', `preview ${status}`);
+    const previewUrl = `https://files.example/img-${status}/preview`;
+    const harness = createHarness(imageConversation(`conv-preview-${status}`, [pastedImage(`img-${status}`, previewUrl)]), {
+      assetResponses: { [ORIGINAL_URL(`img-${status}`)]: { status }, [previewUrl]: { bytes: preview, contentType: 'image/webp' } },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [exported] = (await harness.firstHandoff).conversations;
+    assert.deepEqual(plain(exported.incomplete), [], 'an unavailable original does not make the conversation incomplete');
+    const [asset] = exported.assets;
+    assert.deepEqual(new Uint8Array(Buffer.from(asset.base64, 'base64')), preview);
+    assert.equal(asset.variant, 'preview', 'never labelled as the original');
+    assert.equal(asset.mime, 'image/webp');
+    assert.equal(asset.detected_extension, 'webp', 'stored under its real extension, not .png');
+    assert.equal(asset.preview_reason, 'original-unavailable');
+    assert.equal(asset.original_status, status);
+    assert.match(asset.original_checked_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(asset.file_uuid, `img-${status}`, 'the identity is kept for a later attempt');
+    assert.deepEqual(harness.requests.filter((url) => url === ORIGINAL_URL(`img-${status}`) || url === previewUrl), [ORIGINAL_URL(`img-${status}`), previewUrl], 'original first, then the preview, once each');
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('any other failure of the original fails the conversation instead of keeping the preview', async () => {
+  const cases = [
+    ['HTTP 403', { status: 403 }],
+    ['HTTP 429', { status: 429 }],
+    ['HTTP 500', { status: 500 }],
+    ['HTTP 503', { status: 503 }],
+    ['a network error', { networkError: true }],
+    ['bytes that are not an image', { content: '<!DOCTYPE html><html>error page</html>', contentType: 'image/png' }],
+    ['a truncated PNG signature', { bytes: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a]) }],
+  ];
+  for (const [label, response] of cases) {
+    const previewUrl = 'https://files.example/img-fail/preview';
+    const conversation = imageConversation('conv-fail', [pastedImage('img-fail', previewUrl)]);
+    const harness = createHarness(conversation, {
+      conversationListResponse: [
+        { uuid: 'conv-fail', name: 'Failing original', created_at: '2026-10-26T08:00:00.000Z', updated_at: '2026-10-26T08:30:00.000Z' },
+        { uuid: 'conv-ok', name: 'Other conversation', created_at: '2026-10-26T08:00:00.000Z', updated_at: '2026-10-26T08:20:00.000Z' },
+      ],
+      fullConversationResponse: (id) => (id === 'conv-fail' ? conversation : plainConversation('conv-ok')),
+      assetResponses: { [ORIGINAL_URL('img-fail')]: response, [previewUrl]: { bytes: syntheticImage('webp', 'p') } },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const handoff = await harness.firstHandoff;
+    assert.deepEqual(plain(handoff.conversations.map((c) => c.external_id)), ['conv-ok'], `${label}: the conversation is not published`);
+    assert.deepEqual(plain(handoff.skipped.map((item) => item.id)), ['conv-fail'], `${label}: it is reported, so a later sync retries it`);
+    assert.equal(harness.requests.includes(previewUrl), false, `${label}: the preview is never substituted`);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('an image with no file ID is archived from its preview, labelled as a preview', async () => {
+  const previewUrl = 'https://files.example/no-id/preview';
+  const file = pastedImage(undefined, previewUrl);
+  delete file.file_uuid;
+  const harness = createHarness(imageConversation('conv-no-id', [file]), {
+    assetResponses: { [previewUrl]: { bytes: syntheticImage('webp', 'no id') } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [asset] = (await harness.firstHandoff).conversations[0].assets;
+  assert.equal(asset.variant, 'preview');
+  assert.equal(asset.preview_reason, 'no-file-id');
+  assert.equal(asset.original_status, undefined);
+  assert.equal(harness.requests.some((url) => url.includes('/files/') && url.endsWith('/contents')), false, 'nothing to ask the Files API for');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('in a sandbox workspace, the original is archived once even when the sandbox holds the same upload', async () => {
+  const original = syntheticImage('png', 'sandbox');
+  const previewUrl = 'https://files.example/img-sb/preview';
+  const path = '/mnt/user-data/uploads/1700000000000_image.png';
+  const harness = createHarness(imageConversation('conv-sandbox', [pastedImage('img-sb', previewUrl)], { upgraded: false, text: `Uploaded to ${path}` }), {
+    sandboxFiles: [{ path, content_type: 'image/png' }],
+    sandboxContents: { [path]: original },
+    assetResponses: { [ORIGINAL_URL('img-sb')]: { bytes: original }, [previewUrl]: { bytes: syntheticImage('webp', 'sb') } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(plain(exported.incomplete), []);
+  assert.equal(exported.assets.length, 1, 'identical bytes are stored once');
+  assert.equal(exported.assets[0].variant, 'original');
+  assert.equal(exported.assets[0].sha256, sha256Of(original));
+  assert.equal(harness.requests.includes(previewUrl), false);
+  assert.ok(harness.requests.some((url) => url.includes('/wiggle/list-files')), 'the sandbox is still listed in a sandbox workspace');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('in a sandbox workspace, a same-named sandbox file is still not attached on its name alone', async () => {
+  const original = syntheticImage('png', 'named');
+  const harness = createHarness(imageConversation('conv-sandbox-name', [pastedImage('img-sn', 'https://files.example/img-sn/preview')], { upgraded: false, text: 'See 1700000000000_image.png' }), {
+    sandboxFiles: [{ path: '/mnt/user-data/outputs/1700000000000_image.png', content_type: 'image/png' }],
+    sandboxContents: { '/mnt/user-data/outputs/1700000000000_image.png': syntheticImage('png', 'a different file') },
+    assetResponses: { [ORIGINAL_URL('img-sn')]: { bytes: original } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.equal(exported.assets.length, 1);
+  assert.equal(exported.assets[0].sha256, sha256Of(original));
+  assert.equal(harness.requests.some((url) => url.includes('/wiggle/download-file')), false, 'the existing collision protection is unchanged');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('an image with no preview URL is archived from its original', async () => {
+  const original = syntheticImage('jpeg', 'no url');
+  const file = pastedImage('img-nourl', null);
+  delete file.preview_asset;
+  const harness = createHarness(imageConversation('conv-no-url', [file]), {
+    assetResponses: { [ORIGINAL_URL('img-nourl')]: { bytes: original } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(plain(exported.incomplete), []);
+  const [asset] = exported.assets;
+  assert.equal(asset.variant, 'original');
+  assert.equal(asset.mime, 'image/jpeg');
+  assert.equal(asset.detected_extension, 'jpg');
+  assert.equal(asset.file_uuid, 'img-nourl');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('an image whose original and preview are both unavailable is visibly not archived, and the original is asked for once', async () => {
+  const previewUrl = 'https://files.example/img-gone/preview';
+  const harness = createHarness(imageConversation('conv-gone', [pastedImage('img-gone', previewUrl)]), {
+    assetResponses: { [ORIGINAL_URL('img-gone')]: { status: 404 }, [previewUrl]: { status: 404 } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.equal(exported.assets.length, 0);
+  assert.equal(exported.incomplete.length, 1, 'nothing was archived, so this is incomplete');
+  assert.equal(exported.incomplete[0].file_uuid, 'img-gone');
+  assert.equal(harness.requests.filter((url) => url === ORIGINAL_URL('img-gone')).length, 1);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a normal sync does not ask again for an original the archive recorded as unavailable; an explicit Latest N sync does', async () => {
+  const previewUrl = 'https://files.example/img-known/preview';
+  const conversation = imageConversation('conv-known', [pastedImage('img-known', previewUrl)]);
+  const options = {
+    archiveState: [{ id: 'conv-known', updated_at: '2026-01-01T00:00:00.000Z' }],
+    archivePreviews: [{ id: 'conv-known', file_uuid: 'img-known', original_status: 404, original_checked_at: '2026-10-01T00:00:00.000Z' }],
+    assetResponses: { [ORIGINAL_URL('img-known')]: { bytes: syntheticImage('png', 'now served') }, [previewUrl]: { bytes: syntheticImage('webp', 'known') } },
+    storage: {},
+  };
+  const normal = createHarness(conversation, options);
+  normal.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [kept] = (await normal.firstHandoff).conversations[0].assets;
+  assert.equal(normal.requests.includes(ORIGINAL_URL('img-known')), false, 'not asked again by a normal sync');
+  assert.equal(kept.variant, 'preview');
+  assert.equal(kept.original_status, 404, 'the recorded status is kept');
+  assert.equal(kept.original_checked_at, '2026-10-01T00:00:00.000Z', 'and when it was recorded');
+  normal.finishFirstHandoff({ ok: true });
+
+  const explicit = createHarness(conversation, options);
+  explicit.onMessage({ type: 'startSync', limit: '1' }, {}, () => {});
+  const [recovered] = (await explicit.firstHandoff).conversations[0].assets;
+  assert.equal(explicit.requests.includes(ORIGINAL_URL('img-known')), true, 'an explicit Latest N sync asks for the original again');
+  assert.equal(recovered.variant, 'original');
+  explicit.finishFirstHandoff({ ok: true });
+});
+
+test('non-image attachments are downloaded exactly as before, without asking for an original', async () => {
+  const url = 'https://files.example/report.pdf';
+  const conversation = imageConversation('conv-pdf', [{ file_uuid: 'pdf-9', file_name: 'report.pdf', preview_url: url, mime_type: 'application/pdf' }]);
+  const harness = createHarness(conversation, { assetResponses: { [url]: { content: '%PDF bytes', contentType: 'application/pdf' } }, storage: {} });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [asset] = (await harness.firstHandoff).conversations[0].assets;
+  assert.equal(asset.mime, 'application/pdf');
+  assert.equal(asset.variant, undefined);
+  assert.equal(asset.detected_extension, undefined);
+  assert.equal(harness.requests.some((request) => request.includes('/files/pdf-9/contents')), false);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Reconciliation with the sandbox uploads/ rule, and originals the viewer
+// cannot display (HEIC, TIFF, SVG). Synthetic images only.
+// ---------------------------------------------------------------------------
+
+function sandboxImageSync({ original, contentType = 'image/png', originalResponse = { status: 404 }, preview = syntheticImage('webp', 'preview'), name = '1700000000000_image.png' }) {
+  const previewUrl = 'https://files.example/img-r/preview';
+  const path = `/mnt/user-data/uploads/${name}`;
+  const file = { ...pastedImage('img-r', previewUrl), file_name: name };
+  const harness = createHarness(imageConversation('conv-r', [file], { upgraded: false, text: `Here is ${name}` }), {
+    sandboxFiles: [{ path, content_type: contentType }],
+    sandboxContents: { [path]: original },
+    assetResponses: { [ORIGINAL_URL('img-r')]: originalResponse, [previewUrl]: { bytes: preview } },
+    storage: {},
+  });
+  return { harness, previewUrl, path };
+}
+
+test('Files API 404 with the original in the sandbox: the sandbox file is the original, the preview a separate preview, both kept', async () => {
+  const original = syntheticImage('jpeg', 'sandbox original');
+  const preview = syntheticImage('webp', 'preview');
+  const { harness, path } = sandboxImageSync({ original, preview, contentType: 'image/png' });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.deepEqual(plain(exported.incomplete), []);
+  assert.equal(exported.assets.length, 2, 'both files are kept');
+  const archivedOriginal = exported.assets.find((asset) => asset.source === 'sandbox');
+  const archivedPreview = exported.assets.find((asset) => asset.source === 'message');
+  assert.equal(archivedOriginal.variant, 'original');
+  assert.equal(archivedOriginal.sha256, sha256Of(original));
+  assert.equal(archivedOriginal.mime, 'image/jpeg', 'type from the bytes, not the sandbox listing');
+  assert.equal(archivedOriginal.detected_extension, 'jpg');
+  assert.equal(archivedOriginal.source_path, path);
+  assert.equal(archivedOriginal.file_uuid, 'img-r', 'linked to the same Claude file');
+  assert.deepEqual(plain(archivedOriginal.message_external_ids), ['u1']);
+  assert.equal(archivedPreview.variant, 'preview');
+  assert.equal(archivedPreview.sha256, sha256Of(preview));
+  assert.equal(archivedPreview.original_sha256, sha256Of(original), 'the preview names its original');
+  for (const field of ['preview_reason', 'original_status', 'original_checked_at']) {
+    assert.equal(archivedPreview[field], undefined, `not a preview-only image (${field})`);
+  }
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a sandbox uploads/ file whose bytes are not an image is not taken as the original', async () => {
+  const { harness } = sandboxImageSync({ original: new TextEncoder().encode('not an image at all') });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  const archivedPreview = exported.assets.find((asset) => asset.source === 'message');
+  const sandbox = exported.assets.find((asset) => asset.source === 'sandbox');
+  assert.equal(archivedPreview.variant, 'preview');
+  assert.equal(archivedPreview.preview_reason, 'original-unavailable', 'still preview-only');
+  assert.equal(archivedPreview.original_sha256, undefined);
+  assert.equal(sandbox.variant, undefined, 'the sandbox file is kept unlabelled');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a Files API original identical to the sandbox copy is stored once, as the original, with no preview', async () => {
+  const original = syntheticImage('png', 'same');
+  const { harness, previewUrl } = sandboxImageSync({ original, originalResponse: { bytes: original } });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  assert.equal(exported.assets.length, 1);
+  assert.equal(exported.assets[0].variant, 'original');
+  assert.equal(harness.requests.includes(previewUrl), false);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('HEIC, TIFF and SVG originals are kept unchanged and get Claude’s preview as a display copy', async () => {
+  for (const [format, mime, extension] of [['heic', 'image/heic', 'heic'], ['tiff', 'image/tiff', 'tiff'], ['svg', 'image/svg+xml', 'svg']]) {
+    const original = syntheticImage(format, 'camera');
+    const preview = syntheticImage('webp', `preview of ${format}`);
+    const previewUrl = `https://files.example/${format}/preview`;
+    const harness = createHarness(imageConversation(`conv-d-${format}`, [{ ...pastedImage(`img-d-${format}`, previewUrl), file_name: `photo.${extension}` }]), {
+      assetResponses: { [ORIGINAL_URL(`img-d-${format}`)]: { bytes: original }, [previewUrl]: { bytes: preview } },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [exported] = (await harness.firstHandoff).conversations;
+    assert.deepEqual(plain(exported.incomplete), [], format);
+    assert.equal(exported.assets.length, 2, `${format}: original and display copy`);
+    const [first, second] = exported.assets;
+    assert.equal(first.variant, 'original', format);
+    assert.equal(first.mime, mime, format);
+    assert.equal(first.detected_extension, extension, format);
+    assert.deepEqual(new Uint8Array(Buffer.from(first.base64, 'base64')), original, `${format}: the original bytes, not converted`);
+    assert.equal(second.variant, 'preview', format);
+    assert.equal(second.mime, 'image/webp', format);
+    assert.equal(second.original_sha256, first.sha256, format);
+    assert.equal(second.preview_reason, undefined, `${format}: not preview-only`);
+    assert.equal(second.file_uuid, first.file_uuid, format);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('a displayable original gets no display copy, and the preview is never requested', async () => {
+  // WebP is compared with the preview (see the Files API WebP tests).
+  for (const format of ['png', 'jpeg', 'gif', 'bmp', 'avif']) {
+    const previewUrl = `https://files.example/${format}/preview`;
+    const harness = createHarness(imageConversation(`conv-nd-${format}`, [pastedImage(`img-nd-${format}`, previewUrl)]), {
+      assetResponses: { [ORIGINAL_URL(`img-nd-${format}`)]: { bytes: syntheticImage(format, 'x') }, [previewUrl]: { bytes: syntheticImage('webp', 'p') } },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [exported] = (await harness.firstHandoff).conversations;
+    assert.equal(exported.assets.length, 1, format);
+    assert.equal(harness.requests.includes(previewUrl), false, format);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('a HEIC original is archived alone when its preview is unavailable or not a displayable image', async () => {
+  for (const [label, response] of [['404', { status: 404 }], ['410', { status: 410 }], ['non-image bytes', { content: 'oops' }], ['a TIFF preview', { bytes: syntheticImage('tiff', 'p') }]]) {
+    const previewUrl = 'https://files.example/heic-alone/preview';
+    const harness = createHarness(imageConversation('conv-heic-alone', [{ ...pastedImage('img-heic', previewUrl), file_name: 'photo.heic' }]), {
+      assetResponses: { [ORIGINAL_URL('img-heic')]: { bytes: syntheticImage('heic', 'h') }, [previewUrl]: response },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [exported] = (await harness.firstHandoff).conversations;
+    assert.deepEqual(plain(exported.incomplete), [], label);
+    assert.equal(exported.assets.length, 1, label);
+    assert.equal(exported.assets[0].variant, 'original', label);
+    assert.equal(exported.assets[0].mime, 'image/heic', label);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('a HEIC original whose preview fails with 5xx fails the conversation for this sync, like any download', async () => {
+  const previewUrl = 'https://files.example/heic-5xx/preview';
+  const conversation = imageConversation('conv-heic-5xx', [{ ...pastedImage('img-h5', previewUrl), file_name: 'photo.heic' }]);
+  const harness = createHarness(conversation, {
+    conversationListResponse: [
+      { uuid: 'conv-heic-5xx', name: 'HEIC', created_at: '2026-10-26T08:00:00.000Z', updated_at: '2026-10-26T08:30:00.000Z' },
+      { uuid: 'conv-ok', name: 'OK', created_at: '2026-10-26T08:00:00.000Z', updated_at: '2026-10-26T08:20:00.000Z' },
+    ],
+    fullConversationResponse: (id) => (id === 'conv-heic-5xx' ? conversation : plainConversation('conv-ok')),
+    assetResponses: { [ORIGINAL_URL('img-h5')]: { bytes: syntheticImage('heic', 'h') }, [previewUrl]: { status: 503 } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.deepEqual(plain(handoff.skipped.map((item) => item.id)), ['conv-heic-5xx'], 'retried by a later sync');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a HEIC original in the sandbox, with the Files API answering 404, is the original next to its preview', async () => {
+  const original = syntheticImage('heic', 'sandbox heic');
+  const { harness } = sandboxImageSync({ original, name: 'IMG_0001.HEIC', contentType: 'application/octet-stream' });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  const sandbox = exported.assets.find((asset) => asset.source === 'sandbox');
+  const archivedPreview = exported.assets.find((asset) => asset.source === 'message');
+  assert.equal(sandbox.variant, 'original');
+  assert.equal(sandbox.mime, 'image/heic');
+  assert.equal(sandbox.detected_extension, 'heic');
+  assert.equal(archivedPreview.original_sha256, sandbox.sha256);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Archived originals are never demoted; ambiguous names are never paired.
+// Synthetic images only.
+// ---------------------------------------------------------------------------
+
+const ARCHIVED_PATH = 'archive/conversations/claude/personal/assets/conv-a1/aaaaaaaa-1700000000000_image.jpg';
+const archivedOriginalState = (id, fileUuid, extra = {}) => ({
+  archiveState: [{ id, updated_at: '2026-01-01T00:00:00.000Z' }],
+  archiveOriginals: [{ id, file_uuid: fileUuid, path: ARCHIVED_PATH, sha256: 'a'.repeat(64), size: 1234, mime: 'image/jpeg', ...extra }],
+});
+
+test('when Claude no longer serves an archived original, the archived one is referenced again, not demoted to a preview', async () => {
+  for (const status of [404, 410]) {
+    const previewUrl = `https://files.example/a1-${status}/preview`;
+    const harness = createHarness(imageConversation('conv-a1', [pastedImage('img-a1', previewUrl)]), {
+      ...archivedOriginalState('conv-a1', 'img-a1'),
+      assetResponses: { [ORIGINAL_URL('img-a1')]: { status }, [previewUrl]: { bytes: syntheticImage('webp', 'p') } },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [exported] = (await harness.firstHandoff).conversations;
+    assert.deepEqual(plain(exported.incomplete), [], String(status));
+    assert.equal(exported.assets.length, 1, String(status));
+    const [asset] = exported.assets;
+    assert.equal(asset.variant, 'original', String(status));
+    assert.equal(asset.reuse_path, ARCHIVED_PATH, `${status}: the archived file is referenced`);
+    assert.equal(asset.sha256, 'a'.repeat(64));
+    assert.equal(asset.base64, '', 'no bytes are sent again');
+    assert.equal(asset.file_uuid, 'img-a1');
+    assert.equal(asset.preview_reason, undefined, 'not preview-only');
+    assert.equal(harness.requests.includes(previewUrl), false, `${status}: a displayable original needs no preview`);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('an archived original is only referenced when Claude answers 404/410; a served original is downloaded as usual', async () => {
+  const served = syntheticImage('jpeg', 'served again');
+  const harness = createHarness(imageConversation('conv-a1', [pastedImage('img-a1', 'https://files.example/a1/preview')]), {
+    ...archivedOriginalState('conv-a1', 'img-a1'),
+    assetResponses: { [ORIGINAL_URL('img-a1')]: { bytes: served } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [asset] = (await harness.firstHandoff).conversations[0].assets;
+  assert.equal(asset.reuse_path, undefined);
+  assert.equal(asset.sha256, sha256Of(served));
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('an archived HEIC original referenced again still gets a display copy', async () => {
+  const path = 'archive/conversations/claude/personal/assets/conv-h1/bbbbbbbb-photo.heic';
+  const previewUrl = 'https://files.example/h1/preview';
+  const harness = createHarness(imageConversation('conv-h1', [{ ...pastedImage('img-h1', previewUrl), file_name: 'photo.heic' }]), {
+    archiveState: [{ id: 'conv-h1', updated_at: '2026-01-01T00:00:00.000Z' }],
+    archiveOriginals: [{ id: 'conv-h1', file_uuid: 'img-h1', path, sha256: 'b'.repeat(64), size: 99, mime: 'image/heic' }],
+    assetResponses: { [ORIGINAL_URL('img-h1')]: { status: 404 }, [previewUrl]: { bytes: syntheticImage('webp', 'heic preview') } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [original, preview] = (await harness.firstHandoff).conversations[0].assets;
+  assert.equal(original.reuse_path, path);
+  assert.equal(original.mime, 'image/heic');
+  assert.equal(preview.variant, 'preview');
+  assert.equal(preview.original_sha256, 'b'.repeat(64));
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('two images named image.png and one sandbox upload of that name: no guess, nothing is paired', async () => {
+  const previewA = 'https://files.example/dup-a/preview';
+  const previewB = 'https://files.example/dup-b/preview';
+  const path = '/mnt/user-data/uploads/image.png';
+  const conversation = imageConversation('conv-dup', [
+    { ...pastedImage('img-dup-a', previewA), file_name: 'image.png' },
+    { ...pastedImage('img-dup-b', previewB), file_name: 'image.png' },
+  ], { upgraded: false, text: 'Two screenshots: image.png and image.png' });
+  const harness = createHarness(conversation, {
+    sandboxFiles: [{ path, content_type: 'image/png' }],
+    sandboxContents: { [path]: syntheticImage('png', 'which one?') },
+    assetResponses: {
+      [ORIGINAL_URL('img-dup-a')]: { status: 404 }, [ORIGINAL_URL('img-dup-b')]: { status: 404 },
+      [previewA]: { bytes: syntheticImage('webp', 'a') }, [previewB]: { bytes: syntheticImage('webp', 'b') },
+    },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  const previews = exported.assets.filter((asset) => asset.source === 'message');
+  assert.equal(previews.length, 2);
+  for (const preview of previews) {
+    assert.equal(preview.variant, 'preview');
+    assert.equal(preview.original_sha256, undefined, 'not paired with a guessed original');
+    assert.equal(preview.preview_reason, 'original-unavailable', 'still honestly preview-only');
+  }
+  for (const sandbox of exported.assets.filter((asset) => asset.source === 'sandbox')) {
+    assert.equal(sandbox.variant, undefined, 'the sandbox file is not labelled as either image');
+  }
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('two attachments of the same name in different messages are not paired with one sandbox upload either', async () => {
+  const path = '/mnt/user-data/uploads/image.png';
+  const conversation = imageConversation('conv-dup2', [{ ...pastedImage('img-d1', 'https://files.example/d1'), file_name: 'image.png' }], { upgraded: false, text: 'image.png' });
+  conversation.chat_messages[1].files = [{ ...pastedImage('img-d2', null), file_name: 'image.png' }];
+  delete conversation.chat_messages[1].files[0].preview_asset;
+  const harness = createHarness(conversation, {
+    sandboxFiles: [{ path, content_type: 'image/png' }],
+    sandboxContents: { [path]: syntheticImage('png', 'which one?') },
+    assetResponses: { [ORIGINAL_URL('img-d1')]: { status: 404 }, 'https://files.example/d1': { bytes: syntheticImage('webp', 'd1') } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [exported] = (await harness.firstHandoff).conversations;
+  const preview = exported.assets.find((asset) => asset.source === 'message' && asset.variant === 'preview');
+  assert.equal(preview.original_sha256, undefined);
+  harness.finishFirstHandoff({ ok: true });
+});
+
+
+// ---------------------------------------------------------------------------
+// Files API WebP check, plan-only handoff, files_v2 diagnostics. Synthetic only.
+// ---------------------------------------------------------------------------
+
+test('a WebP from the Files API that is the same as the preview is archived as a preview, never as the original', async () => {
+  const same = syntheticImage('webp', 'served twice');
+  const previewUrl = 'https://files.example/w1/preview';
+  const harness = createHarness(imageConversation('conv-w1', [pastedImage('img-w1', previewUrl)]), {
+    assetResponses: { [ORIGINAL_URL('img-w1')]: { bytes: same }, [previewUrl]: { bytes: same } },
+    storage: {},
+  });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const [asset] = (await harness.firstHandoff).conversations[0].assets;
+  assert.equal(asset.variant, 'preview');
+  assert.equal(asset.preview_reason, 'files-api-served-preview');
+  assert.equal(asset.mime, 'image/webp');
+  assert.equal(asset.detected_extension, 'webp');
+  assert.equal(asset.sha256, sha256Of(same), 'the bytes are kept');
+  assert.ok(harness.requests.includes(previewUrl), 'the preview was compared');
+  harness.finishFirstHandoff({ ok: true });
+});
+
+test('a WebP from the Files API that differs from the preview, or with no preview to compare, stays the original', async () => {
+  for (const [label, previewResponse] of [['different preview', { bytes: syntheticImage('webp', 'smaller preview') }], ['preview 404', { status: 404 }]]) {
+    const upload = syntheticImage('webp', 'a WebP upload');
+    const previewUrl = `https://files.example/w2-${label}/preview`;
+    const harness = createHarness(imageConversation('conv-w2', [pastedImage('img-w2', previewUrl)]), {
+      assetResponses: { [ORIGINAL_URL('img-w2')]: { bytes: upload }, [previewUrl]: previewResponse },
+      storage: {},
+    });
+    harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+    const [asset] = (await harness.firstHandoff).conversations[0].assets;
+    assert.equal(asset.variant, 'original', label);
+    assert.equal(asset.sha256, sha256Of(upload), label);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('a plan-only sync says so in the first and the last message of its transfer; a normal sync does not', async () => {
+  for (const planOnly of [true, false]) {
+    const harness = createHarness(plainConversation('conv-plan'), { storage: {} });
+    harness.onMessage({ type: 'startSync', limit: 'all', ...(planOnly ? { planOnly: true } : {}) }, {}, () => {});
+    const handoff = await harness.firstHandoff;
+    const start = harness.runtimeMessages.find((m) => m.type === 'syncTransferStart');
+    assert.equal(start.metadata?.planOnly === true, planOnly, `start (${planOnly})`);
+    assert.equal(handoff.planOnly === true, planOnly, `end (${planOnly})`);
+    harness.finishFirstHandoff({ ok: true });
+  }
+});
+
+test('images listed only in files_v2 are counted for diagnostics and not exported', async () => {
+  const conversation = imageConversation('conv-v2', [pastedImage('img-in-files', 'https://files.example/v2a')]);
+  conversation.chat_messages[0].files_v2 = [
+    { file_uuid: 'img-in-files', file_name: '1700000000000_image.png', file_kind: 'image' },
+    { file_uuid: 'img-only-v2', file_name: 'extra.png', file_kind: 'image', preview_asset: { url: 'https://files.example/v2b' } },
+    { file_uuid: 'doc-only-v2', file_name: 'notes.pdf', file_kind: 'document' },
+  ];
+  const harness = createHarness(conversation, { assetResponses: { [ORIGINAL_URL('img-in-files')]: { bytes: syntheticImage('png', 'v2') } }, storage: {} });
+  harness.onMessage({ type: 'startSync', limit: 'all' }, {}, () => {});
+  const handoff = await harness.firstHandoff;
+  assert.deepEqual(plain(handoff.filesV2OnlyImages), { images: 1, conversations: 1 });
+  assert.equal(handoff.conversations[0].assets.length, 1, 'files_v2 is not an export source');
+  assert.equal(harness.requests.some((url) => url.includes('img-only-v2') || url.includes('v2b')), false);
+  harness.finishFirstHandoff({ ok: true });
 });

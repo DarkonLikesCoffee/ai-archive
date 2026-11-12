@@ -7,6 +7,20 @@
   // downloads of them that this sync skipped. See fetchAsset.
   let knownOversizedFiles = null;
   let oversizedStats = newOversizedStats();
+  // Images the archive holds only as Claude's preview because Claude did not
+  // serve the original (conversation ID -> file UUID -> { original_status,
+  // original_checked_at }), from the archive state of an "all" sync. A normal
+  // sync does not ask for those originals again; an explicit "Latest N" sync
+  // has no archive state, so it asks again. See downloadMessageImage.
+  let knownPreviewOnlyImages = null;
+  // Originals the archive already holds for image files (conversation ID ->
+  // file UUID -> { path, sha256, size, mime }), from the same archive state.
+  // When Claude no longer serves such an original, the archived one is linked
+  // again instead of the image being demoted to a preview.
+  let knownArchivedOriginals = null;
+  // Diagnostics only: image files Claude lists in a message's files_v2 but not
+  // in its files, which the exporter reads (counts, never names or IDs).
+  let filesV2OnlyImages = { images: 0, conversations: 0 };
 
   // Per-sync counts of downloads over the upload limit: only counts, byte
   // totals and reason codes, never names, IDs or contents.
@@ -466,6 +480,48 @@
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
+  // The image format of a file from its bytes, never from its name or a
+  // declared type: Claude names a pasted image "…_image.png" whether its
+  // original is PNG or JPEG, and serves its preview as WebP under that name.
+  // Returns { format, mime, extension } or null for bytes that are not a
+  // recognised image.
+  const IMAGE_FORMATS = {
+    png: { mime: 'image/png', extension: 'png' },
+    jpeg: { mime: 'image/jpeg', extension: 'jpg' },
+    gif: { mime: 'image/gif', extension: 'gif' },
+    webp: { mime: 'image/webp', extension: 'webp' },
+    bmp: { mime: 'image/bmp', extension: 'bmp' },
+    tiff: { mime: 'image/tiff', extension: 'tiff' },
+    avif: { mime: 'image/avif', extension: 'avif' },
+    heic: { mime: 'image/heic', extension: 'heic' },
+    heif: { mime: 'image/heif', extension: 'heif' },
+    svg: { mime: 'image/svg+xml', extension: 'svg' },
+  };
+  function detectImageFormat(input) {
+    const b = input instanceof Uint8Array ? input : new Uint8Array(input || new ArrayBuffer(0));
+    const at = (offset, ...bytes) => b.length >= offset + bytes.length && bytes.every((x, i) => b[offset + i] === x);
+    const ascii = (offset, length) => (b.length >= offset + length ? String.fromCharCode(...b.subarray(offset, offset + length)) : '');
+    let format = null;
+    if (at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) format = 'png';
+    else if (at(0, 0xff, 0xd8, 0xff)) format = 'jpeg';
+    else if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') format = 'gif';
+    else if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') format = 'webp';
+    else if (ascii(0, 2) === 'BM' && b.length >= 26) format = 'bmp';
+    else if (at(0, 0x49, 0x49, 0x2a, 0x00) || at(0, 0x4d, 0x4d, 0x00, 0x2a)) format = 'tiff';
+    else if (ascii(4, 4) === 'ftyp') {
+      const brand = ascii(8, 4);
+      if (brand === 'avif' || brand === 'avis') format = 'avif';
+      else if (['heic', 'heix', 'heim', 'heis', 'hevc', 'hevx', 'hevm', 'hevs'].includes(brand)) format = 'heic';
+      else if (brand === 'mif1' || brand === 'msf1') format = 'heif';
+    } else {
+      // SVG is text: an optional BOM, XML declaration, comments and doctype,
+      // then the <svg> root element.
+      const head = String.fromCharCode(...b.subarray(0, 1024)).replace(/^\xef\xbb\xbf/, '');
+      if (/^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE\s+svg[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*<svg[\s>]/i.test(head)) format = 'svg';
+    }
+    return format ? { format, ...IMAGE_FORMATS[format] } : null;
+  }
+
   // Run only a small number of network tasks at once. Results stay in input
   // order, and after the first failure no new tasks are scheduled; workers
   // already in flight are allowed to settle before the error is propagated.
@@ -635,7 +691,7 @@
 
   // `route` names the download path for the counters only: message-url,
   // files-api, sandbox-path or sandbox-list.
-  async function fetchAsset(url, name, mime, signal, { conversationId = null, fileUuid = null, fileIdAmbiguous = false, declaredSize = null, route = 'message-url' } = {}) {
+  async function fetchAsset(url, name, mime, signal, { conversationId = null, fileUuid = null, fileIdAmbiguous = false, declaredSize = null, route = 'message-url', detect = false } = {}) {
     const known = knownOversizedFile(conversationId, fileUuid);
     const label = safeAssetName(name);
     if (!url) {
@@ -676,6 +732,8 @@
         base64: archivedAssetBase64(buffer),
         size: buffer.byteLength,
         sha256: await sha256Bytes(buffer),
+        // What the bytes are, for callers that must not trust names or types.
+        ...(detect ? { detected: detectImageFormat(new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 1024))) } : {}),
       };
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
@@ -698,6 +756,170 @@
 
   const UNAVAILABLE_STATUSES = new Set([404, 410]);
   const isUnavailable = (error) => UNAVAILABLE_STATUSES.has(error?.status);
+
+  // A message file that is an image upload. Claude marks images with
+  // file_kind "image"; a declared image type or an image file name counts too.
+  const IMAGE_NAME = /\.(png|jpe?g|gif|webp|bmp|tiff?|avif|heic|heif)$/i;
+  function isImageMessageFile(file, name) {
+    if (String(file?.file_kind || '').toLowerCase() === 'image') return true;
+    const declared = String(file?.mime_type || file?.content_type || file?.file_type || '').toLowerCase();
+    if (declared.startsWith('image/')) return true;
+    return IMAGE_NAME.test(String(name || file?.file_name || ''));
+  }
+
+  const messageFileId = (file) => {
+    const id = file?.file_uuid || file?.uuid;
+    return typeof id === 'string' && id.trim() ? id : null;
+  };
+
+  // Claude's original upload of a file, by its file UUID. Observed on a real
+  // account to serve the uploaded image bytes (PNG/JPEG) where the message
+  // file's preview URL serves a lossy WebP preview; it answers 404 for some
+  // images, which means only that Claude did not serve the original then.
+  const filesApiUrl = (org, fileId) => `/api/organizations/${encodeURIComponent(org)}/files/${encodeURIComponent(fileId)}/contents`;
+
+  // An image downloaded from the Files API is accepted as the original only
+  // when its bytes are a recognised image. Its type and extension come from
+  // those bytes. Anything else is a failed download (retried by a later
+  // sync), never a reason to keep a preview instead.
+  function acceptOriginalImage(asset, name) {
+    // A file over the upload limit whose download was skipped (see
+    // fetchAsset) has no bytes to check; it is not archived either way.
+    if (!asset.base64 && asset.size > MAX_ARCHIVED_FILE_BYTES) return { ...asset, variant: 'original' };
+    if (!asset.detected) {
+      throw Object.assign(new Error(`Failed to download attachment "${safeAssetName(name)}": Claude's original file is not a recognised image.`), { category: 'download-failed' });
+    }
+    const { detected, ...rest } = asset;
+    return { ...rest, mime: detected.mime, detected_extension: detected.extension, variant: 'original' };
+  }
+
+  function knownArchivedOriginal(conversationId, fileId) {
+    if (!knownArchivedOriginals || !conversationId || !fileId) return null;
+    return knownArchivedOriginals.get(String(conversationId))?.get(String(fileId)) || null;
+  }
+
+  function knownPreviewOnly(conversationId, fileId) {
+    if (!knownPreviewOnlyImages || !conversationId || !fileId) return null;
+    return knownPreviewOnlyImages.get(String(conversationId))?.get(String(fileId)) || null;
+  }
+
+  // Image types the web viewer shows inline (SAFE_INLINE_IMAGE_MIMES in
+  // web/src/attachmentSecurity.js). An original of another type (HEIC, HEIF,
+  // TIFF, SVG) is kept as it is and also gets Claude's preview as a display
+  // copy, so the conversation does not lose its inline image.
+  const DISPLAYABLE_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/avif', 'image/x-icon']);
+
+  // The format of an already downloaded file from the start of its base64.
+  function detectImageFormatFromBase64(base64) {
+    const head = String(base64 || '').replace(/\s+/g, '').slice(0, 1368);
+    if (!head) return null;
+    try { return detectImageFormat(base64ToBytes(head)); } catch { return null; }
+  }
+
+  // The preview of an original the viewer cannot show inline, as a separate
+  // preview variant that names its original (original_sha256). It is never
+  // a replacement: the original is archived either way. Claude answering the
+  // preview with 404/410, or bytes that are not a displayable image, leave
+  // the original alone; other failures fail the download like any other.
+  async function withDisplayCopy(original, url, name, signal) {
+    if (!url || !original.detected_extension || DISPLAYABLE_IMAGE_MIMES.has(original.mime)) return original;
+    try {
+      const preview = await fetchAsset(url, name, null, signal, { route: 'message-url', detect: true });
+      const { detected, ...rest } = preview;
+      if (!detected || !DISPLAYABLE_IMAGE_MIMES.has(detected.mime) || rest.sha256 === original.sha256) return original;
+      return {
+        ...original,
+        display_copy: { ...rest, mime: detected.mime, detected_extension: detected.extension, variant: 'preview', original_sha256: original.sha256 },
+      };
+    } catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      if (isUnavailable(e)) return original;
+      throw e;
+    }
+  }
+
+  // The Files API's WebP compared with the message file's preview: returns a
+  // preview-only asset when both are the same bytes, or null when they differ
+  // or the preview is unavailable (404/410). Other failures fail the download.
+  async function sameAsPreview(accepted, url, name, signal) {
+    try {
+      const preview = await fetchAsset(url, name, null, signal, { route: 'message-url', detect: true });
+      if (preview.sha256 !== accepted.sha256) return null;
+      const { variant, detected_extension: extension, ...rest } = accepted;
+      return { ...rest, mime: 'image/webp', detected_extension: 'webp', variant: 'preview', preview_reason: 'files-api-served-preview', original_status: 200, original_checked_at: new Date().toISOString() };
+    } catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      if (isUnavailable(e)) return null;
+      throw e;
+    }
+  }
+
+  // One image attached to a message: Claude's original first, then, only if
+  // Claude does not serve the original (404/410, or no file ID to ask for
+  // it), the message file's preview URL, archived and labelled as a preview.
+  // Any other failure of the original (403, 429, 5xx, network, bytes that are
+  // not an image) fails the download, so the conversation is retried by a
+  // later sync instead of silently keeping the preview.
+  async function downloadMessageImage(org, conversationId, file, url, name, signal) {
+    const fileId = messageFileId(file);
+    const declaredSize = declaredFileSize(file);
+    const known = knownPreviewOnly(conversationId, fileId);
+    let originalStatus = null;
+    let checkedAt = null;
+    let reason = 'no-file-id';
+    if (fileId && known) {
+      // The archive already holds only the preview: Claude did not serve the
+      // original at the recorded time. Not asked again by a normal sync.
+      originalStatus = known.original_status ?? null;
+      checkedAt = known.original_checked_at ?? null;
+      reason = 'original-unavailable';
+    } else if (fileId) {
+      let accepted = null;
+      try {
+        const original = await fetchAsset(filesApiUrl(org, fileId), name, null, signal, {
+          conversationId, fileUuid: fileId, declaredSize, route: 'files-api', detect: true,
+        });
+        accepted = acceptOriginalImage(original, name);
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e;
+        if (!isUnavailable(e)) throw e;
+        originalStatus = e.status;
+        checkedAt = new Date().toISOString();
+        reason = 'original-unavailable';
+      }
+      if (accepted?.mime === 'image/webp' && url) {
+        // A WebP from the Files API may be Claude's preview rather than the
+        // upload. If the preview URL serves the very same bytes, it is
+        // archived and labelled as a preview, never as the original.
+        const servedPreview = await sameAsPreview(accepted, url, name, signal);
+        if (servedPreview) return servedPreview;
+      }
+      if (accepted) return withDisplayCopy(accepted, url, name, signal);
+      // Claude no longer serves an original the archive already holds: link
+      // that archived original again (the background checks it is still the
+      // archived file), never demote it to a preview. No bytes are sent.
+      const archived = knownArchivedOriginal(conversationId, fileId);
+      if (archived) {
+        const extension = String(archived.path).split('/').pop().split('.').pop().toLowerCase();
+        return withDisplayCopy({
+          name: safeAssetName(name), mime: archived.mime || 'application/octet-stream', base64: '', size: archived.size, sha256: archived.sha256,
+          variant: 'original', reuse_path: archived.path, detected_extension: extension,
+        }, url, name, signal);
+      }
+    }
+    // The preview has its own bytes and identity: it is not looked up as an
+    // oversized record of the original.
+    const preview = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal, { route: 'message-url', detect: true });
+    const { detected, ...rest } = preview;
+    return {
+      ...rest,
+      ...(detected ? { mime: detected.mime, detected_extension: detected.extension } : {}),
+      variant: 'preview',
+      preview_reason: reason,
+      ...(originalStatus != null ? { original_status: originalStatus } : {}),
+      ...(checkedAt ? { original_checked_at: checkedAt } : {}),
+    };
+  }
 
   // Claude gives some uploads only as a sandbox path ("file_kind": "blob",
   // "path": "/mnt/user-data/uploads/…", no URL; seen on a real account). The
@@ -862,6 +1084,72 @@
     return name === 'excerpt_from_previous_claude_message.txt' || name.startsWith('excerpt_from_previous_claude_message.');
   }
 
+  // A preview archived because the Files API did not serve the original, and
+  // the sandbox's uploads/ copy of that upload (kept by sandboxFileIsReferenced
+  // for a user's attachment): the sandbox file is the original. When exactly
+  // one uploads/ file has the image's name and its bytes are a recognised
+  // image, it becomes the original variant, with its type and extension from
+  // its bytes, linked to the same Claude file and messages; the preview stays
+  // archived as a separate preview variant naming it (original_sha256), and is
+  // no longer a preview-only image. Both files are kept. Anything ambiguous
+  // leaves both as they are.
+  function labelSandboxOriginals(assets, imageNameCounts = new Map()) {
+    const uploadName = (asset) => {
+      const relative = sandboxRelativePath(asset.source_path);
+      return /^uploads\//.test(relative) ? relative.split('/').pop() : null;
+    };
+    const previewNameCounts = new Map();
+    for (const asset of assets) {
+      if (asset.source !== 'message' || asset.variant !== 'preview') continue;
+      const key = String(asset.name || '').toLowerCase();
+      previewNameCounts.set(key, (previewNameCounts.get(key) || 0) + 1);
+    }
+    for (const preview of assets) {
+      if (preview.source !== 'message' || preview.variant !== 'preview' || preview.original_sha256) continue;
+      const wanted = String(preview.name || '').toLowerCase();
+      if (!wanted) continue;
+      // A name shared by several images of the conversation (pasted images
+      // are often all "image.png") cannot tell which one the upload is: no
+      // guess, both stay as they are.
+      if ((imageNameCounts.get(wanted) || 0) > 1 || (previewNameCounts.get(wanted) || 0) > 1) continue;
+      const candidates = assets.filter((asset) => asset.source === 'sandbox' && !asset.variant
+        && uploadName(asset) != null && safeAssetName(uploadName(asset)).toLowerCase() === wanted);
+      if (candidates.length !== 1) continue;
+      const [original] = candidates;
+      const detected = detectImageFormatFromBase64(original.base64);
+      if (!detected || original.sha256 === preview.sha256) continue;
+      original.variant = 'original';
+      original.mime = detected.mime;
+      original.detected_extension = detected.extension;
+      original.file_uuid ??= preview.file_uuid ?? null;
+      const ids = [...new Set([...(original.message_external_ids || []), ...(preview.message_external_ids || (preview.message_external_id ? [preview.message_external_id] : []))])];
+      if (ids.length) original.message_external_ids = ids;
+      original.message_external_id ??= preview.message_external_id ?? ids[0] ?? null;
+      preview.original_sha256 = original.sha256;
+      delete preview.preview_reason;
+      delete preview.original_status;
+      delete preview.original_checked_at;
+    }
+  }
+
+  // Image entries of message.files_v2 with no entry in message.files for the
+  // same file UUID (or, without one, the same name). Counted, not exported.
+  function countFilesV2OnlyImages(messages) {
+    let count = 0;
+    for (const message of Array.isArray(messages) ? messages : []) {
+      const files = Array.isArray(message?.files) ? message.files : [];
+      const ids = new Set(files.map(messageFileId).filter(Boolean));
+      const names = new Set(files.map((f) => String(f?.file_name || f?.name || '').toLowerCase()).filter(Boolean));
+      for (const file of Array.isArray(message?.files_v2) ? message.files_v2 : []) {
+        const name = file?.file_name || file?.name || '';
+        if (!isImageMessageFile(file, name)) continue;
+        const id = messageFileId(file);
+        if (id ? !ids.has(id) : !names.has(String(name).toLowerCase())) count += 1;
+      }
+    }
+    return count;
+  }
+
   async function collectMessageAssets(org, conversationId, messages, signal, inlineByMessage = new Map(), incomplete = [], sandboxInfo = {}, sandboxSupported = true) {
     const assets = [];
     const seen = new Set();
@@ -930,17 +1218,21 @@
       directTasks,
       ASSET_DOWNLOAD_CONCURRENCY,
       async ({ message, file, url, name, messageExternalIds, messageReferences }) => {
+        const image = isImageMessageFile(file, name);
         try {
-          const asset = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal, {
-            conversationId, fileUuid: file.file_uuid || file.uuid || null,
-            declaredSize: declaredFileSize(file),
-          });
+          const asset = image
+            ? await downloadMessageImage(org, conversationId, file, url, name, signal)
+            : await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type, signal, {
+              conversationId, fileUuid: file.file_uuid || file.uuid || null,
+              declaredSize: declaredFileSize(file),
+            });
           return { asset, message, file, messageExternalIds, messageReferences };
         } catch (e) {
           if (!isUnavailable(e)) throw e;
           // Handled like a file without a URL: the sandbox may still hold it.
+          // For an image, Claude's original was already asked for.
           for (const referenced of messageReferences) {
-            filesWithoutDownloadUrl.push({ message: referenced, file, name, reason: `Claude returned HTTP ${e.status} for its download` });
+            filesWithoutDownloadUrl.push({ message: referenced, file, name, reason: `Claude returned HTTP ${e.status} for its download`, ...(image ? { originalTried: true } : {}) });
           }
           return null;
         }
@@ -948,26 +1240,31 @@
       signal,
     );
 
-    for (const { asset, message, file, messageExternalIds, messageReferences } of directAssets.filter(Boolean)) {
+    for (const { asset: downloaded, message, file, messageExternalIds, messageReferences } of directAssets.filter(Boolean)) {
       const messageId = message.uuid || message.id || null;
       const linkedMessageIds = messageExternalIds.length
         ? messageExternalIds
         : (messageId ? [messageId] : []);
-      assets.push({
-        ...asset,
-        source: 'message',
-        file_uuid: file.file_uuid || file.uuid || null,
-        message_external_id: messageId,
-        ...(linkedMessageIds.length ? { message_external_ids: linkedMessageIds } : {}),
-      });
-      const nameKey = String(asset.name || '').toLowerCase();
-      const fingerprint = `${nameKey}|${asset.sha256}`;
-      messageAssetFingerprints.add(fingerprint);
-      // The shared download is associated with every source message, so also
-      // deduplicate its extracted-content representation independently for each.
-      for (const referencedMessage of messageReferences) {
-        fingerprintsForMessage(referencedMessage).add(fingerprint);
-        hashesForMessage(referencedMessage).add(asset.sha256);
+      // An original the viewer cannot display carries Claude's preview as a
+      // display copy: both are archived, linked to the same message file.
+      const { display_copy: displayCopy, ...asset } = downloaded;
+      for (const item of displayCopy ? [asset, displayCopy] : [asset]) {
+        assets.push({
+          ...item,
+          source: 'message',
+          file_uuid: file.file_uuid || file.uuid || null,
+          message_external_id: messageId,
+          ...(linkedMessageIds.length ? { message_external_ids: linkedMessageIds } : {}),
+        });
+        const nameKey = String(item.name || '').toLowerCase();
+        const fingerprint = `${nameKey}|${item.sha256}`;
+        messageAssetFingerprints.add(fingerprint);
+        // The shared download is associated with every source message, so also
+        // deduplicate its extracted-content representation independently for each.
+        for (const referencedMessage of messageReferences) {
+          fingerprintsForMessage(referencedMessage).add(fingerprint);
+          hashesForMessage(referencedMessage).add(item.sha256);
+        }
       }
     }
 
@@ -996,6 +1293,21 @@
       seen.add(key);
       assets.push(asset);
     }
+    // How many distinct image attachments of the conversation have each name.
+    const imageNameCounts = new Map();
+    const countedImages = new Set();
+    for (const message of messages) {
+      for (const [position, file] of (Array.isArray(message?.files) ? message.files : []).entries()) {
+        const fileName = file?.file_name || file?.name || '';
+        if (!fileName || !isImageMessageFile(file, fileName)) continue;
+        const identity = messageFileId(file) || `${message?.uuid || ''}:${position}`;
+        if (countedImages.has(identity)) continue;
+        countedImages.add(identity);
+        const key = safeAssetName(fileName).toLowerCase();
+        imageNameCounts.set(key, (imageNameCounts.get(key) || 0) + 1);
+      }
+    }
+    labelSandboxOriginals(assets, imageNameCounts);
 
     // Some document uploads are represented only as attachments[].extracted_content.
     // Preserve those as downloadable text files instead of dumping their contents
@@ -1153,7 +1465,7 @@
     // a complete archive and later syncs retry it.
     const byPathCache = new Map();
     const filesApiAssetCache = new Map();
-    for (const { message, file, name, reason } of filesWithoutDownloadUrl) {
+    for (const { message, file, name, reason, originalTried = false } of filesWithoutDownloadUrl) {
       const messageId = message.uuid || message.id || null;
       const fileId = file.file_uuid || file.uuid || null;
       const nameKeys = new Set([
@@ -1207,7 +1519,10 @@
       // still be validated against a live account.
       const downloadSource = String(file?.download_source || '').toLowerCase().replace(/-/g, '_');
       const fileApiId = file.file_uuid || file.uuid || null;
-      if (file?.file_kind === 'blob' && downloadSource === 'files_api' && fileApiId) {
+      // An image without a preview URL is asked for its original the same
+      // way, unless that was already tried for it in this sync.
+      const imageOriginal = isImageMessageFile(file, name) && !originalTried && Boolean(messageFileId(file));
+      if (((file?.file_kind === 'blob' && downloadSource === 'files_api') || imageOriginal) && fileApiId) {
         const cached = filesApiAssetCache.get(String(fileApiId));
         if (cached) {
           if (messageId && !cached.message_external_ids.includes(messageId)) {
@@ -1220,12 +1535,13 @@
           continue;
         }
 
-        const url = `/api/organizations/${encodeURIComponent(org)}/files/${encodeURIComponent(fileApiId)}/contents`;
+        const url = filesApiUrl(org, fileApiId);
         try {
           downloaded = await fetchAsset(url, name, file.mime_type || file.content_type || file.file_type || null, signal, {
             conversationId, fileUuid: fileApiId, route: 'files-api',
-            declaredSize: declaredFileSize(file),
+            declaredSize: declaredFileSize(file), detect: imageOriginal,
           });
+          if (imageOriginal) downloaded = acceptOriginalImage(downloaded, name);
           const linked = {
             ...downloaded,
             source: 'message',
@@ -1408,6 +1724,8 @@
     // in the index so the conversation is retried by later syncs.
     const incomplete = [];
     const sandboxSupported = c.workspace_upgraded !== true && c.is_wiggle_enabled !== false;
+    const v2Only = countFilesV2OnlyImages(raw);
+    if (v2Only) { filesV2OnlyImages.images += v2Only; filesV2OnlyImages.conversations += 1; }
     const assets = await collectMessageAssets(org, c.uuid, raw, signal, inlineByMessage, incomplete, sandboxInfo, sandboxSupported);
     return {
       external_id: c.uuid,
@@ -1456,7 +1774,26 @@
             if (!oversized.has(String(item.id))) oversized.set(String(item.id), new Map());
             oversized.get(String(item.id)).set(String(item.file_uuid), { size: item.size, sha256: String(item.sha256) });
           }
-          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, error: null });
+          const previews = new Map();
+          for (const item of Array.isArray(response.preview_only) ? response.preview_only : []) {
+            if (!item?.id || typeof item.file_uuid !== 'string' || !item.file_uuid) continue;
+            if (!previews.has(String(item.id))) previews.set(String(item.id), new Map());
+            previews.get(String(item.id)).set(item.file_uuid, {
+              original_status: Number.isSafeInteger(item.original_status) ? item.original_status : null,
+              original_checked_at: typeof item.original_checked_at === 'string' ? item.original_checked_at : null,
+            });
+          }
+          const originals = new Map();
+          for (const item of Array.isArray(response.originals) ? response.originals : []) {
+            if (!item?.id || typeof item.file_uuid !== 'string' || !item.file_uuid || typeof item.path !== 'string' || !/^[0-9a-f]{64}$/.test(String(item.sha256))) continue;
+            if (!originals.has(String(item.id))) originals.set(String(item.id), new Map());
+            originals.get(String(item.id)).set(item.file_uuid, {
+              path: item.path, sha256: String(item.sha256),
+              size: Number.isSafeInteger(item.size) ? item.size : null,
+              mime: typeof item.mime === 'string' ? item.mime : null,
+            });
+          }
+          resolve({ state: new Map(response.conversations.map((entry) => [String(entry.id), entry.updated_at])), oversized, previewOnly: previews, originals, error: null });
         });
       } catch (error) {
         failed(error?.message || error);
@@ -1640,8 +1977,11 @@
     }
   }
 
-  async function runSync(limit = 'all', { automatic = false } = {}) {
+  async function runSync(limit = 'all', { automatic = false, planOnly = false } = {}) {
     if (syncing) return;
+    // An automatic sync is never plan-only, and a plan-only sync never publishes.
+    planOnly = planOnly === true && !automatic;
+    filesV2OnlyImages = { images: 0, conversations: 0 };
     syncing = true;
     currentAbortController = new AbortController();
     const signal = currentAbortController.signal;
@@ -1663,6 +2003,8 @@
       if (archivedState?.blocksSync) throw new Error(archivedState.error);
       const archived = archivedState?.state || null;
       knownOversizedFiles = archivedState?.oversized || null;
+      knownPreviewOnlyImages = archivedState?.previewOnly || null;
+      knownArchivedOriginals = archivedState?.originals || null;
       oversizedStats = newOversizedStats();
       const archiveStateError = archivedState?.error ? sanitizeError(archivedState.error) : null;
       if (signal.aborted) throw new DOMException('Sync cancelled', 'AbortError');
@@ -1691,7 +2033,7 @@
       let firstExportError = null;
       // The transfer starts before fetching, so a busy extension is reported
       // at once instead of after every conversation has been downloaded.
-      const transfer = await createTransferSession(signal);
+      const transfer = await createTransferSession(signal, { planOnly });
       let result;
       try {
         for (let i = 0; i < selected.length; i++) {
@@ -1765,6 +2107,8 @@
         // while the first batch is still being committed to GitHub.
         result = await transfer.finish({
           skipped, unchangedIds, fullList: limit === 'all', listed: listData.length,
+          ...(planOnly ? { planOnly: true } : {}),
+          filesV2OnlyImages: { ...filesV2OnlyImages },
           ...(archiveStateError ? { archiveStateError } : {}),
           ...(oversizedStats.skipped ? { oversizedDownloadsSkipped: oversizedStats.skipped } : {}),
           ...(oversizedStats.detected ? { oversizedStats: { ...oversizedStats, downloaded_reasons: { ...oversizedStats.downloaded_reasons }, downloaded_routes: { ...oversizedStats.downloaded_routes } } } : {}),
@@ -1874,7 +2218,7 @@
     return { id, records, payloads };
   }
 
-  async function createTransferSession(signal) {
+  async function createTransferSession(signal, { planOnly = false } = {}) {
     const transferId = createInlineMarkerNonce();
     let lostError = null;
     let finishing = false;
@@ -1884,7 +2228,9 @@
     let batchIndex = 0;
     let sentConversations = 0;
 
-    const started = await sendRuntimeMessage({ type: 'syncTransferStart', transferId, protocol: 2 });
+    // A plan-only transfer says so from its first message, so the extension
+    // never uploads its attachments.
+    const started = await sendRuntimeMessage({ type: 'syncTransferStart', transferId, protocol: 2, ...(planOnly ? { metadata: { planOnly: true } } : {}) });
     if (!started?.ok) {
       throw new Error(started?.error || 'The extension could not prepare the sync transfer. Nothing was published; sync again.');
     }
@@ -2031,7 +2377,7 @@
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'startSync') {
-      runSync(msg.limit || 'all');
+      runSync(msg.limit || 'all', { planOnly: msg.planOnly === true });
       sendResponse({ ok: true });
       return false;
     }

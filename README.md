@@ -1,5 +1,19 @@
 # AI Conversation Archive — GitHub / Markdown Edition
 
+## Extension v0.5.29 — original images instead of previews
+- Uploaded and pasted images are now archived from Claude's original upload. Before, every image was archived from Claude's smaller, lossy WebP preview, stored under the original's `.png` or `.jpg` name.
+- The type and extension of an image come from its bytes. A pasted image Claude names `…_image.png` is stored as `.jpg` when it is a JPEG. Originals are never converted.
+- If Claude does not serve the original (HTTP 404/410) but a sandbox conversation's `uploads/` folder holds it, that file is archived as the original and the preview is kept next to it, labelled as a preview.
+- An original already in the archive is never demoted: if Claude later stops serving it, the archived original stays linked.
+- A sandbox upload is paired with a preview only when its name is unique; several images named `image.png` are never guessed.
+- If no original is available, the preview is archived under its real `.webp` extension, with a visible "Preview only" note and a `preview_only` record in the index. The conversation is not marked incomplete, and normal syncs do not ask for that original again; a "Latest N" sync does. Any other failure leaves the conversation out of that sync, so a later sync retries it: a preview is never substituted silently.
+- HEIC, HEIF, TIFF and SVG originals, which the archive viewer does not display inline, are kept unchanged and also get Claude's preview as a display copy, shown inline with a link to the original.
+- Exporter version 2: the next "All conversations" sync re-exports every conversation once, replacing archived previews by originals wherever Claude still serves them. Run **Plan a full sync (writes nothing)** first: it reports every change and writes nothing. Procedure: `docs/full-resync-original-images.md`.
+- A sync never deletes an attachment any more: earlier files the export no longer links (old previews, files whose message left Claude's active branch) are kept and listed under `retained_assets`, with what replaced them.
+- A WebP the Files API returns identically to the preview is archived as a preview, never as the original. Images Claude lists only in `files_v2` are counted in the sync report (diagnostics; not exported).
+- Downgrade protection (not absolute): every index records `requires_extension: "0.5.29"`, and so does a new file, `archive/.ai-archive.json`. From 0.5.29 on, an extension older than either refuses to sync. Extensions before 0.5.29 cannot be stopped: they ignore both, and when they re-export a conversation they replace its originals with previews (git history keeps the originals). They drop the index marker but never touch the marker file, so the next sync with 0.5.29 or later detects the rewrite (also when they re-exported every conversation with originals), and warns in the popup after every sync until you acknowledge it. Update every installed copy of the extension.
+- Format details: `docs/archive-format-v1.md`. Web 0.6.19: the verifier checks original/preview pairs, kept files and the marker. The controlled live test and its read-only check script (`web/scripts/verify-recovered-originals.mjs`) are described in `docs/live-test-original-images.md`.
+
 ## Extension v0.5.28 — same-named attachments are no longer merged by name
 - A pasted image is listed on its message with a *preview* (Claude serves a WebP preview under the upload's `.png` name), while the sandbox's `uploads/` folder holds the original. Because the two share a file name, the exporter skipped the original. It now downloads it as well and keeps both. A copy with the same name and the **same bytes** is still stored only once.
 - Unchanged conversations are not re-exported by this version, so already archived conversations gain the original only when they are synced again. See the development log for the trade-off of re-exporting everything.

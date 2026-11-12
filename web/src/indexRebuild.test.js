@@ -110,3 +110,41 @@ test('a missing attachment file and a "not archived" note are reported, not inve
   assert.equal(entry.assets.some((asset) => asset.path === imagePath), false);
   assert.equal(entry.assets.every((asset) => asset.sha256 === null), true, 'no hash is claimed without reading the bytes');
 });
+
+test('a rebuild of an original with its preview says which image records it cannot keep, instead of calling the entry unchanged', async () => {
+  const c = conversation('conv-img', 'Images', [
+    { name: 'photo.heic', mime: 'image/heic', bytes: 'heic original bytes' },
+    { name: 'photo.heic', mime: 'image/webp', bytes: 'webp preview bytes' },
+  ]);
+  const [original, preview] = c.assets;
+  Object.assign(original, { variant: 'original', file_uuid: 'img-1', detected_extension: 'heic' });
+  Object.assign(preview, { variant: 'preview', file_uuid: 'img-1', detected_extension: 'webp', original_sha256: original.sha256 });
+  c.messages[0].files = [{ file_uuid: 'img-1', file_name: 'photo.heic' }];
+  const archive = await exportArchive([c]);
+  archive.index.conversations[0].retained_assets = [{ path: 'archive/conversations/claude/personal/assets/x/old.png', name: 'old.png' }];
+  const indexed = archive.index.conversations[0];
+  assert.ok(indexed.assets.some((a) => a.preview_of), 'the exporter recorded the pair');
+
+  const plan = await planIndexRebuild(archive);
+  assert.deepEqual(plan.unchanged, [], 'not reported as unchanged');
+  assert.equal(plan.differs.length, 1);
+  assert.deepEqual(plan.differs[0].fields, ['not preserved by a rebuild: retained_assets, assets.variant, assets.preview_of, assets.file_uuid']);
+  assert.deepEqual(plan.lostIfApplied[0].fields, ['exporter_version', 'format_version', 'retained_assets', 'assets.variant', 'assets.preview_of', 'assets.file_uuid']);
+  const report = formatRebuildPlan(plan);
+  assert.match(report, /would lose retained_assets, assets\.variant, assets\.preview_of, assets\.file_uuid, which neither the Markdown nor a later sync restores/);
+  assert.match(report, /would lose exporter_version, format_version; their next sync would re-export them/);
+
+  const [path, markdown] = [...archive.markdown][0];
+  const { entry } = await rebuildIndexEntry({ path, markdown, tree: archive.tree, readBytes: archive.readBytes });
+  assert.deepEqual(entry.assets.map((a) => a.mime).sort(), ['image/heic', 'image/webp'], 'HEIC gets its own type');
+});
+
+test('the rebuild knows HEIC, HEIF and TIFF types', async () => {
+  const c = conversation('conv-types', 'Types', [
+    { name: 'a.heif', mime: 'image/heif', bytes: 'heif' }, { name: 'b.tif', mime: 'image/tiff', bytes: 'tif' }, { name: 'c.tiff', mime: 'image/tiff', bytes: 'tiff' },
+  ]);
+  const archive = await exportArchive([c]);
+  const [path, markdown] = [...archive.markdown][0];
+  const { entry } = await rebuildIndexEntry({ path, markdown, tree: archive.tree, readBytes: archive.readBytes });
+  assert.deepEqual(entry.assets.map((a) => a.mime).sort(), ['image/heif', 'image/tiff', 'image/tiff']);
+});

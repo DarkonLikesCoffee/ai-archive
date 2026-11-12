@@ -2,6 +2,169 @@
 
 This file is the durable handoff between Claude Code sessions. Keep entries factual and concise. Newest entries go first.
 
+## Migration fixes for the full re-sync — 2026-11-12 (extension 0.5.29, exporter version 2)
+
+Fixes from the root-cause audit (each reproduced first against the PR #102 code; synthetic data only).
+
+1. **A full sync re-exported nothing.** Unchanged entries with `exporter_version: 1` were skipped. `EXPORTER_VERSION` is now 2, so every earlier entry is re-exported once. A failed re-export keeps the archived copy and version 1, so it is retried.
+2. **The incomplete-conversation guard blocked corrections.** An earlier image the new export represents by an original or preview of the same Claude file name is no longer "lost". Any other missing file still keeps the archived copy.
+3. **Never delete attachments (owner's requirement).** Every earlier file the export no longer links, of any type, is kept and listed in `retained_assets`.
+   - Each kept file records `reason` (`superseded` or `not-in-export`), `superseded_by` and `same_bytes_as`. `variant: "preview"` is set only when it is identical to a current preview.
+   - A kept file is never labelled as an original.
+   - Only a renamed conversation's old Markdown file is removed.
+4. **Plan-only full sync.**
+   - Popup: "Plan a full sync (writes nothing)".
+   - The flag travels with the transfer's first message, and attachments are not staged.
+   - `gh()` refuses every non-GET request while it runs. The plan exits before the first write, even for an empty repository.
+   - The report: totals, failed conversations with reasons, kept-previous, deletions, orphaned files, and per-conversation details. It is stored locally (`last_sync_plan`) and copied as JSON from the popup.
+5. **Files API WebP check.** When the Files API returns WebP and the preview is the same bytes, the image is archived as a preview (`files-api-served-preview`), never as the original.
+6. **`files_v2` diagnostics.** Image entries only in `files_v2` are counted (counts only) and reported. They are not exported.
+
+**Tests.**
+- Migration against an archive written by the real 0.5.28 code: an original served, an original unavailable, your two incomplete conversations with five previews, a non-image file that left the export, a failed re-export.
+- The guard's protection still holds; a second full sync with fresh downloads publishes nothing.
+- Plan-only: full report and no write request, including an empty repository, a plan-only transfer, and an injected write attempt.
+- The WebP check; `files_v2` counts.
+- Changed expectations for the new rules: attachments kept, not deleted; exporter version 2.
+- Negative checks: each fix disabled fails 1–7 tests.
+
+**Results.**
+- `node --test extension/*.test.js`: 298/298.
+- `cd web && npm test`: 127/127. `npm run build`: OK.
+- `node e2e/extension-sync.e2e.cjs`: exit 0, 55 PASS / 0 FAIL. Its check "the image that left the conversation is removed" now checks that it is kept and listed.
+- `node web/e2e/viewer.e2e.cjs`: exit 0, 47 PASS.
+
+**Archive-side pre-plan of the owner's read-only copy** (`15d25de`; counts only; run in the cloud session, no Claude data):
+- Main account: 802 conversations, all exporter version 1, all to be re-exported; 652 images (612 WebP under `.png`/`.jpg`); 243 conversations with images.
+- Second profile: 12 conversations, 114 WebP images, needing its own login.
+- Test profile: 10 entries.
+- 56 files already unreferenced.
+
+**Not done.** The plan-only run against Claude must run in the owner's browser. No real sync. No archive changes.
+
+## A corrupted marker file no longer erases a downgrade warning — 2026-11-10 (extension 0.5.29)
+
+- **Bug, reproduced first in a scratch copy.** An unreadable `archive/.ai-archive.json` (invalid JSON or not an object), or a `downgrade_warning` that was not a readable object, raised no warning once the index had its `requires_extension` again. The next sync then rewrote the marker clean, silently erasing a warning nobody had acknowledged.
+- **Fix (`downgradeWarningFor`, `loadArchiveMarker`).**
+  - An unreadable marker is reported as `marker-unreadable`, and an unreadable warning as `warning-unreadable`. The popup and sync report say "the archive's version marker could not be read".
+  - The warning is kept in the rewritten, readable marker and cleared only after it is acknowledged.
+  - Its `detected_at` comes from the marker's blob ID, so it stays stable while the file is unchanged.
+- **Tests.** 2 background tests (4 corruption cases, each warned, kept, still warned on the next sync, cleared only after acknowledgement; and a readable marker raises nothing) and 1 popup test. With either new check removed, the test fails.
+- **Live-test procedure corrected** (`docs/live-test-original-images.md`).
+  - The popup's smallest choice is "Latest 10", which would copy 9 historical conversations. Syncing exactly one conversation uses the popup's own `sendToClaude({ type: 'startSync', limit: '1' })` from its DevTools console, with no code change.
+  - Automatic sync must be confirmed off first; if on, it copies up to 20 conversations.
+  - Copying historical conversations is a separate step that needs the owner's agreement on N.
+- **Check script.** It now finds an archived image by its name without the extension, so an uploaded `photo.jpg` (not only a pasted `…_image.png`) is checked. 1 new test; with the old exact-name match it fails. Web tests: 127/127.
+- **Not done.** No live step can be run from a cloud session: no browser, Claude login, test repository or token here. The owner runs the live steps; this session verifies the results read-only once given access to the test repository.
+
+## Pre-live-test verification of PR #102 — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+- **CI for `c7e86da`.** `test-and-build` and `extension-e2e` both succeeded (run 42809195233).
+- **Regression found and fixed.** The previous commit added `retained_assets` paths to `referencedPaths`, which is also the list `verifySyncTree` requires to exist. A kept file deleted outside AI Archive would therefore have blocked every sync with "Archive integrity check failed".
+  - Kept files are now only protected from deletion (`protectedPaths`), not required to exist.
+  - New test: such an archive still syncs. With the old behaviour put back, it fails.
+- **Live-test check script moved into the repository.**
+  - `web/src/recoveredOriginals.js`: checks, testable.
+  - `web/scripts/verify-recovered-originals.mjs`: command line, no machine-specific paths. Exit 0 pass, 1 a check failed, 2 could not run.
+  - Procedure: `docs/live-test-original-images.md`.
+  - 4 tests in `web/src/recoveredOriginals.test.js`. They build the test archive with the real exporter code, so the checker and the format cannot drift apart unnoticed, and they cover each kind of mislabelling and the command-line exit codes.
+- **Package.** The 0.5.28 fixture lives in `test-fixtures/`, outside `extension/` (the unpacked package); CI does no packaging.
+- **Final local results.**
+  - `node --test extension/*.test.js`: 281/281.
+  - `cd web && npm test`: 126/126. `npm run build`: OK.
+  - `node e2e/extension-sync.e2e.cjs`: exit 0, 55 PASS / 0 FAIL.
+  - `node web/e2e/viewer.e2e.cjs`: exit 0, 47 PASS.
+- **Recheck when PR #100 is merged and this PR is retargeted.** See the PR description: merge result, full suites, CI, the 0.5.28 fixture still matching what was released, and versions.
+
+## Review fixes for PR #102: originals never demoted, unique pairing, persistent downgrade detection — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+Fixes for the defects found by the final review of PR #102. Each was reproduced first in scratch copies running the real code.
+
+1. **Archived originals were demoted.** A re-export after Claude stopped serving an archived original (404/410) moved the original to `retained_assets`, stopped linking it, and listed the image as preview-only.
+   - Image assets now record `file_uuid`, and the archive state sends archived originals to the Claude tab.
+   - On 404/410 the tab sends a `reuse_path` reference instead of downgrading. `applyArchivedOriginals` (background) accepts it only if the previous entry lists that path, SHA-256 and file UUID and the file exists; otherwise the image is reported as not archived and the archived copy is kept.
+   - A sync without archive state ("Latest N") that received only a preview re-links the archived original and keeps the preview as its `preview_of`.
+   - Reused originals are never uploaded again.
+2. **Ambiguous pairing.** `labelSandboxOriginals` pairs only when the name is unique among the sandbox uploads, the conversation's image attachments and the previews.
+3. **Downgrade detection missed the only-conversation case; the warning was one-shot.**
+   - New `archive/.ai-archive.json` (`requires_extension`, `written_by_extension`, and an optional `downgrade_warning`).
+   - Verified with the released 0.5.28 code, now a test fixture at `test-fixtures/extension-0.5.28/background.js`: 0.5.28 never reads, writes or deletes the marker file; it drops the index marker; it deletes the re-exported original from the latest version.
+   - Detection: the marker file says 0.5.29+ but the index has no marker. The warning is stored in the marker file and reported by every sync until acknowledged through the popup's "I understand", which stores the warning's `detected_at`; the next sync clears it. The marker file's requirement is also enforced as a version guard.
+   - The marker file is uploaded only when new or changed, and fields it does not know are kept when it is rewritten. Archives with nothing to change are not committed to just to add it.
+4. **Kept files could be deleted through a shared folder.** `retained_assets` paths are now part of the cleanup guard.
+5. **Rebuild dry run.** Entries holding `preview_only`, `retained_assets` or `assets.variant`/`preview_of`/`file_uuid` are reported as differing ("not preserved by a rebuild"), and the report separates fields a sync restores from fields it does not. HEIC, HEIF, TIFF, AVIF, BMP and ICO types were added.
+6. **Verifier.** `older-extension-wrote` now also fires when the marker file exists but the index marker does not.
+7. **Owner's four-image check script** (kept outside the repository): updated to the final schema, checking `variant`, `file_uuid`, `preview_of`, `preview_only`, `retained_assets`, the links, and both markers.
+
+**Tests (synthetic images only).**
+- `node --test extension/*.test.js`: 280/280. 17 new: 5 content, 12 background.
+- Two existing exact-count assertions now account for the marker file. They still check that the Markdown is not rewritten, and that 12 assets, one Markdown file and one index are uploaded.
+- `cd web && npm test`: 122/122 (3 new). `npm run build`: OK.
+- `node e2e/extension-sync.e2e.cjs`: exit 0, 55 PASS / 0 FAIL. 1 new check: the marker file. The existing "each new file uploaded exactly once" check found that the marker was re-uploaded on every commit; fixed.
+- `node web/e2e/viewer.e2e.cjs`: exit 0.
+- Negative checks, each fix disabled in turn: 1a (2 tests fail), 1b (1), 1c (1), 1d (4), 2 (2), 3a (1), 3b (1), 3c (1), 3d (1), 3e verifier (1), 4 (1), 5a (1), 5b (2), unchanged-marker upload (1), unknown marker fields (1).
+
+**Limitations (documented in `docs/archive-format-v1.md`).**
+- Versions before 0.5.29 cannot be stopped.
+- Detection happens only after they write, and only while the marker file exists.
+- The damage they do is recovered from git history.
+
+**Not verified.** No live Claude run. No real archive touched.
+
+**Next task.** The owner-approved live test (separate repository and Chrome profile). Then merge PR #100, merge `development` into this branch and retarget PR #102.
+
+## Reconciling original-first images with the sandbox rule; display copies; downgrade protection — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+- **Branch.** `claude/original-first-reconciled`, based on PR #100's head (not yet merged; it is the branch's base) with PR #101 merged in. Conflicts were in docs, versions and the two test files only; both PRs' tests and docs are kept.
+- **Bug fixed.** With both PRs, a sandbox conversation whose Files API answered 404 archived the preview as "preview only" while PR #100's rule also archived the sandbox `uploads/` original, unlabelled and typed from the sandbox listing. The original was archived, but the archive said it was not.
+- **Owner decisions applied.**
+  - **Keep both files.** `labelSandboxOriginals` (content.js) makes exactly one same-named `uploads/` file with recognised image bytes the original: `variant: original`, type and extension from its bytes, linked to the same Claude file and message. The preview stays as `variant: preview` with `original_sha256`, which background.js turns into `preview_of: <original path>`. Such a preview is not preview-only. Anything ambiguous leaves both unlabelled or preview-only.
+  - **Schema.**
+    - `assets[].variant` and `assets[].preview_of`: linked files.
+    - `preview_only[]`, renamed from `previews` (never released): only images whose original is not archived. New reason `original-not-archived` (downloaded but too large).
+    - `retained_assets[]`: unlinked historical files.
+    - Markdown links each file once: the original as the image plus "Also archived: Claude's preview", or for non-displayable originals the preview inline plus a link to the unchanged original.
+  - **HEIC/HEIF/TIFF/SVG.** These originals are kept unchanged and also get Claude's preview as a display copy when it is a displayable image. A 404/410 or non-displayable preview leaves the original alone; other preview failures fail the conversation for that sync, like any download. Nothing is converted.
+  - **Downgrade protection.**
+    - Every index written records `requires_extension: "0.5.29"`; `loadArchiveIndex` refuses (blocksSync, before any download or write) when the running version (`EXTENSION_VERSION`, tested equal to manifest.json) is older or the value is not a version.
+    - Released versions (≤0.5.28) cannot be stopped: they never read the marker. But they write `{version, updated_at, conversations}` only (confirmed in their code), dropping it. So original-first records without the marker mean an older version wrote. The sync report, the popup (a warning entry first, sync shown as with problems) and the verifier (`older-extension-wrote`) say so.
+  - **Verifier.** New warnings `preview-of-missing`, `preview-only-unlisted`, `preview-only-has-original` and `older-extension-wrote`.
+- **Tests (synthetic images only).**
+  - `node --test extension/*.test.js`: 263/263 (PR #100 and #101 tests plus 17 new: 8 content, 8 background, 1 popup).
+  - `cd web && npm test`: 119/119 (2 new). `npm run build`: OK.
+  - `node e2e/extension-sync.e2e.cjs`: exit 0, 54 PASS / 0 FAIL (1 new: the index marker).
+  - `node web/e2e/viewer.e2e.cjs`: exit 0, 47 PASS.
+  - Checks that the tests catch each mechanism, each disabled in turn: sandbox labelling (2 fail), display copy (2), version guard (1), older-writer detection (1), pairing (3).
+- **Not verified.** No live Claude run; no real archive touched. Live test pending the owner's approval (separate test repository and Chrome profile).
+- **Risks.**
+  - A downgrade by a released version is detected only after it happened; the originals stay in git history.
+  - Display copies add one preview download per HEIC/TIFF/SVG image.
+  - The Files API is undocumented.
+- **Next task.** After PR #100 merges: merge `development` into this branch (no content change expected) and retarget its PR to `development`. Then the owner-approved live test.
+
+## Original images instead of Claude's previews — 2026-11-10 (extension 0.5.29, web 0.6.19)
+
+- **Failure.** Image attachments were archived from Claude's WebP preview under the original's name (`….png`/`….jpg`): `collectMessageAssets` took `preview_asset.url || preview_url || document_asset.url` for every file, `fetchAsset` kept Claude's name and declared type, and `assetPath` took the extension from the name. The original route (`/files/{uuid}/contents`) was used only for `file_kind: blob` files. On the owner's archive this affects 729 images (read-only inventory; no private data in this repository).
+- **Evidence for the original route.** The owner's read-only DevTools probe and four verified full downloads: Claude served PNG/JPEG originals there for 4 images in 2 conversations; one SHA-256 equals the original already in the archive. Other images answered 404 (inconclusive). Claude's own names do not match the format either: three originals named `…_image.png` are JPEG.
+- **Change (based on `development`; PR #100 is not merged and not included).**
+  - `content.js`: for an image message file (`file_kind: image`, an image type or an image name) with a file UUID, the original is requested first and accepted only if its bytes are a recognised image (PNG, JPEG, GIF, WebP, BMP, TIFF, AVIF, HEIC/HEIF, SVG). Its MIME type and extension come from the bytes (`detectImageFormat`). Only on 404/410, or when there is no file UUID, is the preview archived, marked `variant: 'preview'` with the reason, status and time. Any other failure (403, 429, 5xx, network, non-image bytes) fails the conversation for this sync. Images without a preview URL take the same original route. Non-image files are unchanged.
+  - Archive state: images recorded as preview-only are not asked for again by a normal sync; a "Latest N" sync (no archive state) asks again.
+  - `background.js`: paths take the detected extension; preview images get a visible "Preview only" note; index assets gain `variant`; entries gain `previews[]` (not `incomplete`, so still skippable) and `retained_assets[]`. When an export that records `variant` replaces an earlier image, the earlier file is kept and listed instead of deleted.
+  - Web verifier: `retained_assets` count as referenced; a missing one is a warning. The rebuild dry run lists `previews`/`retained_assets` as not recoverable.
+  - Format documented in `docs/archive-format-v1.md` ("Image originals and previews"). `EXPORTER_VERSION` unchanged: nothing already archived is re-exported by this change.
+- **Tests (all synthetic images; no real images or hashes committed).**
+  - `node --test extension/*.test.js`: 243/243. 12 new content tests: original-first in an upgraded workspace; JPEG under a `.png` name; every recognised format; 404 and 410 fall back to a labelled preview; 403, 429, 500, 503, network error, non-image bytes and a truncated signature fail the conversation without requesting the preview; no file ID; sandbox workspace dedup and the unchanged name-collision rule; no preview URL; both unavailable; known preview-only not re-asked, but re-asked by Latest N; non-image files unchanged. 7 new background tests: path extensions, Markdown notes, index fields and shape compatibility, keeping the replaced preview, carrying kept files forward, unchanged deletion for older exports, archive state. The test harness answers an unconfigured Files API request with 404.
+  - With original-first disabled, 9 of the new content tests fail. With retention disabled, the retention test fails.
+  - `cd web && npm test`: 111/111 (2 new). `npm run build`: OK.
+  - `node e2e/extension-sync.e2e.cjs`: exit 0, 53 PASS, 0 FAIL. It now serves a synthetic original for the pasted map and checks the archive holds it as `map.jpg`, `variant: original`, with the preview never requested.
+  - `node web/e2e/viewer.e2e.cjs`: exit 0.
+- **Not verified.** No live Claude or real-archive run. The live check (one conversation, separate test repository, compare against the owner's recovered originals) awaits the owner's approval.
+- **Risks.**
+  - The Files API is undocumented.
+  - A 403 on originals (if Claude ever answers so for images) would fail those conversations every sync until handled.
+  - When PR #100 merges, its sandbox `uploads/` rule must be reconciled with this change: with an original from the Files API, the sandbox copy has the same bytes and is deduplicated; with a preview fallback, PR #100 would also archive the sandbox original, and that preview should then not be listed in `previews`.
+- **Next task.** The owner-approved live test (procedure in the PR). Then design the explicit, opt-in recovery for already-archived previews, with a dry run, never touching unrelated conversations.
+
 ## Verifier fixes and the same-name attachment collision — 2026-11-09 (extension 0.5.28, web 0.6.18)
 
 **Background.** A read-only investigation of the owner's archive (2026-11-09; reported to the owner, no private data committed here) explained all 62 warnings:
